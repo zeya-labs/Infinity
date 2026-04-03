@@ -13,6 +13,7 @@ torch==2.5.1
 pytz
 pandas
 wandb
+swanlab
 colorama
 imageio
 einops

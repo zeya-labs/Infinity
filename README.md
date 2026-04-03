@@ -147,6 +147,12 @@ We provide [train.sh](scripts/train.sh) for train Infinity-2B with one command
 bash scripts/train.sh
 ```
 
+For normal-map tokenizer fine-tuning on Hypersim caches exported by NormalART, see [docs/normal_tokenizer_finetune.md](docs/normal_tokenizer_finetune.md). The stable tested setup on 2x A100 80G is:
+
+```shell
+NPROC_PER_NODE=2 bash scripts/train_normal_tokenizer.sh
+```
+
 To train Infinity with different model sizes {125M, 1B, 2B} and different {256/512/1024} resolutions, you can run the following command:
 ```shell
 # 125M, layer12, pixel number = 256 x 256 = 0.06M Pixels
