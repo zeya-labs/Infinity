@@ -34,6 +34,7 @@ wandb
 data/
 tmp
 output
+outputs/
 *.tsv
 *.mp4
 output/*
