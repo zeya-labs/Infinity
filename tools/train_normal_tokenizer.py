@@ -68,6 +68,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apply-spatial-patchify", action="store_true", default=True)
     parser.add_argument("--disable-spatial-patchify", dest="apply_spatial_patchify", action="store_false")
     parser.add_argument("--encoder-dtype", type=str, choices=("fp32", "bf16"), default="bf16")
+    parser.add_argument(
+        "--trainable-scope",
+        type=str,
+        choices=("all", "decoder_quantizer", "decoder_only"),
+        default="all",
+        help="Train all modules, freeze encoder only, or freeze encoder+quantizer so latent stays fixed.",
+    )
     parser.add_argument("--swanlab-project", type=str, default=os.environ.get("SWANLAB_PROJECT", "infinity_normal_tokenizer_hypersim"))
     parser.add_argument("--swanlab-workspace", type=str, default=os.environ.get("SWANLAB_WORKSPACE", ""))
     parser.add_argument("--swanlab-experiment-name", type=str, default="")
@@ -221,6 +228,7 @@ def compute_metrics(
 def save_visuals(
     output_dir: Path,
     swanlab_run: Any | None,
+    stage: str,
     step: int,
     target: torch.Tensor,
     recon: torch.Tensor,
@@ -236,12 +244,26 @@ def save_visuals(
     ).unsqueeze(1).detach().cpu().float().div(45.0).clamp(0.0, 1.0)
     angle_vis = angle_vis.repeat(1, 3, 1, 1)
 
+    gt_grid = make_grid(target_vis, nrow=min(4, target_vis.shape[0]))
+    recon_grid = make_grid(recon_vis, nrow=min(4, recon_vis.shape[0]))
+    angle_grid = make_grid(angle_vis, nrow=min(4, angle_vis.shape[0]))
     grid = make_grid(torch.cat([target_vis, recon_vis, angle_vis], dim=0), nrow=4)
     image_dir = output_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
-    save_image(grid, image_dir / f"step_{step:07d}.png")
+    save_image(gt_grid, image_dir / f"{stage}_normal_gt_step_{step:07d}.png")
+    save_image(recon_grid, image_dir / f"{stage}_normal_recon_step_{step:07d}.png")
+    save_image(angle_grid, image_dir / f"{stage}_normal_angle_step_{step:07d}.png")
+    save_image(grid, image_dir / f"{stage}_normal_compare_step_{step:07d}.png")
     if swanlab_run is not None:
-        swanlab_run.log({"train/normal_grid": swanlab.Image(grid)}, step=step)
+        swanlab_run.log(
+            {
+                f"{stage}/normal_gt": swanlab.Image(gt_grid),
+                f"{stage}/normal_recon": swanlab.Image(recon_grid),
+                f"{stage}/normal_angle": swanlab.Image(angle_grid),
+                f"{stage}/normal_compare": swanlab.Image(grid),
+            },
+            step=step,
+        )
 
 
 def resolve_repo_path(path_str: str) -> str:
@@ -249,6 +271,46 @@ def resolve_repo_path(path_str: str) -> str:
     if path.is_absolute():
         return str(path)
     return str((ROOT_DIR / path).resolve())
+
+
+def set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
+    for parameter in module.parameters():
+        parameter.requires_grad_(requires_grad)
+
+
+def configure_trainable_scope(raw_model: torch.nn.Module, scope: str) -> dict[str, bool]:
+    if scope == "all":
+        plan = {"encoder": True, "quantizer": True, "decoder": True}
+    elif scope == "decoder_quantizer":
+        plan = {"encoder": False, "quantizer": True, "decoder": True}
+    elif scope == "decoder_only":
+        plan = {"encoder": False, "quantizer": False, "decoder": True}
+    else:
+        raise ValueError(f"Unsupported trainable scope: {scope}")
+
+    set_requires_grad(raw_model.encoder, plan["encoder"])
+    set_requires_grad(raw_model.quantizer, plan["quantizer"])
+    set_requires_grad(raw_model.decoder, plan["decoder"])
+    return plan
+
+
+def apply_scope_train_modes(raw_model: torch.nn.Module, scope: str) -> None:
+    raw_model.train()
+    if scope in {"decoder_quantizer", "decoder_only"}:
+        raw_model.encoder.eval()
+    if scope == "decoder_only":
+        raw_model.quantizer.eval()
+    else:
+        raw_model.quantizer.train()
+    raw_model.decoder.train()
+
+
+def get_trainable_parameters(raw_model: torch.nn.Module) -> list[torch.nn.Parameter]:
+    return [parameter for parameter in raw_model.parameters() if parameter.requires_grad]
+
+
+def count_parameters(parameters: list[torch.nn.Parameter]) -> int:
+    return sum(parameter.numel() for parameter in parameters)
 
 
 def build_model(args: argparse.Namespace) -> torch.nn.Module:
@@ -351,9 +413,15 @@ def load_resume(
     checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
     raw_model.load_state_dict(checkpoint["vae"], strict=True)
     if "opt_vae" in checkpoint and checkpoint["opt_vae"] is not None:
-        optimizer.load_state_dict(checkpoint["opt_vae"])
+        try:
+            optimizer.load_state_dict(checkpoint["opt_vae"])
+        except ValueError as exc:
+            LOGGER.warning("skip optimizer state restore due to parameter mismatch: %s", exc)
     if scheduler is not None and checkpoint.get("sch_vae") is not None:
-        scheduler.load_state_dict(checkpoint["sch_vae"])
+        try:
+            scheduler.load_state_dict(checkpoint["sch_vae"])
+        except ValueError as exc:
+            LOGGER.warning("skip scheduler state restore due to parameter mismatch: %s", exc)
     start_epoch = int(checkpoint.get("epoch", -1)) + 1
     global_step = int(checkpoint.get("step", 0))
     best_val_angle = float(checkpoint.get("best_val_angle", float("inf")))
@@ -447,10 +515,11 @@ def run_validation(
     device: torch.device,
     distributed: bool,
     args: argparse.Namespace,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
     model.eval()
     meter_sums: dict[str, torch.Tensor] = {}
     meter_count = torch.tensor(0.0, device=device)
+    visual_payload = None
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if device.type == "cuda" and args.precision == "bf16"
@@ -466,6 +535,11 @@ def run_validation(
             with autocast_ctx:
                 recon, vq_output = model(target)
                 _, metrics = compute_metrics(target, recon, mask, vq_output["commitment_loss"], args)
+            if visual_payload is None:
+                visual_payload = {
+                    "target": target.detach().cpu(),
+                    "recon": recon.detach().cpu(),
+                }
 
             batch_size = target.shape[0]
             meter_count += batch_size
@@ -478,8 +552,8 @@ def run_validation(
             dist.all_reduce(value, op=dist.ReduceOp.SUM)
 
     if float(meter_count.item()) == 0.0:
-        return {}
-    return {key: float((value / meter_count).item()) for key, value in meter_sums.items()}
+        return {}, visual_payload
+    return {key: float((value / meter_count).item()) for key, value in meter_sums.items()}, visual_payload
 
 
 def main() -> None:
@@ -504,6 +578,7 @@ def main() -> None:
             args.batch_size * world_size,
             args.val_batch_size,
         )
+        LOGGER.info("trainable_scope=%s", args.trainable_scope)
         train_dataset = HypersimNormalCacheDataset(args.train_cache, repeat=args.repeat_train, mmap=args.mmap_cache)
         val_dataset = HypersimNormalCacheDataset(args.val_cache, repeat=args.repeat_val, mmap=args.mmap_cache)
         train_loader, train_sampler = build_loader(
@@ -528,10 +603,20 @@ def main() -> None:
             val_sampler.drop_last = False
 
         raw_model = build_model(args).to(device)
+        train_plan = configure_trainable_scope(raw_model, args.trainable_scope)
+        trainable_parameters = get_trainable_parameters(raw_model)
+        if not trainable_parameters:
+            raise RuntimeError(f"No trainable parameters found for scope={args.trainable_scope}")
+        LOGGER.info(
+            "trainable_modules=%s trainable_params=%.2fM total_params=%.2fM",
+            ", ".join(name for name, enabled in train_plan.items() if enabled),
+            count_parameters(trainable_parameters) / 1_000_000,
+            sum(parameter.numel() for parameter in raw_model.parameters()) / 1_000_000,
+        )
         model = DDP(raw_model, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False) if distributed else raw_model
 
         optimizer = torch.optim.AdamW(
-            raw_model.parameters(),
+            trainable_parameters,
             lr=args.lr,
             betas=tuple(args.betas),
             weight_decay=args.weight_decay,
@@ -564,7 +649,7 @@ def main() -> None:
         for epoch in range(start_epoch, args.epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
-            model.train()
+            apply_scope_train_modes(raw_model, args.trainable_scope)
 
             for batch_idx, batch in enumerate(train_loader):
                 if args.max_steps > 0 and global_step >= args.max_steps:
@@ -625,9 +710,9 @@ def main() -> None:
                         swanlab_run.log(payload, step=global_step)
 
                 if global_step == 1 or global_step % args.image_log_every == 0:
-                    save_visuals(output_dir, swanlab_run, global_step, target, recon, is_main=(rank == 0))
+                    save_visuals(output_dir, swanlab_run, "train", global_step, target, recon, is_main=(rank == 0))
 
-            val_metrics = run_validation(model, val_loader, device, distributed, args)
+            val_metrics, val_visuals = run_validation(model, val_loader, device, distributed, args)
             if rank == 0 and val_metrics:
                 LOGGER.info(
                     "val epoch=%d loss=%.4f l1=%.4f cos=%.4f vq=%.4f norm=%.4f angle=%.3f",
@@ -641,6 +726,16 @@ def main() -> None:
                 )
                 if swanlab_run is not None:
                     swanlab_run.log({f"val/{key}": value for key, value in val_metrics.items()}, step=global_step)
+                if val_visuals is not None:
+                    save_visuals(
+                        output_dir,
+                        swanlab_run,
+                        "val",
+                        global_step,
+                        val_visuals["target"],
+                        val_visuals["recon"],
+                        is_main=True,
+                    )
 
             if rank == 0 and val_metrics and val_metrics["metric_angle_deg"] < best_val_angle:
                 best_val_angle = val_metrics["metric_angle_deg"]

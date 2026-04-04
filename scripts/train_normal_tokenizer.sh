@@ -8,8 +8,6 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
 export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-export SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
-export SWANLAB_PROJECT="${SWANLAB_PROJECT:-infinity_normal_tokenizer_hypersim}"
 
 TRAIN_CACHE_DEFAULT="${NORMAL_TRAIN_CACHE:-/root/vepfs/NormalART/datasets/cache/hypersim_full/256x256/train.pt}"
 VAL_CACHE_DEFAULT="${NORMAL_VAL_CACHE:-/root/vepfs/NormalART/datasets/cache/hypersim_full/256x256/val.pt}"

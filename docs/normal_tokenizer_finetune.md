@@ -34,6 +34,21 @@ That configuration corresponds to:
 
 Downstream code that loads the fine-tuned tokenizer should keep the same tokenizer shape assumptions.
 
+## Trainable Scope
+
+The trainer supports three optimization scopes:
+
+- `all`: train encoder, quantizer, and decoder
+- `decoder_quantizer`: freeze encoder, train quantizer and decoder
+- `decoder_only`: freeze encoder and quantizer, train decoder only so latent codes stay fixed
+
+Example for decoder-only fine-tuning:
+
+```bash
+NPROC_PER_NODE=2 bash scripts/train_normal_tokenizer.sh \
+  --trainable-scope decoder_only
+```
+
 ## Stable Training Command
 
 The tested stable launch on 2x A100 80G is:
@@ -111,3 +126,14 @@ Each run writes:
 - `checkpoints/best_angle_*.pth`
 
 If `checkpoints/last.pth` already exists in the selected output directory, the trainer resumes automatically.
+
+SwanLab image panels include:
+
+- `train/normal_gt`
+- `train/normal_recon`
+- `train/normal_angle`
+- `train/normal_compare`
+- `val/normal_gt`
+- `val/normal_recon`
+- `val/normal_angle`
+- `val/normal_compare`
