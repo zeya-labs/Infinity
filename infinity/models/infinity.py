@@ -44,7 +44,7 @@ class TextAttentivePool(nn.Module):
         else:
             self.head_dim = 128
 
-        self.num_heads = Ct5 // self.head_dim
+        self.num_heads = max(1, D // self.head_dim)
         self.ca = CrossAttention(for_attn_pool=True, embed_dim=self.D, kv_dim=Ct5, num_heads=self.num_heads)
     def forward(self, ca_kv):
         return self.ca(None, ca_kv).squeeze(1)
@@ -551,17 +551,29 @@ class Infinity(nn.Module):
 
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             layer_idx = 0
-            for block_idx, b in enumerate(self.block_chunks):
-                # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
+            if self.num_block_chunks == 1:
+                block_iter = [(0, self.blocks)]
+            else:
+                block_iter = [(block_idx, block_chunk.module) for block_idx, block_chunk in enumerate(self.block_chunks)]
+
+            for block_idx, modules in block_iter:
                 if self.add_lvl_embeding_only_first_block and block_idx == 0:
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if not self.add_lvl_embeding_only_first_block: 
+                if not self.add_lvl_embeding_only_first_block:
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                
-                for m in b.module:
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+
+                for m in modules:
+                    last_stage = m(
+                        x=last_stage,
+                        cond_BD=cond_BD_or_gss,
+                        ca_kv=ca_kv,
+                        attn_bias_or_two_vector=None,
+                        attn_fn=attn_fn,
+                        scale_schedule=scale_schedule,
+                        rope2d_freqs_grid=self.rope2d_freqs_grid,
+                        scale_ind=si,
+                    )
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
-                        # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
                         last_stage = torch.cat((last_stage, last_stage), 0)
                     layer_idx += 1
@@ -765,7 +777,18 @@ def get_params_num(d, w, mlp):
     return f'{s/1e9:.2f}B'
 
 
-TIMM_KEYS = {'img_size', 'pretrained', 'pretrained_cfg', 'pretrained_cfg_overlay', 'global_pool'}
+TIMM_KEYS = {
+    'img_size',
+    'pretrained',
+    'pretrained_cfg',
+    'pretrained_cfg_overlay',
+    'global_pool',
+    'cache_dir',
+    'features_only',
+    'scriptable',
+    'exportable',
+    'no_jit',
+}
 
 @register_model
 def infinity_2b(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, **kwargs): return Infinity(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
