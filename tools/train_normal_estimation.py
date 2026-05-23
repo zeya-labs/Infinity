@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+try:
+    import swanlab
+except ImportError:
+    swanlab = None
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -109,6 +113,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb-vae-type", type=int, default=14)
     parser.add_argument("--rgb-apply-spatial-patchify", action="store_true", default=True)
     parser.add_argument("--rgb-no-spatial-patchify", dest="rgb_apply_spatial_patchify", action="store_false")
+    parser.add_argument("--swanlab-project", type=str, default=os.environ.get("SWANLAB_PROJECT", "infinity_normal_estimation_hypersim"))
+    parser.add_argument("--swanlab-workspace", type=str, default=os.environ.get("SWANLAB_WORKSPACE", ""))
+    parser.add_argument("--swanlab-experiment-name", type=str, default="")
+    parser.add_argument("--swanlab-job-type", type=str, default="train_normal_estimation")
+    parser.add_argument("--swanlab-tags", nargs="*", default=["normal_estimation", "hypersim"])
+    parser.add_argument(
+        "--swanlab-mode",
+        type=str,
+        choices=("cloud", "local", "offline", "disabled"),
+        default=os.environ.get("SWANLAB_MODE", "cloud"),
+    )
+    parser.add_argument("--swanlab-logdir", type=str, default="")
     return parser.parse_args()
 
 
@@ -389,20 +405,117 @@ def cast_condition_tuple(
     return kv_compact, lens, cu_seqlens, max_seqlen
 
 
+def build_swanlab_experiment_name(args: argparse.Namespace, output_dir: Path) -> str:
+    if args.swanlab_experiment_name:
+        return args.swanlab_experiment_name
+    if output_dir.parent.name and output_dir.parent.name != output_dir.anchor:
+        return f"{args.swanlab_job_type}_{output_dir.parent.name}_{output_dir.name}"
+    return f"{args.swanlab_job_type}_{output_dir.name}"
+
+
+def swanlab_state_path(output_dir: Path) -> Path:
+    return output_dir / "swanlab_run.json"
+
+
+def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> Any | None:
+    if not enabled or args.swanlab_mode == "disabled":
+        return None
+    if swanlab is None:
+        raise ImportError("swanlab is not installed, but SwanLab logging is enabled.")
+
+    state_path = swanlab_state_path(output_dir)
+    run_id = ""
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        run_id = str(state.get("run_id", "")).strip()
+
+    logdir = Path(args.swanlab_logdir) if args.swanlab_logdir else output_dir / "swanlab"
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    init_kwargs: dict[str, Any] = {
+        "project": args.swanlab_project,
+        "experiment_name": build_swanlab_experiment_name(args, output_dir),
+        "job_type": args.swanlab_job_type,
+        "tags": list(args.swanlab_tags),
+        "config": vars(args),
+        "logdir": str(logdir),
+        "mode": args.swanlab_mode,
+        "reinit": True,
+    }
+    workspace = args.swanlab_workspace.strip()
+    if workspace:
+        init_kwargs["workspace"] = workspace
+    if run_id:
+        init_kwargs["id"] = run_id
+        if args.swanlab_mode == "cloud":
+            init_kwargs["resume"] = "allow"
+
+    run = swanlab.init(**init_kwargs)
+    run_public = getattr(run, "public", None)
+    current_run_id = str(getattr(run_public, "run_id", "")).strip()
+    state_payload = {
+        "project": args.swanlab_project,
+        "workspace": workspace,
+        "experiment_name": build_swanlab_experiment_name(args, output_dir),
+        "mode": args.swanlab_mode,
+        "logdir": str(logdir),
+    }
+    if current_run_id:
+        state_payload["run_id"] = current_run_id
+    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return run
+
+
 def save_visuals(
     output_dir: Path,
+    swanlab_run: Any | None,
+    stage: str,
     step: int,
     image: torch.Tensor,
     target: torch.Tensor,
     prediction: torch.Tensor,
+    is_main: bool,
 ) -> None:
+    if not is_main:
+        return
+
+    if image.shape[-2:] != target.shape[-2:]:
+        image = F.interpolate(image.float(), size=target.shape[-2:], mode="bilinear", align_corners=False)
+    if prediction.shape[-2:] != target.shape[-2:]:
+        prediction = F.interpolate(prediction.float(), size=target.shape[-2:], mode="bilinear", align_corners=False)
+        prediction = prediction / torch.linalg.norm(prediction, dim=1, keepdim=True).clamp_min(1e-6)
+
     image_dir = output_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     image_vis = image[:4].detach().cpu().float().clamp(0.0, 1.0)
     target_vis = normals_to_vis(target[:4])
     prediction_vis = normals_to_vis(prediction[:4])
-    compare = make_grid(torch.cat([image_vis, target_vis, prediction_vis], dim=0), nrow=min(4, image_vis.shape[0]))
-    save_image(compare, image_dir / f"compare_step_{step:07d}.png")
+    angle_vis = torch.rad2deg(
+        torch.acos((F.normalize(prediction[:4].float(), dim=1) * F.normalize(target[:4].float(), dim=1)).sum(dim=1).clamp(-1.0, 1.0))
+    ).unsqueeze(1).detach().cpu().float().div(45.0).clamp(0.0, 1.0)
+    angle_vis = angle_vis.repeat(1, 3, 1, 1)
+
+    image_grid = make_grid(image_vis, nrow=min(4, image_vis.shape[0]))
+    target_grid = make_grid(target_vis, nrow=min(4, target_vis.shape[0]))
+    prediction_grid = make_grid(prediction_vis, nrow=min(4, prediction_vis.shape[0]))
+    angle_grid = make_grid(angle_vis, nrow=min(4, angle_vis.shape[0]))
+    compare = make_grid(torch.cat([image_vis, target_vis, prediction_vis, angle_vis], dim=0), nrow=min(4, image_vis.shape[0]))
+    save_image(image_grid, image_dir / f"{stage}_rgb_step_{step:07d}.png")
+    save_image(target_grid, image_dir / f"{stage}_normal_gt_step_{step:07d}.png")
+    save_image(prediction_grid, image_dir / f"{stage}_normal_pred_step_{step:07d}.png")
+    save_image(angle_grid, image_dir / f"{stage}_normal_angle_step_{step:07d}.png")
+    save_image(compare, image_dir / f"{stage}_compare_step_{step:07d}.png")
+    if swanlab_run is not None:
+        swanlab_run.log(
+            {
+                f"{stage}/rgb": swanlab.Image(image_grid),
+                f"{stage}/normal_gt": swanlab.Image(target_grid),
+                f"{stage}/normal_pred": swanlab.Image(prediction_grid),
+                f"{stage}/normal_angle": swanlab.Image(angle_grid),
+                f"{stage}/compare": swanlab.Image(compare),
+            },
+            step=step,
+        )
 
 
 def save_checkpoint(
@@ -612,13 +725,14 @@ def evaluate(
     args: argparse.Namespace,
     device: torch.device,
     distributed: bool,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
     training = model.training
     model.eval()
     sums: dict[str, torch.Tensor] = {}
     count = 0
+    visual_payload = None
     for batch in dataloader:
-        _, metrics, _, _ = forward_batch(
+        _, metrics, prediction, image = forward_batch(
             model=model,
             normal_vae=normal_vae,
             rgb_vae=rgb_vae,
@@ -627,6 +741,12 @@ def evaluate(
             device=device,
             precision=args.precision,
         )
+        if visual_payload is None:
+            visual_payload = {
+                "image": image.detach().cpu(),
+                "target": batch["target"].detach().cpu(),
+                "prediction": prediction.detach().cpu(),
+            }
         batch_size = batch["image"].shape[0]
         count += batch_size
         for key, value in metrics.items():
@@ -641,7 +761,7 @@ def evaluate(
     result = {key: float(value.item() / total_count) for key, value in sums.items()}
     if training:
         model.train()
-    return result
+    return result, visual_payload
 
 
 def main() -> int:
@@ -653,196 +773,247 @@ def main() -> int:
     seed_everything(args.seed, rank)
 
     if rank == 0:
-        (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+        (output_dir / "args.json").write_text(json.dumps(vars(args), ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.info("world_size=%s device=%s", world_size, device)
 
-    train_dataset = HypersimNormalDataset(
-        root=args.data_root,
-        partition=args.train_partition,
-        pn=args.pn,
-        max_samples=args.max_train_samples,
-    )
-    val_dataset = HypersimNormalDataset(
-        root=args.data_root,
-        partition=args.val_partition,
-        pn=args.pn,
-        max_samples=args.max_val_samples,
-    )
-    train_loader, train_sampler = make_dataloader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        distributed=distributed,
-        shuffle=True,
-        drop_last=True,
-    )
-    val_loader, _ = make_dataloader(
-        val_dataset,
-        batch_size=args.val_batch_size,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        distributed=distributed,
-        shuffle=False,
-        drop_last=False,
-    )
+    swanlab_run = None
+    try:
+        if rank == 0:
+            LOGGER.info(
+                "batch_size_per_gpu=%d global_batch_size=%d val_batch_size_per_gpu=%d zero=%d swanlab_mode=%s",
+                args.batch_size,
+                args.batch_size * world_size,
+                args.val_batch_size,
+                args.zero,
+                args.swanlab_mode,
+            )
 
-    normal_vae = build_bsq_vae(
-        ckpt_path=args.normal_vae_ckpt,
-        codebook_dim=args.normal_vae_type,
-        apply_spatial_patchify=args.normal_apply_spatial_patchify,
-        device=device,
-    )
-    rgb_vae = build_bsq_vae(
-        ckpt_path=args.rgb_vae_ckpt,
-        codebook_dim=args.rgb_vae_type,
-        apply_spatial_patchify=args.rgb_apply_spatial_patchify,
-        device=device,
-    )
+        train_dataset = HypersimNormalDataset(
+            root=args.data_root,
+            partition=args.train_partition,
+            pn=args.pn,
+            max_samples=args.max_train_samples,
+        )
+        val_dataset = HypersimNormalDataset(
+            root=args.data_root,
+            partition=args.val_partition,
+            pn=args.pn,
+            max_samples=args.max_val_samples,
+        )
+        train_loader, train_sampler = make_dataloader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            distributed=distributed,
+            shuffle=True,
+            drop_last=True,
+        )
+        val_loader, _ = make_dataloader(
+            val_dataset,
+            batch_size=args.val_batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            distributed=distributed,
+            shuffle=False,
+            drop_last=False,
+        )
 
-    rgb_cond_dim = rgb_vae.embed_dim * (4 if args.rgb_apply_spatial_patchify else 1)
-    model = build_infinity_normal_model(
-        model_name=args.model_name,
-        vae_local=normal_vae,
-        cond_dim=rgb_cond_dim,
-        text_maxlen=max_condition_length_for_pn(args.pn),
-        pn=args.pn,
-        batch_size=args.batch_size,
-        use_bit_label=args.use_bit_label,
-        add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
-        rope2d_each_sa_layer=args.rope2d_each_sa_layer,
-        rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
-        apply_spatial_patchify=args.normal_apply_spatial_patchify,
-        device=device,
-    )
-    model = convert_model_precision(model, args.precision)
-    maybe_load_init_model(model, args.init_model, is_main=(rank == 0))
-    model = build_training_model(model, args=args, device=device, distributed=distributed)
+        normal_vae = build_bsq_vae(
+            ckpt_path=args.normal_vae_ckpt,
+            codebook_dim=args.normal_vae_type,
+            apply_spatial_patchify=args.normal_apply_spatial_patchify,
+            device=device,
+        )
+        rgb_vae = build_bsq_vae(
+            ckpt_path=args.rgb_vae_ckpt,
+            codebook_dim=args.rgb_vae_type,
+            apply_spatial_patchify=args.rgb_apply_spatial_patchify,
+            device=device,
+        )
 
-    total_steps = len(train_loader) * args.epochs
-    if args.max_steps > 0:
-        total_steps = min(total_steps, args.max_steps)
-    optimizer, scheduler = build_optimizer_and_scheduler(model, args, total_steps=max(1, total_steps))
-    scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16"))
-    start_epoch, global_step, best_val_angle = maybe_resume(
-        args=args,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler if args.precision == "fp16" else None,
-        is_main=(rank == 0),
-    )
+        rgb_cond_dim = rgb_vae.embed_dim * (4 if args.rgb_apply_spatial_patchify else 1)
+        model = build_infinity_normal_model(
+            model_name=args.model_name,
+            vae_local=normal_vae,
+            cond_dim=rgb_cond_dim,
+            text_maxlen=max_condition_length_for_pn(args.pn),
+            pn=args.pn,
+            batch_size=args.batch_size,
+            use_bit_label=args.use_bit_label,
+            add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
+            rope2d_each_sa_layer=args.rope2d_each_sa_layer,
+            rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
+            apply_spatial_patchify=args.normal_apply_spatial_patchify,
+            device=device,
+        )
+        model = convert_model_precision(model, args.precision)
+        maybe_load_init_model(model, args.init_model, is_main=(rank == 0))
+        model = build_training_model(model, args=args, device=device, distributed=distributed)
 
-    model.train()
-    start_time = time.time()
-    for epoch in range(start_epoch, args.epochs):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+        total_steps = len(train_loader) * args.epochs
+        if args.max_steps > 0:
+            total_steps = min(total_steps, args.max_steps)
+        optimizer, scheduler = build_optimizer_and_scheduler(model, args, total_steps=max(1, total_steps))
+        scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16"))
+        start_epoch, global_step, best_val_angle = maybe_resume(
+            args=args,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler if args.precision == "fp16" else None,
+            is_main=(rank == 0),
+        )
 
-        for batch_idx, batch in enumerate(train_loader):
-            optimizer.zero_grad(set_to_none=True)
-            total_loss, metrics, prediction, image = forward_batch(
+        swanlab_run = init_swanlab(args, output_dir, enabled=(rank == 0))
+
+        model.train()
+        start_time = time.time()
+        for epoch in range(start_epoch, args.epochs):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            for batch_idx, batch in enumerate(train_loader):
+                optimizer.zero_grad(set_to_none=True)
+                total_loss, metrics, prediction, image = forward_batch(
+                    model=model,
+                    normal_vae=normal_vae,
+                    rgb_vae=rgb_vae,
+                    batch=batch,
+                    args=args,
+                    device=device,
+                    precision=args.precision,
+                )
+
+                if args.precision == "fp16":
+                    scaler.scale(total_loss).backward()
+                    if args.grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        clip_grad_norm(model, args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    total_loss.backward()
+                    clip_grad_norm(model, args.grad_clip)
+                    optimizer.step()
+                scheduler.step()
+                global_step += 1
+
+                reduced = reduce_metrics(metrics, distributed)
+                current_lr = optimizer.param_groups[0]["lr"]
+                if rank == 0 and (global_step % args.log_every == 0 or global_step == 1):
+                    LOGGER.info(
+                        "epoch=%d step=%d/%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f lr=%.2e",
+                        epoch + 1,
+                        global_step,
+                        total_steps,
+                        reduced["loss_total"],
+                        reduced["loss_ce"],
+                        reduced["loss_total_aux"],
+                        reduced["angle_deg"],
+                        reduced["acc_11_25"],
+                        reduced["acc_22_5"],
+                        reduced["acc_30"],
+                        current_lr,
+                    )
+                    if swanlab_run is not None:
+                        payload = {f"train/{key}": value for key, value in reduced.items()}
+                        payload["train/lr"] = current_lr
+                        payload["train/epoch"] = epoch + 1
+                        swanlab_run.log(payload, step=global_step)
+                if rank == 0 and (global_step % args.image_log_every == 0 or global_step == 1):
+                    save_visuals(
+                        output_dir,
+                        swanlab_run,
+                        "train",
+                        global_step,
+                        image,
+                        batch["target"].to(device),
+                        prediction,
+                        is_main=True,
+                    )
+
+                if args.max_steps > 0 and global_step >= args.max_steps:
+                    break
+
+            val_metrics, val_visuals = evaluate(
                 model=model,
                 normal_vae=normal_vae,
                 rgb_vae=rgb_vae,
-                batch=batch,
+                dataloader=val_loader,
                 args=args,
                 device=device,
-                precision=args.precision,
+                distributed=distributed,
             )
-
-            if args.precision == "fp16":
-                scaler.scale(total_loss).backward()
-                if args.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    clip_grad_norm(model, args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                total_loss.backward()
-                clip_grad_norm(model, args.grad_clip)
-                optimizer.step()
-            scheduler.step()
-            global_step += 1
-
-            reduced = reduce_metrics(metrics, distributed)
-            if rank == 0 and (global_step % args.log_every == 0 or global_step == 1):
+            should_save_last = (epoch + 1) % args.save_every_epoch == 0
+            is_best = val_metrics["angle_deg"] < best_val_angle
+            if is_best:
+                best_val_angle = val_metrics["angle_deg"]
+            if rank == 0:
                 LOGGER.info(
-                    "epoch=%d step=%d/%d loss=%.4f ce=%.4f angle=%.2f acc11=%.3f lr=%.2e",
+                    "val epoch=%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
                     epoch + 1,
-                    global_step,
-                    total_steps,
-                    reduced["loss_total"],
-                    reduced["loss_ce"],
-                    reduced["angle_deg"],
-                    reduced["acc_11_25"],
-                    optimizer.param_groups[0]["lr"],
+                    val_metrics["loss_total"],
+                    val_metrics["loss_ce"],
+                    val_metrics["loss_total_aux"],
+                    val_metrics["angle_deg"],
+                    val_metrics["acc_11_25"],
+                    val_metrics["acc_22_5"],
+                    val_metrics["acc_30"],
                 )
-            if rank == 0 and (global_step % args.image_log_every == 0 or global_step == 1):
-                save_visuals(output_dir, global_step, image, batch["target"].to(device), prediction)
+                if swanlab_run is not None:
+                    payload = {f"val/{key}": value for key, value in val_metrics.items()}
+                    payload["val/epoch"] = epoch + 1
+                    swanlab_run.log(payload, step=global_step)
+                if val_visuals is not None:
+                    save_visuals(
+                        output_dir,
+                        swanlab_run,
+                        "val",
+                        global_step,
+                        val_visuals["image"],
+                        val_visuals["target"],
+                        val_visuals["prediction"],
+                        is_main=True,
+                    )
+            if should_save_last:
+                save_checkpoint(
+                    output_dir / "checkpoints" / "last.pth",
+                    args=args,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler if args.precision == "fp16" else None,
+                    epoch=epoch + 1,
+                    step=global_step,
+                    best_val_angle=best_val_angle,
+                    is_main=(rank == 0),
+                )
+            if is_best:
+                save_checkpoint(
+                    output_dir / "checkpoints" / f"best_angle_{best_val_angle:.4f}.pth",
+                    args=args,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler if args.precision == "fp16" else None,
+                    epoch=epoch + 1,
+                    step=global_step,
+                    best_val_angle=best_val_angle,
+                    is_main=(rank == 0),
+                )
 
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
 
-        val_metrics = evaluate(
-            model=model,
-            normal_vae=normal_vae,
-            rgb_vae=rgb_vae,
-            dataloader=val_loader,
-            args=args,
-            device=device,
-            distributed=distributed,
-        )
-        should_save_last = (epoch + 1) % args.save_every_epoch == 0
-        is_best = val_metrics["angle_deg"] < best_val_angle
-        if is_best:
-            best_val_angle = val_metrics["angle_deg"]
         if rank == 0:
-            LOGGER.info(
-                "val epoch=%d loss=%.4f ce=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
-                epoch + 1,
-                val_metrics["loss_total"],
-                val_metrics["loss_ce"],
-                val_metrics["angle_deg"],
-                val_metrics["acc_11_25"],
-                val_metrics["acc_22_5"],
-                val_metrics["acc_30"],
-            )
-        if should_save_last:
-            save_checkpoint(
-                output_dir / "checkpoints" / "last.pth",
-                args=args,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler if args.precision == "fp16" else None,
-                epoch=epoch + 1,
-                step=global_step,
-                best_val_angle=best_val_angle,
-                is_main=(rank == 0),
-            )
-        if is_best:
-            save_checkpoint(
-                output_dir / "checkpoints" / f"best_angle_{best_val_angle:.4f}.pth",
-                args=args,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler if args.precision == "fp16" else None,
-                epoch=epoch + 1,
-                step=global_step,
-                best_val_angle=best_val_angle,
-                is_main=(rank == 0),
-            )
-
-        if args.max_steps > 0 and global_step >= args.max_steps:
-            break
-
-    if rank == 0:
-        elapsed = time.time() - start_time
-        LOGGER.info("finished in %.1fs, best_val_angle=%.4f", elapsed, best_val_angle)
-    cleanup_distributed(distributed)
-    return 0
+            elapsed = time.time() - start_time
+            LOGGER.info("finished in %.1fs, best_val_angle=%.4f", elapsed, best_val_angle)
+        return 0
+    finally:
+        if swanlab_run is not None:
+            swanlab_run.finish()
+        cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":
