@@ -9,11 +9,12 @@ pandas
 timm==0.9.6
 decord
 transformers
-torch==2.5.1
+torch==2.6.0
 pytz
 pandas
 wandb
 swanlab
+textual
 colorama
 imageio
 einops

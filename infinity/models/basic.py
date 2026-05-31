@@ -14,9 +14,20 @@ import numpy as np
 from timm.models.layers import DropPath, drop_path
 from torch.utils.checkpoint import checkpoint
 
-# Import flash_attn's attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
-from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+# Import flash_attn's attention when available. Inference can run through
+# PyTorch SDPA when customized_flash_attn is disabled.
+try:
+    from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+    from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+    flash_attn_installed = True
+except (ImportError, OSError):
+    flash_attn_installed = False
+
+    def flash_attn_func(*args, **kwargs):
+        raise ImportError("flash-attn is not installed or is incompatible with this torch build.")
+
+    def flash_attn_varlen_kvpacked_func(*args, **kwargs):
+        raise ImportError("flash-attn is not installed or is incompatible with this torch build.")
 
 from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
 
@@ -392,7 +403,20 @@ class CrossAttention(nn.Module):
         kv_compact = kv_compact.contiguous()
         
         cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
-        if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
+        if not flash_attn_installed:
+            q_view = q_compact.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+            pieces = []
+            for batch_idx in range(B):
+                start = int(cu_seqlens_k[batch_idx].item())
+                end = int(cu_seqlens_k[batch_idx + 1].item())
+                k, v = kv_compact[start:end].unbind(dim=1)
+                k = k.transpose(0, 1).unsqueeze(0)
+                v = v.transpose(0, 1).unsqueeze(0)
+                pieces.append(
+                    slow_attn(q_view[batch_idx : batch_idx + 1], k, v, dropout_p=0.0, scale=self.scale)
+                )
+            oup = torch.cat(pieces, dim=0).transpose(1, 2).reshape(B, Lq, -1)
+        elif q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
             oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), kv=kv_compact.to(dtype=torch.bfloat16), cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
             oup = oup.float()
         else:
