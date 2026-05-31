@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recon-cosine-weight", type=float, default=1.0)
     parser.add_argument("--vq-weight", type=float, default=1.0)
     parser.add_argument("--norm-weight", type=float, default=0.1)
+    parser.add_argument("--normal-gradient-weight", type=float, default=0.2)
     parser.add_argument("--vae-ckpt", type=str, default=str(ROOT_DIR / "weights" / "infinity_vae_d56_f8_14_patchify.pth"))
     parser.add_argument("--codebook-dim", type=int, default=14)
     parser.add_argument("--apply-spatial-patchify", action="store_true", default=True)
@@ -189,6 +190,20 @@ def masked_scalar_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return value[valid].mean()
 
 
+def masked_gradient_l1(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    pred_dx = prediction[:, :, :, 1:] - prediction[:, :, :, :-1]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    mask_dx = mask[:, :, :, 1:] & mask[:, :, :, :-1]
+
+    pred_dy = prediction[:, :, 1:, :] - prediction[:, :, :-1, :]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    mask_dy = mask[:, :, 1:, :] & mask[:, :, :-1, :]
+
+    loss_dx = masked_channel_mean((pred_dx - target_dx).abs(), mask_dx)
+    loss_dy = masked_channel_mean((pred_dy - target_dy).abs(), mask_dy)
+    return 0.5 * (loss_dx + loss_dy)
+
+
 def compute_metrics(
     target: torch.Tensor,
     recon: torch.Tensor,
@@ -207,12 +222,14 @@ def compute_metrics(
     recon_cosine = masked_scalar_mean(cosine_distance, mask)
     recon_angle_deg = masked_scalar_mean(angular_deg, mask)
     norm_loss = masked_channel_mean((pred_norm - 1.0).abs(), mask)
+    gradient_loss = masked_gradient_l1(recon_normalized, target_normalized, mask)
 
     total_loss = (
         args.recon_l1_weight * recon_l1
         + args.recon_cosine_weight * recon_cosine
         + args.vq_weight * vq_loss
         + args.norm_weight * norm_loss
+        + args.normal_gradient_weight * gradient_loss
     )
     metrics = {
         "loss_total": total_loss.detach(),
@@ -220,6 +237,7 @@ def compute_metrics(
         "loss_recon_cosine": recon_cosine.detach(),
         "loss_vq": vq_loss.detach(),
         "loss_norm": norm_loss.detach(),
+        "loss_normal_gradient": gradient_loss.detach(),
         "metric_angle_deg": recon_angle_deg.detach(),
     }
     return total_loss, metrics
@@ -690,7 +708,7 @@ def main() -> None:
                 if rank == 0 and (global_step == 1 or global_step % args.log_every == 0):
                     elapsed = time.time() - train_start
                     LOGGER.info(
-                        "step=%d epoch=%d batch=%d/%d loss=%.4f l1=%.4f cos=%.4f vq=%.4f norm=%.4f angle=%.3f lr=%.6g elapsed=%.1fs",
+                        "step=%d epoch=%d batch=%d/%d loss=%.4f l1=%.4f cos=%.4f grad=%.4f vq=%.4f norm=%.4f angle=%.3f lr=%.6g elapsed=%.1fs",
                         global_step,
                         epoch,
                         batch_idx + 1,
@@ -698,6 +716,7 @@ def main() -> None:
                         reduced_metrics["loss_total"],
                         reduced_metrics["loss_recon_l1"],
                         reduced_metrics["loss_recon_cosine"],
+                        reduced_metrics["loss_normal_gradient"],
                         reduced_metrics["loss_vq"],
                         reduced_metrics["loss_norm"],
                         reduced_metrics["metric_angle_deg"],
@@ -715,11 +734,12 @@ def main() -> None:
             val_metrics, val_visuals = run_validation(model, val_loader, device, distributed, args)
             if rank == 0 and val_metrics:
                 LOGGER.info(
-                    "val epoch=%d loss=%.4f l1=%.4f cos=%.4f vq=%.4f norm=%.4f angle=%.3f",
+                    "val epoch=%d loss=%.4f l1=%.4f cos=%.4f grad=%.4f vq=%.4f norm=%.4f angle=%.3f",
                     epoch,
                     val_metrics["loss_total"],
                     val_metrics["loss_recon_l1"],
                     val_metrics["loss_recon_cosine"],
+                    val_metrics["loss_normal_gradient"],
                     val_metrics["loss_vq"],
                     val_metrics["loss_norm"],
                     val_metrics["metric_angle_deg"],

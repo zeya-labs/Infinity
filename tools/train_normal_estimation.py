@@ -36,14 +36,13 @@ if str(ROOT_DIR) not in sys.path:
 from infinity.normal_estimation import (  # noqa: E402
     HypersimNormalDataset,
     build_bsq_vae,
-    build_condition_tuple_from_image,
+    build_prefix_tokens_from_image,
     build_infinity_normal_model,
     build_multiscale_var_inputs,
     collate_normal_estimation_batch,
     compute_normal_metrics,
     decode_logits_to_normal,
     load_infinity_state_dict,
-    max_condition_length_for_pn,
     normals_to_vis,
     resolve_scale_schedule_from_hw,
 )
@@ -394,17 +393,6 @@ def clip_grad_norm(model: torch.nn.Module, max_norm: float) -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
 
-def cast_condition_tuple(
-    cond_tuple: tuple[torch.Tensor, list[int], torch.Tensor, int],
-    model: torch.nn.Module,
-) -> tuple[torch.Tensor, list[int], torch.Tensor, int]:
-    target_dtype = next(parameter.dtype for parameter in model.parameters() if parameter.is_floating_point())
-    kv_compact, lens, cu_seqlens, max_seqlen = cond_tuple
-    if kv_compact.dtype != target_dtype:
-        kv_compact = kv_compact.to(dtype=target_dtype)
-    return kv_compact, lens, cu_seqlens, max_seqlen
-
-
 def build_swanlab_experiment_name(args: argparse.Namespace, output_dir: Path) -> str:
     if args.swanlab_experiment_name:
         return args.swanlab_experiment_name
@@ -652,7 +640,7 @@ def forward_batch(
     scale_schedule = scale_schedule[:training_scales]
 
     with torch.no_grad():
-        cond_tuple, _ = build_condition_tuple_from_image(
+        rgb_prefix_blc = build_prefix_tokens_from_image(
             image_01=image,
             rgb_vae=rgb_vae,
             scale_schedule=scale_schedule,
@@ -677,10 +665,9 @@ def forward_batch(
     first_stage_len = int(np.array(scale_schedule[0]).prod())
     x_blc_without_prefix = x_blc_without_prefix[:, : total_seq_len - first_stage_len, :]
     gt_bl = torch.cat(gt_ms_idx_bl, dim=1)[:, :total_seq_len].contiguous().long()
-    cond_tuple = cast_condition_tuple(cond_tuple, model)
 
     with precision_context(precision):
-        logits_blv = model(cond_tuple, x_blc_without_prefix, scale_schedule=scale_schedule)
+        logits_blv = model(rgb_prefix_blc, x_blc_without_prefix, scale_schedule=scale_schedule)
         ce_loss, ce_metrics = compute_ce_loss(logits_blv, gt_bl, use_bit_label=args.use_bit_label)
         prediction, latent_prediction = decode_logits_to_normal(
             logits_blv=logits_blv,
@@ -832,12 +819,9 @@ def main() -> int:
             device=device,
         )
 
-        rgb_cond_dim = rgb_vae.embed_dim * (4 if args.rgb_apply_spatial_patchify else 1)
         model = build_infinity_normal_model(
             model_name=args.model_name,
             vae_local=normal_vae,
-            cond_dim=rgb_cond_dim,
-            text_maxlen=max_condition_length_for_pn(args.pn),
             pn=args.pn,
             batch_size=args.batch_size,
             use_bit_label=args.use_bit_label,

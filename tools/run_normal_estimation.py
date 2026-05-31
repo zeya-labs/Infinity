@@ -17,10 +17,9 @@ if str(ROOT_DIR) not in sys.path:
 
 from infinity.normal_estimation import (  # noqa: E402
     build_bsq_vae,
-    build_condition_tuple_from_image,
+    build_prefix_tokens_from_image,
     build_infinity_normal_model,
     load_infinity_state_dict,
-    max_condition_length_for_pn,
     normalize_normals,
     normals_to_vis,
     resolve_scale_schedule_from_hw,
@@ -147,12 +146,9 @@ def main() -> int:
         device=device,
     )
 
-    rgb_cond_dim = rgb_vae.embed_dim * (4 if rgb_apply_spatial_patchify else 1)
     model = build_infinity_normal_model(
         model_name=model_name,
         vae_local=normal_vae,
-        cond_dim=rgb_cond_dim,
-        text_maxlen=max_condition_length_for_pn(pn),
         pn=pn,
         batch_size=1,
         use_bit_label=use_bit_label,
@@ -176,37 +172,21 @@ def main() -> int:
             image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            cond_tuple, _ = build_condition_tuple_from_image(
+            rgb_prefix_blc = build_prefix_tokens_from_image(
                 image_01=image_tensor,
                 rgb_vae=rgb_vae,
                 scale_schedule=scale_schedule,
                 apply_spatial_patchify=rgb_apply_spatial_patchify,
             )
-            generated = model.autoregressive_infer_cfg(
+            raw_normal = model.autoregressive_infer_prefix(
                 vae=normal_vae,
+                rgb_prefix_blc=rgb_prefix_blc,
                 scale_schedule=scale_schedule,
-                label_B_or_BLT=cond_tuple,
-                B=1,
-                g_seed=None,
-                cfg_list=[1.0] * len(scale_schedule),
-                tau_list=[args.tau] * len(scale_schedule),
+                tau=args.tau,
                 top_k=args.top_k,
                 top_p=args.top_p,
                 vae_type=normal_vae_type,
-                returns_vemb=1,
-                ret_img=True,
-                inference_mode=True,
             )
-            if isinstance(generated, tuple):
-                generated_img = generated[2]
-            elif isinstance(generated, list):
-                generated_img = generated[-1]
-            else:
-                generated_img = generated
-            if generated_img.ndim == 3:
-                generated_img = generated_img.unsqueeze(0)
-            generated_img = generated_img.permute(0, 3, 1, 2).float().div(255.0).flip(dims=(1,))
-            raw_normal = generated_img.mul(2.0).sub(1.0)
             raw_normal = F.interpolate(raw_normal, size=(original_height, original_width), mode="bilinear", align_corners=False)
             raw_normal = normalize_normals(raw_normal)
             normal_vis = normals_to_vis(raw_normal)[0]
