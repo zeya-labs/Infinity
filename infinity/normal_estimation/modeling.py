@@ -467,7 +467,7 @@ class InfinityNormalPrefixModel(Infinity):
                 next_input = F.interpolate(
                     summed_codes,
                     size=vae_scale_schedule[scale_index],
-                    mode=vae.quantizer.z_interplote_up,
+                    mode=vae.quantizer.z_interplote_down,
                 ).contiguous()
                 next_input = _flatten_feature_tokens(next_input, apply_spatial_patchify=self.apply_spatial_patchify)
                 current_emb = self.word_embed(self.norm0_ve(next_input.float())) + self.normal_modality_embed
@@ -718,7 +718,8 @@ def build_multiscale_var_inputs(
             gt_all_bit_indices.append(bit_indices)
 
             if 0 <= noise_apply_layers and scale_index < noise_apply_layers and noise_apply_strength > 0:
-                mask = torch.rand_like(bit_indices.float()) < noise_apply_strength
+                stage_noise_strength = np.random.randint(0, int(100 * noise_apply_strength) + 1) * 0.01
+                mask = torch.rand_like(bit_indices.float()) < stage_noise_strength
                 noisy_indices = bit_indices.clone()
                 noisy_indices[mask] = 1 - noisy_indices[mask]
                 if noise_apply_requant:

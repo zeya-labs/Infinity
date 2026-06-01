@@ -103,10 +103,10 @@ def main() -> int:
     normal_vae_type = int(_resolve_option(args.normal_vae_type, checkpoint_args, "normal_vae_type", 14))
     rgb_vae_type = int(_resolve_option(args.rgb_vae_type, checkpoint_args, "rgb_vae_type", 14))
     normal_apply_spatial_patchify = bool(
-        int(_resolve_option(args.normal_apply_spatial_patchify, checkpoint_args, "normal_apply_spatial_patchify", 1))
+        int(_resolve_option(args.normal_apply_spatial_patchify, checkpoint_args, "normal_apply_spatial_patchify", 0))
     )
     rgb_apply_spatial_patchify = bool(
-        int(_resolve_option(args.rgb_apply_spatial_patchify, checkpoint_args, "rgb_apply_spatial_patchify", 1))
+        int(_resolve_option(args.rgb_apply_spatial_patchify, checkpoint_args, "rgb_apply_spatial_patchify", 0))
     )
     use_bit_label = bool(int(_resolve_option(args.use_bit_label, checkpoint_args, "use_bit_label", 1)))
     add_lvl_embeding_only_first_block = int(

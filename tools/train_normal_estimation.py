@@ -22,7 +22,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
-from torch.distributed.fsdp.api import FullOptimStateDictConfig, FullStateDictConfig, StateDictType
+try:
+    from torch.distributed.fsdp import FullOptimStateDictConfig, FullStateDictConfig, StateDictType
+except ImportError:
+    FullOptimStateDictConfig = None
+    FullStateDictConfig = None
+    StateDictType = None
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -50,8 +55,16 @@ from infinity.models.infinity import MultipleLayers  # noqa: E402
 
 
 LOGGER = logging.getLogger("train_normal_estimation")
-FULLSTATE_SAVE_POLICY = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-FULLOPTSTATE_SAVE_POLICY = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+FULLSTATE_SAVE_POLICY = (
+    FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    if FullStateDictConfig is not None
+    else None
+)
+FULLOPTSTATE_SAVE_POLICY = (
+    FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    if FullOptimStateDictConfig is not None
+    else None
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-fsdp-use-orig-params", dest="fsdp_use_orig_params", action="store_false")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--image-log-every", type=int, default=200)
+    parser.add_argument("--ar-eval-every", type=int, default=0)
+    parser.add_argument("--ar-eval-samples", type=int, default=32)
+    parser.add_argument("--ar-eval-top-k", type=int, default=1)
+    parser.add_argument("--ar-eval-top-p", type=float, default=0.0)
+    parser.add_argument("--ar-eval-tau", type=float, default=1.0)
     parser.add_argument("--save-every-epoch", type=int, default=1)
     parser.add_argument("--save-optimizer-state", action="store_true", default=False)
     parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="0.06M")
@@ -106,11 +124,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-noise-requant", dest="noise_apply_requant", action="store_false")
     parser.add_argument("--normal-vae-ckpt", type=str, required=True)
     parser.add_argument("--normal-vae-type", type=int, default=14)
-    parser.add_argument("--normal-apply-spatial-patchify", action="store_true", default=True)
+    parser.add_argument("--normal-apply-spatial-patchify", action="store_true", default=False)
     parser.add_argument("--disable-normal-spatial-patchify", dest="normal_apply_spatial_patchify", action="store_false")
     parser.add_argument("--rgb-vae-ckpt", type=str, required=True)
     parser.add_argument("--rgb-vae-type", type=int, default=14)
-    parser.add_argument("--rgb-apply-spatial-patchify", action="store_true", default=True)
+    parser.add_argument("--rgb-apply-spatial-patchify", action="store_true", default=False)
     parser.add_argument("--rgb-no-spatial-patchify", dest="rgb_apply_spatial_patchify", action="store_false")
     parser.add_argument("--swanlab-project", type=str, default=os.environ.get("SWANLAB_PROJECT", "infinity_normal_estimation_hypersim"))
     parser.add_argument("--swanlab-workspace", type=str, default=os.environ.get("SWANLAB_WORKSPACE", ""))
@@ -321,6 +339,14 @@ def is_fsdp_model(model: torch.nn.Module) -> bool:
     return isinstance(model, FSDP)
 
 
+def require_fsdp_state_dict_api() -> None:
+    if StateDictType is None or FULLSTATE_SAVE_POLICY is None or FULLOPTSTATE_SAVE_POLICY is None:
+        raise ImportError(
+            "Current PyTorch does not provide FSDP full-state-dict APIs. "
+            "Use --zero 0 or run with a newer PyTorch environment."
+        )
+
+
 def build_training_model(
     model: torch.nn.Module,
     *,
@@ -527,6 +553,7 @@ def save_checkpoint(
         "zero": args.zero,
     }
     if is_fsdp_model(model):
+        require_fsdp_state_dict_api()
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FULLSTATE_SAVE_POLICY, FULLOPTSTATE_SAVE_POLICY):
             payload["gpt"] = model.state_dict()
             if args.save_optimizer_state:
@@ -567,6 +594,7 @@ def maybe_resume(
     checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
     checkpoint_zero = int(checkpoint.get("zero", 0))
     if is_fsdp_model(model):
+        require_fsdp_state_dict_api()
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FULLSTATE_SAVE_POLICY, FULLOPTSTATE_SAVE_POLICY):
             model.load_state_dict(checkpoint["gpt"], strict=True)
     else:
@@ -751,6 +779,82 @@ def evaluate(
     return result, visual_payload
 
 
+@torch.no_grad()
+def evaluate_ar(
+    *,
+    model: torch.nn.Module,
+    normal_vae: torch.nn.Module,
+    rgb_vae: torch.nn.Module,
+    dataloader: DataLoader,
+    args: argparse.Namespace,
+    device: torch.device,
+    distributed: bool,
+) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
+    training = model.training
+    model.eval()
+    raw_model = model.module if isinstance(model, DDP) else model
+    sums: dict[str, torch.Tensor] = {}
+    count = 0
+    visual_payload = None
+
+    for batch in dataloader:
+        image = batch["image"].to(device, non_blocking=True)
+        target = batch["target"].to(device, non_blocking=True)
+        mask = batch["mask"].to(device, non_blocking=True)
+        scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target.shape[-2], target.shape[-1], args.pn)[1]]
+        training_scales = min(args.always_training_scales, len(scale_schedule))
+        scale_schedule = scale_schedule[:training_scales]
+
+        rgb_prefix_blc = build_prefix_tokens_from_image(
+            image_01=image,
+            rgb_vae=rgb_vae,
+            scale_schedule=scale_schedule,
+            apply_spatial_patchify=args.rgb_apply_spatial_patchify,
+        )
+        with precision_context(args.precision):
+            prediction = raw_model.autoregressive_infer_prefix(
+                vae=normal_vae,
+                rgb_prefix_blc=rgb_prefix_blc,
+                scale_schedule=scale_schedule,
+                top_k=args.ar_eval_top_k,
+                top_p=args.ar_eval_top_p,
+                tau=args.ar_eval_tau,
+                vae_type=args.normal_vae_type,
+            )
+        target_for_prediction, mask_for_prediction = maybe_resize_target_for_prediction(prediction, target, mask)
+        _, metrics = compute_normal_metrics(
+            prediction=prediction,
+            target=target_for_prediction,
+            mask=mask_for_prediction,
+            l1_weight=0.0,
+            angular_weight=0.0,
+            latent_weight=0.0,
+            norm_weight=0.0,
+        )
+        if visual_payload is None:
+            visual_payload = {
+                "image": image.detach().cpu(),
+                "target": target.detach().cpu(),
+                "prediction": prediction.detach().cpu(),
+            }
+        batch_size = image.shape[0]
+        count += batch_size
+        for key, value in metrics.items():
+            sums[key] = sums.get(key, value.new_tensor(0.0)) + value * batch_size
+
+    count_tensor = torch.tensor(float(count), device=device)
+    if distributed:
+        dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+        for value in sums.values():
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    total_count = max(1.0, float(count_tensor.item()))
+    result = {key: float(value.item() / total_count) for key, value in sums.items()}
+    result["samples"] = total_count
+    if training:
+        model.train()
+    return result, visual_payload
+
+
 def main() -> int:
     args = parse_args()
     distributed, rank, world_size, device = init_distributed()
@@ -787,6 +891,12 @@ def main() -> int:
             pn=args.pn,
             max_samples=args.max_val_samples,
         )
+        ar_val_dataset = HypersimNormalDataset(
+            root=args.data_root,
+            partition=args.val_partition,
+            pn=args.pn,
+            max_samples=args.ar_eval_samples,
+        ) if args.ar_eval_samples > 0 else None
         train_loader, train_sampler = make_dataloader(
             train_dataset,
             batch_size=args.batch_size,
@@ -805,6 +915,17 @@ def main() -> int:
             shuffle=False,
             drop_last=False,
         )
+        ar_val_loader = None
+        if ar_val_dataset is not None:
+            ar_val_loader, _ = make_dataloader(
+                ar_val_dataset,
+                batch_size=args.val_batch_size,
+                num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                distributed=distributed,
+                shuffle=False,
+                drop_last=False,
+            )
 
         normal_vae = build_bsq_vae(
             ckpt_path=args.normal_vae_ckpt,
@@ -917,6 +1038,46 @@ def main() -> int:
                         is_main=True,
                     )
 
+                if (
+                    ar_val_loader is not None
+                    and args.ar_eval_every > 0
+                    and global_step % args.ar_eval_every == 0
+                ):
+                    ar_metrics, ar_visuals = evaluate_ar(
+                        model=model,
+                        normal_vae=normal_vae,
+                        rgb_vae=rgb_vae,
+                        dataloader=ar_val_loader,
+                        args=args,
+                        device=device,
+                        distributed=distributed,
+                    )
+                    if rank == 0:
+                        LOGGER.info(
+                            "val_ar step=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                            global_step,
+                            ar_metrics["samples"],
+                            ar_metrics["angle_deg"],
+                            ar_metrics["acc_11_25"],
+                            ar_metrics["acc_22_5"],
+                            ar_metrics["acc_30"],
+                        )
+                        if swanlab_run is not None:
+                            payload = {f"val_ar/{key}": value for key, value in ar_metrics.items()}
+                            swanlab_run.log(payload, step=global_step)
+                        if ar_visuals is not None:
+                            save_visuals(
+                                output_dir,
+                                swanlab_run,
+                                "val_ar",
+                                global_step,
+                                ar_visuals["image"],
+                                ar_visuals["target"],
+                                ar_visuals["prediction"],
+                                is_main=True,
+                            )
+                    dist_barrier_if_initialized()
+
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
 
@@ -960,6 +1121,42 @@ def main() -> int:
                         val_visuals["prediction"],
                         is_main=True,
                     )
+            if ar_val_loader is not None:
+                ar_metrics, ar_visuals = evaluate_ar(
+                    model=model,
+                    normal_vae=normal_vae,
+                    rgb_vae=rgb_vae,
+                    dataloader=ar_val_loader,
+                    args=args,
+                    device=device,
+                    distributed=distributed,
+                )
+                if rank == 0:
+                    LOGGER.info(
+                        "val_ar epoch=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                        epoch + 1,
+                        ar_metrics["samples"],
+                        ar_metrics["angle_deg"],
+                        ar_metrics["acc_11_25"],
+                        ar_metrics["acc_22_5"],
+                        ar_metrics["acc_30"],
+                    )
+                    if swanlab_run is not None:
+                        payload = {f"val_ar/{key}": value for key, value in ar_metrics.items()}
+                        payload["val_ar/epoch"] = epoch + 1
+                        swanlab_run.log(payload, step=global_step)
+                    if ar_visuals is not None:
+                        save_visuals(
+                            output_dir,
+                            swanlab_run,
+                            "val_ar",
+                            global_step,
+                            ar_visuals["image"],
+                            ar_visuals["target"],
+                            ar_visuals["prediction"],
+                            is_main=True,
+                        )
+                dist_barrier_if_initialized()
             if should_save_last:
                 save_checkpoint(
                     output_dir / "checkpoints" / "last.pth",

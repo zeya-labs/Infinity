@@ -32,14 +32,14 @@ VOLC_DEFAULT_QUEUE_NAME = os.environ.get("INFINITY_VOLC_QUEUE_NAME", "queue010")
 VOLC_DEFAULT_QUEUE_ID = os.environ.get("INFINITY_VOLC_QUEUE_ID", "")
 VOLC_DEFAULT_IMAGE = os.environ.get(
     "INFINITY_VOLC_IMAGE",
-    "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:1.12.1",
+    "cr-mlp-cn-beijing.cr.volces.com/public/cmh_test:1.6",
 )
 VOLC_DEFAULT_FLAVOR = os.environ.get("INFINITY_VOLC_FLAVOR", "ml.pni2.28xlarge")
 VOLC_DEFAULT_GPUS = os.environ.get("INFINITY_VOLC_GPUS", "8")
 VOLC_DEFAULT_FRAMEWORK = os.environ.get("INFINITY_VOLC_FRAMEWORK", "Custom")
 VOLC_DEFAULT_REMOTE_ROOT = os.environ.get("INFINITY_VOLC_REMOTE_ROOT", str(ROOT))
 VOLC_LOCAL_VEPFS_ROOT = Path(os.environ.get("INFINITY_VOLC_LOCAL_VEPFS_ROOT", "/root/vepfs"))
-VOLC_DEFAULT_VEPFS_MOUNT = os.environ.get("INFINITY_VOLC_VEPFS_MOUNT", str(ROOT))
+VOLC_DEFAULT_VEPFS_MOUNT = os.environ.get("INFINITY_VOLC_VEPFS_MOUNT", str(VOLC_LOCAL_VEPFS_ROOT))
 VOLC_DEFAULT_ACTIVE_DEADLINE = os.environ.get("INFINITY_VOLC_ACTIVE_DEADLINE_SECONDS", "432000")
 VOLC_DEFAULT_PREEMPTIBLE = os.environ.get("INFINITY_VOLC_PREEMPTIBLE", "true")
 VOLC_DEFAULT_USER_CODE_PATH = os.environ.get("INFINITY_VOLC_USER_CODE_PATH", "")
@@ -372,12 +372,8 @@ def remoteize_command(command: list[str], remote_root: str) -> list[str]:
     remote = [remoteize_value(part, remote_root) for part in command]
     if os.environ.get("INFINITY_VOLC_PYTHON") and command and command[0] == PYTHON:
         remote[0] = os.environ["INFINITY_VOLC_PYTHON"]
-    elif command and command[0] == PYTHON and command[0].startswith(str(ROOT)):
-        remote[0] = "python"
     if os.environ.get("INFINITY_VOLC_TORCHRUN") and command and command[0] == TORCHRUN:
         remote[0] = os.environ["INFINITY_VOLC_TORCHRUN"]
-    elif command and command[0] == TORCHRUN and command[0].startswith(str(ROOT)):
-        remote[0] = "torchrun"
     return remote
 
 
@@ -387,10 +383,10 @@ def volc_task_name(task: Task, started_at: datetime) -> str:
     return f"infinity-{slug or 'task'}-{stamp}"[:200]
 
 
-def local_vepfs_mount() -> tuple[str, str] | None:
+def local_vepfs_mount(mount_path: Path) -> tuple[str, str] | None:
     try:
         result = subprocess.run(
-            ["findmnt", "-T", str(VOLC_LOCAL_VEPFS_ROOT), "-o", "SOURCE,TARGET", "-n"],
+            ["findmnt", "-T", str(mount_path), "-o", "SOURCE,TARGET", "-n"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -405,8 +401,10 @@ def local_vepfs_mount() -> tuple[str, str] | None:
     if not match:
         return None
     try:
-        relative = ROOT.relative_to(Path(match.group("target"))).as_posix()
+        relative = mount_path.relative_to(Path(match.group("target"))).as_posix()
     except ValueError:
+        relative = ""
+    if relative == ".":
         relative = ""
     base_subpath = match.group("subpath").rstrip("/")
     subpath = f"{base_subpath}/{relative}" if relative else base_subpath
@@ -429,7 +427,7 @@ def volc_storages(config: VolcConfig) -> list[dict[str, object]]:
         "MountPath": config.vepfs_mount,
         "ReadOnly": parse_bool(os.environ.get("INFINITY_VOLC_VEPFS_READ_ONLY", "false")),
     }
-    mounted_vepfs = local_vepfs_mount()
+    mounted_vepfs = local_vepfs_mount(Path(config.vepfs_mount))
     if mounted_vepfs:
         vepfs_id, subpath = mounted_vepfs
         storage["VepfsId"] = vepfs_id
@@ -552,6 +550,7 @@ def extract_volc_task_id(output: str) -> str:
         return str(parsed["Id"])
     patterns = (
         r'"Id"\s*:\s*"([A-Za-z0-9_-]+)"',
+        r"task_id\s*[:=]\s*([A-Za-z0-9_-]+)",
         r"TaskID\s*[:=]\s*([A-Za-z0-9_-]+)",
         r"TaskId\s*[:=]\s*([A-Za-z0-9_-]+)",
         r"TaskId\s+([A-Za-z0-9_-]+)",
@@ -742,6 +741,16 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["log_every"],
         "--image-log-every",
         values["image_log_every"],
+        "--ar-eval-every",
+        values["ar_eval_every"],
+        "--ar-eval-samples",
+        values["ar_eval_samples"],
+        "--ar-eval-top-k",
+        values["ar_eval_top_k"],
+        "--ar-eval-top-p",
+        values["ar_eval_top_p"],
+        "--ar-eval-tau",
+        values["ar_eval_tau"],
         "--save-every-epoch",
         values["save_every_epoch"],
         "--train-partition",
@@ -777,6 +786,8 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         cmd.append("--save-optimizer-state")
     if values["spatial_patchify"].lower() in {"1", "yes", "true", "y"}:
         cmd += ["--normal-apply-spatial-patchify", "--rgb-apply-spatial-patchify"]
+    else:
+        cmd += ["--disable-normal-spatial-patchify", "--rgb-no-spatial-patchify"]
     if values["noise_apply_requant"].lower() in {"0", "no", "false", "n"}:
         cmd.append("--disable-noise-requant")
     return cmd
@@ -940,7 +951,7 @@ TASKS: list[Task] = [
         [
             Field("gpus", "GPU 数", "2"),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
-            Field("data_root", "数据目录", "data/normalart/datasets/processed/hypersim"),
+            Field("data_root", "数据目录", "/root/vepfs/NormalART/datasets/processed/hypersim"),
             Field("normal_vae", "Normal VAE", "weights/infinity_vae_d32reg.pth"),
             Field("rgb_vae", "RGB VAE", "weights/infinity_vae_d32reg.pth"),
             Field("vae_type", "VAE type", "32"),
@@ -965,6 +976,11 @@ TASKS: list[Task] = [
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
+            Field("ar_eval_every", "AR eval every", "0"),
+            Field("ar_eval_samples", "AR eval samples", "32"),
+            Field("ar_eval_top_k", "AR top-k", "1"),
+            Field("ar_eval_top_p", "AR top-p", "0.0"),
+            Field("ar_eval_tau", "AR tau", "1.0"),
             Field("save_every_epoch", "Save every epoch", "1"),
             Field("save_optimizer_state", "保存优化器", "0", choices=("0", "1")),
             Field("train_partition", "Train split", "train"),

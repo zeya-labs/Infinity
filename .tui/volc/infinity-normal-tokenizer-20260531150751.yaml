@@ -1,0 +1,41 @@
+TaskName: "infinity-normal-tokenizer-20260531150751"
+Description: "Submitted from Infinity TUI at 2026-05-31T15:07:51+00:00"
+ImageUrl: "cr-mlp-cn-beijing.cr.volces.com/public/cmh_test:1.6"
+Framework: "Custom"
+Entrypoint: |
+  set -e
+  cd /root/vepfs/Infinity
+  export PYTHONPATH=/root/vepfs/Infinity
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  echo '$ /root/vepfs/Infinity/.venv/bin/torchrun --standalone --nproc_per_node 8 tools/train_normal_tokenizer.py --output-dir /root/vepfs/Infinity/outputs/normal_tokenizer/2026-05-31/15-07-51 --train-cache data/normalart/datasets/cache/hypersim_full/256x256/train.pt --val-cache data/normalart/datasets/cache/hypersim_full/256x256/val.pt --vae-ckpt weights/infinity_vae_d32reg.pth --batch-size 16 --val-batch-size 16 --num-workers 8 --prefetch-factor 4 --repeat-train 1 --repeat-val 1 --lr 2e-4 --min-lr 1e-5 --warmup-ratio 0.03 --betas 0.9 0.95 --weight-decay 1e-4 --grad-clip 1.0 --precision bf16 --epochs 20 --max-steps 0 --log-every 10 --image-log-every 200 --save-every-epoch 1 --recon-l1-weight 1.0 --recon-cosine-weight 1.0 --vq-weight 1.0 --norm-weight 0.1 --normal-gradient-weight 0.2 --codebook-dim 32 --encoder-dtype bf16 --trainable-scope decoder_only --swanlab-mode local --swanlab-project infinity_normal_tokenizer_hypersim --disable-spatial-patchify'
+  /root/vepfs/Infinity/.venv/bin/torchrun --standalone --nproc_per_node 8 tools/train_normal_tokenizer.py --output-dir /root/vepfs/Infinity/outputs/normal_tokenizer/2026-05-31/15-07-51 --train-cache data/normalart/datasets/cache/hypersim_full/256x256/train.pt --val-cache data/normalart/datasets/cache/hypersim_full/256x256/val.pt --vae-ckpt weights/infinity_vae_d32reg.pth --batch-size 16 --val-batch-size 16 --num-workers 8 --prefetch-factor 4 --repeat-train 1 --repeat-val 1 --lr 2e-4 --min-lr 1e-5 --warmup-ratio 0.03 --betas 0.9 0.95 --weight-decay 1e-4 --grad-clip 1.0 --precision bf16 --epochs 20 --max-steps 0 --log-every 10 --image-log-every 200 --save-every-epoch 1 --recon-l1-weight 1.0 --recon-cosine-weight 1.0 --vq-weight 1.0 --norm-weight 0.1 --normal-gradient-weight 0.2 --codebook-dim 32 --encoder-dtype bf16 --trainable-scope decoder_only --swanlab-mode local --swanlab-project infinity_normal_tokenizer_hypersim --disable-spatial-patchify
+TaskRoleSpecs:
+  -
+    RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.28xlarge"
+Envs:
+  -
+    Name: "PYTHONPATH"
+    Value: "/root/vepfs/Infinity"
+  -
+    Name: "PYTORCH_CUDA_ALLOC_CONF"
+    Value: "expandable_segments:True"
+  -
+    Name: "CUDA_VISIBLE_DEVICES"
+    Value: "0,1,2,3,4,5,6,7"
+Storages:
+  -
+    Type: "Vepfs"
+    MountPath: "/root/vepfs"
+    ReadOnly: false
+    VepfsId: "vepfs-cnbj2c98dea54433"
+    SubPath: "queue010/20252203747"
+ActiveDeadlineSeconds: 432000
+EnableTensorBoard: false
+Preemptible: true
+Tags:
+  - "infinity"
+  - "normal_tokenizer"
+ResourceQueueName: "queue010"

@@ -1,0 +1,41 @@
+TaskName: "infinity-normal-estimation-20260531135201"
+Description: "Submitted from Infinity TUI at 2026-05-31T13:52:01+00:00"
+ImageUrl: "vemlp-cn-beijing.cr.volces.com/preset-images/pytorch:1.12.1"
+Framework: "Custom"
+Entrypoint: |
+  set -e
+  cd /root/vepfs/Infinity
+  export PYTHONPATH=/root/vepfs/Infinity
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  echo '$ torchrun --standalone --nproc_per_node 8 tools/train_normal_estimation.py --output-dir /root/vepfs/Infinity/outputs/normal_estimation/2026-05-31/13-52-01 --data-root data/normalart/datasets/processed/hypersim --normal-vae-ckpt weights/infinity_vae_d32reg.pth --rgb-vae-ckpt weights/infinity_vae_d32reg.pth --normal-vae-type 32 --rgb-vae-type 32 --model-name infinity_2b --init-model weights/infinity_2b_reg.pth --pn 0.06M --batch-size 4 --val-batch-size 4 --num-workers 4 --prefetch-factor 4 --lr 1e-4 --min-lr 1e-5 --warmup-ratio 0.03 --betas 0.9 0.95 --weight-decay 1e-4 --grad-clip 1.0 --precision bf16 --zero 0 --epochs 20 --max-steps 0 --log-every 10 --image-log-every 200 --save-every-epoch 1 --train-partition train --val-partition val --max-train-samples 0 --max-val-samples 0 --ce-weight 1.0 --normal-l1-weight 0.25 --normal-angular-weight 0.5 --normal-latent-weight 0.1 --normal-norm-weight 0.05 --noise-apply-layers -1 --noise-apply-strength 0.0 --swanlab-mode local --swanlab-project infinity_normal_estimation_hypersim'
+  torchrun --standalone --nproc_per_node 8 tools/train_normal_estimation.py --output-dir /root/vepfs/Infinity/outputs/normal_estimation/2026-05-31/13-52-01 --data-root data/normalart/datasets/processed/hypersim --normal-vae-ckpt weights/infinity_vae_d32reg.pth --rgb-vae-ckpt weights/infinity_vae_d32reg.pth --normal-vae-type 32 --rgb-vae-type 32 --model-name infinity_2b --init-model weights/infinity_2b_reg.pth --pn 0.06M --batch-size 4 --val-batch-size 4 --num-workers 4 --prefetch-factor 4 --lr 1e-4 --min-lr 1e-5 --warmup-ratio 0.03 --betas 0.9 0.95 --weight-decay 1e-4 --grad-clip 1.0 --precision bf16 --zero 0 --epochs 20 --max-steps 0 --log-every 10 --image-log-every 200 --save-every-epoch 1 --train-partition train --val-partition val --max-train-samples 0 --max-val-samples 0 --ce-weight 1.0 --normal-l1-weight 0.25 --normal-angular-weight 0.5 --normal-latent-weight 0.1 --normal-norm-weight 0.05 --noise-apply-layers -1 --noise-apply-strength 0.0 --swanlab-mode local --swanlab-project infinity_normal_estimation_hypersim
+TaskRoleSpecs:
+  -
+    RoleName: "worker"
+    RoleReplicas: 1
+    Flavor: "ml.pni2.28xlarge"
+Envs:
+  -
+    Name: "PYTHONPATH"
+    Value: "/root/vepfs/Infinity"
+  -
+    Name: "PYTORCH_CUDA_ALLOC_CONF"
+    Value: "expandable_segments:True"
+  -
+    Name: "CUDA_VISIBLE_DEVICES"
+    Value: "0,1,2,3,4,5,6,7"
+Storages:
+  -
+    Type: "Vepfs"
+    MountPath: "/root/vepfs/Infinity"
+    ReadOnly: false
+    VepfsId: "vepfs-cnbj2c98dea54433"
+    SubPath: "queue010/20252203747/Infinity"
+ActiveDeadlineSeconds: 432000
+EnableTensorBoard: false
+Preemptible: true
+Tags:
+  - "infinity"
+  - "normal_estimation"
+ResourceQueueName: "queue010"
