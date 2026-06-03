@@ -676,7 +676,7 @@ class BSQ(Module):
             # calculate indices
             bit_indices = (quantized > 0).int()
             entropy_penalty = persample_entropy = cb_entropy = self.zero
-            commit_loss = self.zero
+            commit_loss = F.mse_loss(x, quantized.detach())
 
             # input back to original dtype if needed
 
@@ -715,4 +715,3 @@ class BSQ(Module):
             return ret
 
         return ret, LossBreakdown(persample_entropy, cb_entropy, commit_loss)
-

@@ -17,7 +17,7 @@ import swanlab
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import make_grid, save_image
 
@@ -26,7 +26,8 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from infinity.models.bsq_vae.vae import vae_model
-from infinity.tokenizer_finetune.data import HypersimNormalCacheDataset, collate_normal_batch
+from infinity.tokenizer_finetune.data import collate_normal_batch
+from infinity.normal_estimation import HypersimNormalDataset
 
 
 LOGGER = logging.getLogger("train_normal_tokenizer")
@@ -34,8 +35,12 @@ LOGGER = logging.getLogger("train_normal_tokenizer")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune Infinity tokenizer on normal maps.")
-    parser.add_argument("--train-cache", type=str, required=True)
-    parser.add_argument("--val-cache", type=str, required=True)
+    parser.add_argument("--data-root", type=str, default=str(ROOT_DIR / "data" / "hypersim" / "processed" / "hypersim"))
+    parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="1M")
+    parser.add_argument("--train-partition", type=str, default="train")
+    parser.add_argument("--val-partition", type=str, default="val")
+    parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--max-val-samples", type=int, default=0)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
@@ -47,8 +52,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--repeat-train", type=int, default=1)
     parser.add_argument("--repeat-val", type=int, default=1)
-    parser.add_argument("--mmap-cache", action="store_true", default=True)
-    parser.add_argument("--disable-mmap-cache", dest="mmap_cache", action="store_false")
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
@@ -62,8 +65,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recon-l1-weight", type=float, default=1.0)
     parser.add_argument("--recon-cosine-weight", type=float, default=1.0)
     parser.add_argument("--vq-weight", type=float, default=1.0)
+    parser.add_argument("--lfq-weight", type=float, default=0.0)
     parser.add_argument("--norm-weight", type=float, default=0.1)
     parser.add_argument("--normal-gradient-weight", type=float, default=0.2)
+    parser.add_argument("--edge-recon-weight", type=float, default=0.0)
     parser.add_argument("--vae-ckpt", type=str, default=str(ROOT_DIR / "weights" / "infinity_vae_d56_f8_14_patchify.pth"))
     parser.add_argument("--codebook-dim", type=int, default=14)
     parser.add_argument("--apply-spatial-patchify", action="store_true", default=True)
@@ -156,6 +161,53 @@ def reduce_metrics(metrics: dict[str, torch.Tensor], enabled: bool) -> dict[str,
     return result
 
 
+def bit_indices_to_codes(bit_indices: torch.Tensor) -> torch.Tensor:
+    bits = bit_indices.detach().bool().reshape(-1, bit_indices.shape[-1]).to(torch.int64)
+    if bits.numel() == 0:
+        return bits.new_zeros((0,))
+    weights = 2 ** torch.arange(bits.shape[-1] - 1, -1, -1, device=bits.device, dtype=torch.int64)
+    return (bits * weights).sum(dim=-1)
+
+
+def compute_codebook_metrics(vq_output: dict[str, Any], args: argparse.Namespace, device: torch.device) -> dict[str, torch.Tensor]:
+    bit_indices_per_scale = vq_output.get("bit_indices") or []
+    metrics: dict[str, torch.Tensor] = {}
+    if not bit_indices_per_scale:
+        return metrics
+
+    utilization_values = []
+    unique_values = []
+    bit_one_values = []
+    bit_entropy_values = []
+    for scale_index, bit_indices in enumerate(bit_indices_per_scale):
+        bits = bit_indices.detach()
+        if bits.numel() == 0:
+            continue
+        codebook_size = float(2 ** bits.shape[-1])
+        codes = bit_indices_to_codes(bits)
+        unique_codes = torch.unique(codes).numel()
+        unique_tensor = torch.tensor(float(unique_codes), device=device)
+        utilization = unique_tensor / codebook_size
+        bit_one_ratio = bits.float().mean()
+        bit_entropy = -(bit_one_ratio * torch.log2(bit_one_ratio.clamp_min(1e-8)) + (1.0 - bit_one_ratio) * torch.log2((1.0 - bit_one_ratio).clamp_min(1e-8)))
+
+        metrics[f"codebook/scale_{scale_index}_unique_codes"] = unique_tensor
+        metrics[f"codebook/scale_{scale_index}_utilization"] = utilization
+        metrics[f"codebook/scale_{scale_index}_bit_one_ratio"] = bit_one_ratio
+        metrics[f"codebook/scale_{scale_index}_bit_entropy"] = bit_entropy
+        utilization_values.append(utilization)
+        unique_values.append(unique_tensor)
+        bit_one_values.append(bit_one_ratio)
+        bit_entropy_values.append(bit_entropy)
+
+    if utilization_values:
+        metrics["codebook/mean_unique_codes"] = torch.stack(unique_values).mean()
+        metrics["codebook/mean_utilization"] = torch.stack(utilization_values).mean()
+        metrics["codebook/mean_bit_one_ratio"] = torch.stack(bit_one_values).mean()
+        metrics["codebook/mean_bit_entropy"] = torch.stack(bit_entropy_values).mean()
+    return metrics
+
+
 def ensure_mask(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if mask.ndim != 4 or mask.shape[1] != 1:
         raise ValueError(f"mask must have shape [B, 1, H, W], got {tuple(mask.shape)}")
@@ -188,6 +240,38 @@ def masked_scalar_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if not torch.any(valid):
         return value.new_tensor(0.0)
     return value[valid].mean()
+
+
+def weighted_channel_mean(value: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    mask_float = mask.float()
+    if value.ndim == 4:
+        mask_float = mask_float.expand(-1, value.shape[1], -1, -1)
+        weight = weight.expand(-1, value.shape[1], -1, -1)
+    numerator = (value * weight * mask_float).sum()
+    denominator = (weight * mask_float).sum().clamp_min(1.0)
+    return numerator / denominator
+
+
+def weighted_scalar_mean(value: torch.Tensor, mask: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    valid = mask.squeeze(1).bool()
+    if not torch.any(valid):
+        return value.new_tensor(0.0)
+    return (value[valid] * weight.squeeze(1)[valid]).sum() / weight.squeeze(1)[valid].sum().clamp_min(1.0)
+
+
+def target_edge_weight(target_normalized: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    grad_x = (target_normalized[:, :, :, 1:] - target_normalized[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+    grad_y = (target_normalized[:, :, 1:, :] - target_normalized[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+    edge = torch.zeros_like(mask, dtype=target_normalized.dtype)
+    edge[:, :, :, 1:] = torch.maximum(edge[:, :, :, 1:], grad_x)
+    edge[:, :, :, :-1] = torch.maximum(edge[:, :, :, :-1], grad_x)
+    edge[:, :, 1:, :] = torch.maximum(edge[:, :, 1:, :], grad_y)
+    edge[:, :, :-1, :] = torch.maximum(edge[:, :, :-1, :], grad_y)
+    valid_edge = edge[mask]
+    if valid_edge.numel() == 0:
+        return torch.ones_like(edge)
+    scale = valid_edge.detach().quantile(0.95).clamp_min(1e-4)
+    return 1.0 + (edge / scale).clamp(0.0, 1.0)
 
 
 def masked_gradient_l1(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -223,6 +307,11 @@ def compute_metrics(
     recon_angle_deg = masked_scalar_mean(angular_deg, mask)
     norm_loss = masked_channel_mean((pred_norm - 1.0).abs(), mask)
     gradient_loss = masked_gradient_l1(recon_normalized, target_normalized, mask)
+    edge_weight = target_edge_weight(target_normalized, mask)
+    edge_recon = 0.5 * (
+        weighted_channel_mean((recon - target).abs(), mask, edge_weight)
+        + weighted_scalar_mean(cosine_distance, mask, edge_weight)
+    )
 
     total_loss = (
         args.recon_l1_weight * recon_l1
@@ -230,6 +319,7 @@ def compute_metrics(
         + args.vq_weight * vq_loss
         + args.norm_weight * norm_loss
         + args.normal_gradient_weight * gradient_loss
+        + args.edge_recon_weight * edge_recon
     )
     metrics = {
         "loss_total": total_loss.detach(),
@@ -238,6 +328,7 @@ def compute_metrics(
         "loss_vq": vq_loss.detach(),
         "loss_norm": norm_loss.detach(),
         "loss_normal_gradient": gradient_loss.detach(),
+        "loss_edge_recon": edge_recon.detach(),
         "metric_angle_deg": recon_angle_deg.detach(),
     }
     return total_loss, metrics
@@ -346,11 +437,48 @@ def build_model(args: argparse.Namespace) -> torch.nn.Module:
         decoder_ch_mult=decoder_ch_mult,
     )
     model.args.encoder_dtype = args.encoder_dtype
+    model.lfq_weight = args.lfq_weight
     return model
 
 
+class RepeatDataset(Dataset):
+    def __init__(self, dataset: Dataset, repeat: int) -> None:
+        if repeat < 1:
+            raise ValueError(f"repeat must be >= 1, got {repeat}")
+        self.dataset = dataset
+        self.repeat = repeat
+
+    def __len__(self) -> int:
+        return len(self.dataset) * self.repeat
+
+    def __getitem__(self, index: int) -> Any:
+        return self.dataset[index % len(self.dataset)]
+
+
+def build_tokenizer_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset]:
+    if not args.data_root:
+        raise ValueError("--data-root is required")
+    train_dataset: Dataset = HypersimNormalDataset(
+        root=args.data_root,
+        partition=args.train_partition,
+        pn=args.pn,
+        max_samples=args.max_train_samples,
+    )
+    val_dataset: Dataset = HypersimNormalDataset(
+        root=args.data_root,
+        partition=args.val_partition,
+        pn=args.pn,
+        max_samples=args.max_val_samples,
+    )
+    if args.repeat_train > 1:
+        train_dataset = RepeatDataset(train_dataset, args.repeat_train)
+    if args.repeat_val > 1:
+        val_dataset = RepeatDataset(val_dataset, args.repeat_val)
+    return train_dataset, val_dataset
+
+
 def build_loader(
-    dataset: HypersimNormalCacheDataset,
+    dataset: Dataset,
     batch_size: int,
     num_workers: int,
     prefetch_factor: int,
@@ -553,6 +681,7 @@ def run_validation(
             with autocast_ctx:
                 recon, vq_output = model(target)
                 _, metrics = compute_metrics(target, recon, mask, vq_output["commitment_loss"], args)
+            metrics.update(compute_codebook_metrics(vq_output, args, device))
             if visual_payload is None:
                 visual_payload = {
                     "target": target.detach().cpu(),
@@ -588,8 +717,15 @@ def main() -> None:
     swanlab_run = None
     try:
         LOGGER.info("distributed=%s rank=%d world_size=%d device=%s", distributed, rank, world_size, device)
-        LOGGER.info("train_cache=%s", args.train_cache)
-        LOGGER.info("val_cache=%s", args.val_cache)
+        LOGGER.info(
+            "data_root=%s pn=%s train_partition=%s val_partition=%s max_train_samples=%d max_val_samples=%d",
+            args.data_root,
+            args.pn,
+            args.train_partition,
+            args.val_partition,
+            args.max_train_samples,
+            args.max_val_samples,
+        )
         LOGGER.info(
             "batch_size_per_gpu=%d global_batch_size=%d val_batch_size_per_gpu=%d",
             args.batch_size,
@@ -597,8 +733,7 @@ def main() -> None:
             args.val_batch_size,
         )
         LOGGER.info("trainable_scope=%s", args.trainable_scope)
-        train_dataset = HypersimNormalCacheDataset(args.train_cache, repeat=args.repeat_train, mmap=args.mmap_cache)
-        val_dataset = HypersimNormalCacheDataset(args.val_cache, repeat=args.repeat_val, mmap=args.mmap_cache)
+        train_dataset, val_dataset = build_tokenizer_datasets(args)
         train_loader, train_sampler = build_loader(
             train_dataset,
             batch_size=args.batch_size,
@@ -687,6 +822,7 @@ def main() -> None:
                         vq_loss=vq_output["commitment_loss"],
                         args=args,
                     )
+                    metrics.update(compute_codebook_metrics(vq_output, args, device))
 
                 if use_fp16_scaler:
                     scaler.scale(total_loss).backward()

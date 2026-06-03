@@ -498,11 +498,12 @@ class AutoEncoder(nn.Module):
         h = h.to(dtype=torch.float32)
         # print(z.shape)
         # Multiscale LFQ            
-        z, all_indices, _, _, all_loss, _ = self.quantizer(h)
+        z, all_indices, all_bit_indices, _, all_loss, _ = self.quantizer(h)
         x_recon = self.decoder(z)
         vq_output = {
             "commitment_loss": torch.mean(all_loss) * self.lfq_weight, # here commitment loss is sum of commitment loss and entropy penalty
             "encodings": all_indices, 
+            "bit_indices": all_bit_indices,
         }
         return x_recon, vq_output
 
@@ -554,4 +555,3 @@ class AutoEncoder(nn.Module):
         parser.add_argument("--cycle_loop", type=int, default=0)
         parser.add_argument("--z_drop", type=float, default=0.)
         return parser
-
