@@ -157,6 +157,101 @@ class HypersimNormalDataset(Dataset):
         }
 
 
+class NYUv2ParquetNormalDataset(Dataset):
+    """Read tanganke/nyuv2 Hugging Face parquet shards for RGB-to-normal evaluation."""
+
+    def __init__(
+        self,
+        root: str,
+        partition: str = "val",
+        pn: str = "0.06M",
+        max_samples: int = 0,
+    ) -> None:
+        super().__init__()
+        if partition not in {"train", "val"}:
+            raise ValueError(f"partition must be one of train/val for NYUv2 parquet, got {partition}")
+        if pn not in {"0.06M", "0.25M", "1M"}:
+            raise ValueError(f"Unsupported pn: {pn}")
+
+        try:
+            import pyarrow.parquet as pq  # noqa: F401
+        except ImportError as exc:
+            raise ImportError("NYUv2ParquetNormalDataset requires pyarrow. Install it with `pip install pyarrow`.") from exc
+
+        self.root = Path(root)
+        self.partition = partition
+        self.pn = pn
+        data_dir = self.root / "data"
+        if not data_dir.is_dir():
+            data_dir = self.root
+        self.files = sorted(data_dir.glob(f"{partition}-*.parquet"))
+        if not self.files:
+            raise FileNotFoundError(f"No {partition}-*.parquet files found under {data_dir}")
+
+        import pyarrow.parquet as pq
+
+        self.records: list[tuple[int, int]] = []
+        for file_index, path in enumerate(self.files):
+            metadata = pq.ParquetFile(path).metadata
+            for row_index in range(metadata.num_rows):
+                self.records.append((file_index, row_index))
+        if max_samples > 0:
+            self.records = self.records[:max_samples]
+        self._table_cache: dict[int, Any] = {}
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _load_table(self, file_index: int) -> Any:
+        table = self._table_cache.get(file_index)
+        if table is None:
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(self.files[file_index], columns=["image", "normal", "depth"])
+            self._table_cache.clear()
+            self._table_cache[file_index] = table
+        return table
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        file_index, row_index = self.records[index]
+        table = self._load_table(file_index)
+        image_tensor = torch.from_numpy(np.asarray(table["image"][row_index].as_py(), dtype=np.float32))
+        normal_tensor = torch.from_numpy(np.asarray(table["normal"][row_index].as_py(), dtype=np.float32))
+        depth_tensor = torch.from_numpy(np.asarray(table["depth"][row_index].as_py(), dtype=np.float32))
+
+        normal_norm = torch.linalg.norm(normal_tensor, dim=0, keepdim=True)
+        valid_normal = torch.isfinite(normal_tensor).all(dim=0, keepdim=True) & (normal_norm > 1e-6)
+        normal_tensor = torch.nan_to_num(normal_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        normal_tensor = normal_tensor / torch.linalg.norm(normal_tensor, dim=0, keepdim=True).clamp_min(1e-6)
+        depth_tensor = torch.nan_to_num(depth_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+        target_height, target_width, template = _resolve_target_size(normal_tensor.shape[-2], normal_tensor.shape[-1], self.pn)
+        target_hw = (target_height, target_width)
+        image_tensor = _resize_tensor(image_tensor, target_hw, mode="bilinear").clamp(0.0, 1.0)
+        normal_tensor = _resize_tensor(normal_tensor, target_hw, mode="bilinear", normalize_normals=True).clamp(-1.0, 1.0)
+        depth_tensor = _resize_tensor(depth_tensor, target_hw, mode="nearest")
+        valid_normal = _resize_tensor(valid_normal.float(), target_hw, mode="nearest") > 0.5
+        mask = (depth_tensor > 0) & valid_normal.bool()
+
+        metadata = {
+            "parquet_path": str(self.files[file_index]),
+            "partition": self.partition,
+            "index": index,
+            "row_index": row_index,
+            "stem": f"{self.partition}_{index:06d}",
+            "h_div_w": float(288) / float(384),
+            "h_div_w_template": template,
+            "target_size": target_hw,
+            "original_size": (288, 384),
+        }
+        return {
+            "image": image_tensor,
+            "target": normal_tensor,
+            "mask": mask.bool(),
+            "metadata": metadata,
+        }
+
+
 def collate_normal_estimation_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "image": torch.stack([sample["image"] for sample in samples], dim=0),

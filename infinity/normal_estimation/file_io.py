@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import h5py
 import numpy as np
 
 
 def read_hdf5(path: str) -> np.ndarray:
+    import h5py
+
     with h5py.File(path, "r") as handle:
         return handle["dataset"][:]
 
