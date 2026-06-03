@@ -19,7 +19,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import DataTable, Input, Label, ListItem, ListView, Static
+from textual.widgets import DataTable, Input, Label, ListItem, ListView, SelectionList, Static
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +47,7 @@ VOLC_DEFAULT_REMOTE_CODE_PATH = os.environ.get("INFINITY_VOLC_REMOTE_CODE_PATH",
 VOLC_DEFAULT_RESOURCE_FAMILY = os.environ.get("INFINITY_VOLC_RESOURCE_FAMILY", "ml.pni2")
 VOLC_DEFAULT_RESOURCE_CPU = os.environ.get("INFINITY_VOLC_RESOURCE_CPU", "112")
 VOLC_DEFAULT_RESOURCE_MEMORY = os.environ.get("INFINITY_VOLC_RESOURCE_MEMORY", "1960")
+VOLC_DEFAULT_PRIORITY = os.environ.get("INFINITY_VOLC_PRIORITY", "6")
 
 @dataclass
 class Field:
@@ -55,6 +56,7 @@ class Field:
     default: str
     help: str = ""
     choices: tuple[str, ...] = ()
+    multi_choices: tuple[str, ...] = ()
 
 
 @dataclass
@@ -86,6 +88,7 @@ class VolcConfig:
     resource_family: str
     resource_cpu: str
     resource_memory: str
+    priority: str
 
 
 def shell_join(cmd: list[str]) -> str:
@@ -272,6 +275,7 @@ def current_volc_config() -> VolcConfig:
         resource_family=os.environ.get("INFINITY_VOLC_RESOURCE_FAMILY", VOLC_DEFAULT_RESOURCE_FAMILY),
         resource_cpu=os.environ.get("INFINITY_VOLC_RESOURCE_CPU", VOLC_DEFAULT_RESOURCE_CPU),
         resource_memory=os.environ.get("INFINITY_VOLC_RESOURCE_MEMORY", VOLC_DEFAULT_RESOURCE_MEMORY),
+        priority=os.environ.get("INFINITY_VOLC_PRIORITY", VOLC_DEFAULT_PRIORITY),
     )
 
 
@@ -516,6 +520,7 @@ def build_volc_task_config(
 ) -> tuple[dict[str, object], str]:
     gpu_count = parse_positive_int(config.gpus, "Volc GPU 数")
     active_deadline = parse_positive_int(config.active_deadline_seconds, "Volc 最长运行秒")
+    priority = parse_positive_int(config.priority, "Volc 优先级")
     runtime_values = volc_runtime_values(task, values, gpu_count)
     entrypoint, command_line = build_volc_entrypoint(task, runtime_values, config, gpu_count)
     task_config = remove_empty_config({
@@ -532,6 +537,7 @@ def build_volc_task_config(
         "ActiveDeadlineSeconds": active_deadline,
         "EnableTensorBoard": False,
         "Preemptible": parse_bool(config.preemptible),
+        "Priority": priority,
         "Tags": ["infinity", experiment_slug(task)],
     })
     if config.queue_id:
@@ -659,27 +665,48 @@ def build_infer_8b(values: dict[str, str]) -> list[str]:
     ]
 
 
-def build_normal_infer(values: dict[str, str]) -> list[str]:
+def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
+    methods = [item.strip() for item in values["methods"].replace(",", " ").split() if item.strip()]
     cmd = [
         PYTHON,
-        "tools/run_normal_estimation.py",
-        "--model-path",
-        values["model_path"],
-        "--input-path",
-        values["input_path"],
+        "tools/normal_eval_experiment.py",
+        "--dataset",
+        values["dataset"],
+        "--data-root",
+        values["data_root"],
+        "--partition",
+        values["partition"],
+        "--pn",
+        values["pn"],
+        "--max-samples",
+        values["max_samples"],
+        "--eval-set-workers",
+        values["eval_set_workers"],
         "--output-dir",
         values["output_dir"],
-        "--seed",
-        values["seed"],
-        "--tau",
-        values["tau"],
-        "--top-k",
-        values["top_k"],
-        "--top-p",
-        values["top_p"],
+        "--methods",
+        *methods,
+        "--ours-checkpoint",
+        values["ours_checkpoint"],
+        "--normal-tokenizer-ckpt",
+        values["normal_tokenizer_ckpt"],
+        "--normal-vae-type",
+        values["normal_vae_type"],
+        "--ours-seed",
+        values["ours_seed"],
+        "--ours-top-k",
+        values["ours_top_k"],
+        "--ours-top-p",
+        values["ours_top_p"],
+        "--ours-tau",
+        values["ours_tau"],
+        "--parallel-shards",
+        values["parallel_shards"],
     ]
-    if values["save_npy"].lower() in {"1", "yes", "true", "y"}:
-        cmd.append("--save-npy")
+    if values["bootstrap"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--bootstrap")
+    if values["dry_run"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--dry-run")
     return cmd
 
 
@@ -751,6 +778,8 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["ar_eval_top_p"],
         "--ar-eval-tau",
         values["ar_eval_tau"],
+        "--save-every-steps",
+        values["save_every_steps"],
         "--save-every-epoch",
         values["save_every_epoch"],
         "--train-partition",
@@ -802,10 +831,18 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
         "tools/train_normal_tokenizer.py",
         "--output-dir",
         values["output_dir"],
-        "--train-cache",
-        values["train_cache"],
-        "--val-cache",
-        values["val_cache"],
+        "--data-root",
+        values["data_root"],
+        "--pn",
+        values["pn"],
+        "--train-partition",
+        values["train_partition"],
+        "--val-partition",
+        values["val_partition"],
+        "--max-train-samples",
+        values["max_train_samples"],
+        "--max-val-samples",
+        values["max_val_samples"],
         "--vae-ckpt",
         values["vae_ckpt"],
         "--batch-size",
@@ -851,10 +888,14 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
         values["recon_cosine_weight"],
         "--vq-weight",
         values["vq_weight"],
+        "--lfq-weight",
+        values["lfq_weight"],
         "--norm-weight",
         values["norm_weight"],
         "--normal-gradient-weight",
         values["normal_gradient_weight"],
+        "--edge-recon-weight",
+        values["edge_recon_weight"],
         "--codebook-dim",
         values["codebook_dim"],
         "--encoder-dtype",
@@ -868,8 +909,6 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
     ]
     if values["swanlab_experiment"]:
         cmd += ["--swanlab-experiment-name", values["swanlab_experiment"]]
-    if values["mmap_cache"].lower() in {"0", "no", "false", "n"}:
-        cmd.append("--disable-mmap-cache")
     if values["spatial_patchify"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--apply-spatial-patchify")
     else:
@@ -927,43 +966,33 @@ TASKS: list[Task] = [
         output_slug="infinity_8b",
     ),
     Task(
-        "RGB 到 Normal 推理",
-        "对单张图片或目录批量预测法线图。",
-        [
-            Field("input_path", "输入图片/目录", "data/infinity_toy_data/images"),
-            Field("output_dir", "输出目录", managed_output("normal_infer")),
-            Field("model_path", "Normal checkpoint", "outputs/normal_estimation/latest/checkpoints/last.pth"),
-            Field("seed", "Seed", "0"),
-            Field("tau", "Tau", "1.0"),
-            Field("top_k", "Top-k", "1"),
-            Field("top_p", "Top-p", "0.0"),
-            Field("save_npy", "保存 npy", "0", choices=("0", "1")),
-            Field("cuda", "CUDA_VISIBLE_DEVICES", "0"),
-        ],
-        build_normal_infer,
-        env=lambda v: {"CUDA_VISIBLE_DEVICES": v["cuda"]},
-        category="Normal",
-        output_slug="normal_infer",
-    ),
-    Task(
         "训练 RGB 到 Normal",
         "启动 normal estimation 正式训练。",
         [
             Field("gpus", "GPU 数", "2"),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
-            Field("data_root", "数据目录", "/root/vepfs/NormalART/datasets/processed/hypersim"),
-            Field("normal_vae", "Normal VAE", "weights/infinity_vae_d32reg.pth"),
+            Field("data_root", "数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
+            Field(
+                "normal_vae",
+                "Normal VAE",
+                "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth",
+                choices=(
+                    "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth",
+                    "weights/infinity_vae_d32reg.pth",
+                    "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-05-31/15-08-43/checkpoints/best_angle_6.7867.pth",
+                ),
+            ),
             Field("rgb_vae", "RGB VAE", "weights/infinity_vae_d32reg.pth"),
             Field("vae_type", "VAE type", "32"),
             Field("spatial_patchify", "Spatial patchify", "0", choices=("0", "1")),
             Field("model_name", "模型名", "infinity_2b"),
             Field("init_model", "初始化模型", "weights/infinity_2b_reg.pth"),
-            Field("pn", "分辨率 pn", "0.06M", choices=("0.06M", "0.25M", "1M")),
+            Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("batch_size", "Batch/GPU", "4"),
             Field("val_batch_size", "Val batch/GPU", "4"),
             Field("num_workers", "Workers", "4"),
             Field("prefetch_factor", "Prefetch factor", "4"),
-            Field("lr", "Learning rate", "1e-4"),
+            Field("lr", "Learning rate", "3e-5"),
             Field("min_lr", "Min LR", "1e-5"),
             Field("warmup_ratio", "Warmup ratio", "0.03"),
             Field("beta1", "Adam beta1", "0.9"),
@@ -981,8 +1010,9 @@ TASKS: list[Task] = [
             Field("ar_eval_top_k", "AR top-k", "1"),
             Field("ar_eval_top_p", "AR top-p", "0.0"),
             Field("ar_eval_tau", "AR tau", "1.0"),
+            Field("save_every_steps", "Save every steps", "100"),
             Field("save_every_epoch", "Save every epoch", "1"),
-            Field("save_optimizer_state", "保存优化器", "0", choices=("0", "1")),
+            Field("save_optimizer_state", "保存优化器", "1", choices=("0", "1")),
             Field("train_partition", "Train split", "train"),
             Field("val_partition", "Val split", "val"),
             Field("max_train_samples", "Max train samples", "0"),
@@ -1012,16 +1042,19 @@ TASKS: list[Task] = [
         [
             Field("gpus", "GPU 数", "2"),
             Field("output_dir", "输出目录", managed_output("normal_tokenizer")),
-            Field("train_cache", "训练 cache", "data/normalart/datasets/cache/hypersim_full/256x256/train.pt"),
-            Field("val_cache", "验证 cache", "data/normalart/datasets/cache/hypersim_full/256x256/val.pt"),
+            Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
+            Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
+            Field("train_partition", "Train split", "train"),
+            Field("val_partition", "Val split", "val"),
+            Field("max_train_samples", "Max train samples", "0"),
+            Field("max_val_samples", "Max val samples", "0"),
             Field("vae_ckpt", "基础 VAE", "weights/infinity_vae_d32reg.pth"),
-            Field("batch_size", "Batch/GPU", "16"),
-            Field("val_batch_size", "Val batch/GPU", "16"),
-            Field("num_workers", "Workers", "8"),
+            Field("batch_size", "Batch/GPU", "2"),
+            Field("val_batch_size", "Val batch/GPU", "2"),
+            Field("num_workers", "Workers", "4"),
             Field("prefetch_factor", "Prefetch factor", "4"),
             Field("repeat_train", "Repeat train", "1"),
             Field("repeat_val", "Repeat val", "1"),
-            Field("mmap_cache", "MMap cache", "1", choices=("0", "1")),
             Field("lr", "Learning rate", "2e-4"),
             Field("min_lr", "Min LR", "1e-5"),
             Field("warmup_ratio", "Warmup ratio", "0.03"),
@@ -1038,8 +1071,10 @@ TASKS: list[Task] = [
             Field("recon_l1_weight", "Recon L1 weight", "1.0"),
             Field("recon_cosine_weight", "Recon cosine weight", "1.0"),
             Field("vq_weight", "VQ weight", "1.0"),
+            Field("lfq_weight", "LFQ weight", "0.0"),
             Field("norm_weight", "Norm weight", "0.1"),
             Field("normal_gradient_weight", "Normal gradient weight", "0.2"),
+            Field("edge_recon_weight", "Edge recon weight", "0.0"),
             Field("codebook_dim", "Codebook dim", "32"),
             Field("spatial_patchify", "Spatial patchify", "0", choices=("0", "1")),
             Field("encoder_dtype", "Encoder dtype", "bf16", choices=("bf16", "fp32")),
@@ -1055,7 +1090,60 @@ TASKS: list[Task] = [
         category="Train",
         output_slug="normal_tokenizer",
     ),
-    Task("评估", "运行 scripts/eval.sh。请先检查脚本内变量配置。", [Field("command", "命令", "bash scripts/eval.sh")], build_shell, confirm="评估脚本可能安装/调用多个依赖。", category="Eval"),
+    Task(
+        "Normal Eval 实验",
+        "统一运行 toy/NYUv2/Hypersim normal eval，可选择 Ours、normal tokenizer 和官方 baseline。",
+        [
+            Field("output_dir", "输出目录", managed_output("normal_eval")),
+            Field("dataset", "Dataset", "toy", choices=("toy", "nyuv2", "hypersim")),
+            Field("data_root", "数据目录", "auto", help="auto=toy/NYUv2/Hypersim 默认路径"),
+            Field("partition", "Split", "val", choices=("val", "test", "train")),
+            Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
+            Field("max_samples", "最多样本数", "0", help="0=全量；toy 忽略"),
+            Field("eval_set_workers", "导出 workers", "auto", help="auto=使用全部 CPU 核心"),
+            Field(
+                "methods",
+                "Methods",
+                "ours marigold geowizard stablenormal lotusg dsine metric3dv2 omnidata_v2 marigold_e2eft lotusd",
+                multi_choices=(
+                    "ours",
+                    "marigold",
+                    "geowizard",
+                    "stablenormal",
+                    "lotusg",
+                    "dsine",
+                    "metric3dv2",
+                    "omnidata_v2",
+                    "marigold_e2eft",
+                    "lotusd",
+                ),
+            ),
+            Field(
+                "ours_checkpoint",
+                "Ours checkpoint",
+                "/root/vepfs/Infinity/outputs/normal_estimation/2026-06-01/09-27-05/checkpoints/best_angle_18.5532.pth",
+            ),
+            Field(
+                "normal_tokenizer_ckpt",
+                "Normal tokenizer",
+                "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth",
+            ),
+            Field("normal_vae_type", "Normal VAE type", "32"),
+            Field("ours_seed", "Ours seed", "0"),
+            Field("ours_top_k", "Ours top-k", "1"),
+            Field("ours_top_p", "Ours top-p", "0.0"),
+            Field("ours_tau", "Ours tau", "1.0"),
+            Field("parallel_shards", "并行分片数", "auto", help="auto=按可见 GPU 数分片；1=单进程"),
+            Field("bootstrap", "下载代码/权重", "0", choices=("0", "1")),
+            Field("dry_run", "只打印命令", "0", choices=("0", "1")),
+            Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
+        ],
+        build_normal_baseline_compare,
+        env=lambda v: {"CUDA_VISIBLE_DEVICES": v["cuda"]},
+        confirm="toy 只落预测图；NYUv2/Hypersim 会先导出 RGB/GT/mask，再运行所选方法并统一计算 angle 指标；baseline 首次 bootstrap 会下载第三方仓库和权重。",
+        category="Eval",
+        output_slug="normal_eval",
+    ),
     Task("GPU 状态", "显示 nvidia-smi。", [Field("command", "命令", "nvidia-smi")], build_shell, category="Utility"),
     Task(
         "检查权重和输出",
@@ -1275,6 +1363,10 @@ ChoiceFieldScreen {
     align: center middle;
 }
 
+MultiChoiceFieldScreen {
+    align: center middle;
+}
+
 #edit_modal {
     width: 86;
     height: 9;
@@ -1325,6 +1417,33 @@ ChoiceFieldScreen {
 #choice_table {
     height: auto;
     max-height: 12;
+    margin-top: 1;
+    background: #1a1b26;
+}
+
+#multi_choice_modal {
+    width: 72;
+    height: auto;
+    max-height: 22;
+    padding: 1;
+    background: #1a1b26;
+    border: round #7dcfff;
+}
+
+#multi_choice_title {
+    height: 1;
+    color: #7dcfff;
+    text-style: bold;
+}
+
+#multi_choice_hint {
+    height: 1;
+    color: #565f89;
+}
+
+#multi_choice_list {
+    height: auto;
+    max-height: 16;
     margin-top: 1;
     background: #1a1b26;
 }
@@ -1501,6 +1620,44 @@ class ChoiceFieldScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class MultiChoiceFieldScreen(ModalScreen[str | None]):
+    BINDINGS = [
+        ("escape", "cancel", "取消"),
+        ("q", "cancel", "取消"),
+        ("s", "save", "保存"),
+        ("ctrl+s", "save", "保存"),
+    ]
+
+    def __init__(self, label: str, value: str, choices: tuple[str, ...]) -> None:
+        super().__init__()
+        self.label = label
+        self.value = value
+        self.choices = choices
+
+    def compose(self) -> ComposeResult:
+        selected = {item.strip() for item in self.value.replace(",", " ").split() if item.strip()}
+        selections = [(choice, choice, choice in selected) for choice in self.choices]
+        with Vertical(id="multi_choice_modal"):
+            yield Static(self.label, id="multi_choice_title")
+            yield Static("↑↓ 选择    Space 勾选/取消    s 保存    Esc 取消", id="multi_choice_hint")
+            yield SelectionList[str](
+                *selections,
+                id="multi_choice_list",
+            )
+
+    def on_mount(self) -> None:
+        selector = self.query_one("#multi_choice_list", SelectionList)
+        selector.focus()
+
+    def action_save(self) -> None:
+        selector = self.query_one("#multi_choice_list", SelectionList)
+        selected = [choice for choice in self.choices if choice in selector.selected]
+        self.dismiss(" ".join(selected))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class InfinityTUI(App):
     CSS = CSS
     BINDINGS = [
@@ -1656,7 +1813,9 @@ class InfinityTUI(App):
         field = task.fields[row_index]
         value = self.current_values()[field.key]
         callback = lambda new_value: self.apply_field_edit(row_index, new_value)
-        if field.choices:
+        if field.multi_choices:
+            self.push_screen(MultiChoiceFieldScreen(field.label, value, field.multi_choices), callback)
+        elif field.choices:
             self.push_screen(ChoiceFieldScreen(field.label, value, field.choices), callback)
         else:
             self.push_screen(EditFieldScreen(field.label, value), callback)
@@ -1864,7 +2023,7 @@ class InfinityTUI(App):
             self.notify(f"写入 Volc 配置失败: {exc}", severity="error")
             self.set_status_icon("!")
             return
-        submit_cmd = [VOLC, "ml_task", "submit", "-c", str(conf_path)]
+        submit_cmd = [VOLC, "ml_task", "submit", "-c", str(conf_path), "--priority", config.priority]
         result = subprocess.run(
             submit_cmd,
             cwd=ROOT,
@@ -1891,6 +2050,7 @@ class InfinityTUI(App):
                     "volc_flavor": config.flavor,
                     "volc_gpus": config.gpus,
                     "volc_preemptible": config.preemptible,
+                    "volc_priority": config.priority,
                     "run_dir": str(run_dir),
                     "latest": str(ROOT / "outputs" / experiment_slug(task) / "latest"),
                     "submit_output": output,
@@ -1917,6 +2077,7 @@ class InfinityTUI(App):
                 "volc_flavor": config.flavor,
                 "volc_gpus": config.gpus,
                 "volc_preemptible": config.preemptible,
+                "volc_priority": config.priority,
                 "run_dir": str(run_dir),
                 "latest": str(ROOT / "outputs" / experiment_slug(task) / "latest"),
                 "submit_output": output,
