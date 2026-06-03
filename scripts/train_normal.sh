@@ -9,7 +9,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
 export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
-DATA_ROOT_DEFAULT="${NORMAL_DATA_ROOT:-/root/vepfs/NormalART/datasets/processed/hypersim}"
+DATA_ROOT_DEFAULT="${NORMAL_DATA_ROOT:-/root/vepfs/Infinity/data/hypersim/processed/hypersim}"
 NORMAL_VAE_CKPT_FALLBACK="${ROOT_DIR}/weights/infinity_vae_d56_f8_14_patchify.pth"
 NORMAL_VAE_CKPT_DEFAULT="${NORMAL_VAE_CKPT:-${NORMAL_VAE_CKPT_FALLBACK}}"
 

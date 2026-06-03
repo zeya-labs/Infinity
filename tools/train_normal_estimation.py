@@ -69,7 +69,7 @@ FULLOPTSTATE_SAVE_POLICY = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Infinity for RGB-to-normal estimation on raw Hypersim.")
-    parser.add_argument("--data-root", type=str, default="/root/vepfs/NormalART/datasets/processed/hypersim")
+    parser.add_argument("--data-root", type=str, default="/root/vepfs/Infinity/data/hypersim/processed/hypersim")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--init-model", type=str, default="")
@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--resume-lr-step",
+        type=int,
+        default=-1,
+        help="When checkpoint has no scheduler state, fast-forward the LR scheduler to this step; -1 uses checkpoint step.",
+    )
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -99,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ar-eval-top-k", type=int, default=1)
     parser.add_argument("--ar-eval-top-p", type=float, default=0.0)
     parser.add_argument("--ar-eval-tau", type=float, default=1.0)
+    parser.add_argument("--save-every-steps", type=int, default=0, help="Overwrite checkpoints/last_step.pth every N optimizer steps; 0 disables step checkpointing.")
     parser.add_argument("--save-every-epoch", type=int, default=1)
     parser.add_argument("--save-optimizer-state", action="store_true", default=False)
     parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="0.06M")
@@ -180,11 +187,6 @@ def init_distributed() -> tuple[bool, int, int, torch.device]:
 
 def cleanup_distributed(enabled: bool) -> None:
     if enabled and dist.is_initialized():
-        if dist.get_world_size() > 1:
-            if torch.cuda.is_available():
-                dist.barrier(device_ids=[torch.cuda.current_device()])
-            else:
-                dist.barrier()
         dist.destroy_process_group()
 
 
@@ -459,10 +461,9 @@ def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> A
     workspace = args.swanlab_workspace.strip()
     if workspace:
         init_kwargs["workspace"] = workspace
-    if run_id:
+    if run_id and args.swanlab_mode == "cloud":
         init_kwargs["id"] = run_id
-        if args.swanlab_mode == "cloud":
-            init_kwargs["resume"] = "allow"
+        init_kwargs["resume"] = "allow"
 
     run = swanlab.init(**init_kwargs)
     run_public = getattr(run, "public", None)
@@ -574,8 +575,28 @@ def save_checkpoint(
 
     if is_main:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, checkpoint_path)
+        tmp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp.{os.getpid()}")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, checkpoint_path)
     dist_barrier_if_initialized()
+
+
+def resolve_resume_path(args: argparse.Namespace) -> Path | None:
+    checkpoint_dir = Path(args.output_dir) / "checkpoints"
+    if args.resume:
+        requested = Path(args.resume)
+        if requested.name == "last.pth":
+            step_checkpoint = requested.with_name("last_step.pth")
+            if step_checkpoint.is_file():
+                return step_checkpoint
+        if requested.is_file():
+            return requested
+        return None
+
+    for candidate in (checkpoint_dir / "last_step.pth", checkpoint_dir / "last.pth"):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def maybe_resume(
@@ -587,8 +608,8 @@ def maybe_resume(
     scaler: torch.amp.GradScaler | None,
     is_main: bool,
 ) -> tuple[int, int, float]:
-    resume_path = Path(args.resume) if args.resume else Path(args.output_dir) / "checkpoints" / "last.pth"
-    if not resume_path.is_file():
+    resume_path = resolve_resume_path(args)
+    if resume_path is None:
         return 0, 0, float("inf")
 
     checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
@@ -631,6 +652,15 @@ def maybe_resume(
     start_epoch = int(checkpoint.get("epoch", 0))
     step = int(checkpoint.get("step", 0))
     best_val_angle = float(checkpoint.get("best_val_angle", float("inf")))
+    if not optimizer_loaded and step > 0:
+        lr_step = args.resume_lr_step if args.resume_lr_step >= 0 else step
+        for _ in range(lr_step):
+            scheduler.step()
+        if is_main:
+            LOGGER.info(
+                "Fast-forwarded LR scheduler to step=%d because checkpoint has no optimizer/scheduler state",
+                lr_step,
+            )
     if is_main:
         resume_mode = "weights+optimizer" if optimizer_loaded else "weights-only"
         LOGGER.info("Resumed from %s (epoch=%s, step=%s, mode=%s)", resume_path, start_epoch, step, resume_mode)
@@ -969,6 +999,18 @@ def main() -> int:
             scaler=scaler if args.precision == "fp16" else None,
             is_main=(rank == 0),
         )
+        if global_step > 0:
+            step_epoch = min(global_step // len(train_loader), args.epochs)
+            if step_epoch > start_epoch:
+                if rank == 0:
+                    LOGGER.info(
+                        "Adjusted start_epoch from %d to %d based on global_step=%d and train_batches=%d",
+                        start_epoch,
+                        step_epoch,
+                        global_step,
+                        len(train_loader),
+                    )
+                start_epoch = step_epoch
 
         swanlab_run = init_swanlab(args, output_dir, enabled=(rank == 0))
 
@@ -978,7 +1020,16 @@ def main() -> int:
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
+            resume_batch_offset = global_step % len(train_loader) if epoch == start_epoch else 0
+            if resume_batch_offset and rank == 0:
+                LOGGER.info(
+                    "Skipping %d already-completed batches in resumed epoch %d",
+                    resume_batch_offset,
+                    epoch + 1,
+                )
             for batch_idx, batch in enumerate(train_loader):
+                if batch_idx < resume_batch_offset:
+                    continue
                 optimizer.zero_grad(set_to_none=True)
                 total_loss, metrics, prediction, image = forward_batch(
                     model=model,
@@ -1078,6 +1129,20 @@ def main() -> int:
                             )
                     dist_barrier_if_initialized()
 
+                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    save_checkpoint(
+                        output_dir / "checkpoints" / "last_step.pth",
+                        args=args,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler if args.precision == "fp16" else None,
+                        epoch=epoch,
+                        step=global_step,
+                        best_val_angle=best_val_angle,
+                        is_main=(rank == 0),
+                    )
+
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
 
@@ -1090,7 +1155,7 @@ def main() -> int:
                 device=device,
                 distributed=distributed,
             )
-            should_save_last = (epoch + 1) % args.save_every_epoch == 0
+            should_save_last = args.save_every_epoch > 0 and (epoch + 1) % args.save_every_epoch == 0
             is_best = val_metrics["angle_deg"] < best_val_angle
             if is_best:
                 best_val_angle = val_metrics["angle_deg"]
