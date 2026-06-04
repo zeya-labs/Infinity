@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import csv
 import json
-import math
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -23,16 +25,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=ROOT_DIR / "data/VKITTI2/raw")
     parser.add_argument("--out-dir", type=Path, default=ROOT_DIR / "data/VKITTI2/processed/normals_from_depth")
     parser.add_argument("--depth-scale", type=float, default=100.0, help="Depth PNG scale. VKITTI2 depth is commonly stored in centimeters.")
+    parser.add_argument("--method", choices=("d2nt_basic", "d2nt_v2", "d2nt_v3"), default="d2nt_v3")
+    parser.add_argument("--no-flip", action="store_true", help="Do not flip D2NT normals to VKITTI2 camera-forward convention.")
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--save-vis", action="store_true", default=False)
     return parser.parse_args()
 
 
-def find_one(root: Path, pattern: str) -> Path:
-    matches = sorted(root.glob(pattern))
-    if not matches:
-        raise FileNotFoundError(f"No match under {root}: {pattern}")
-    return matches[0]
+def resolve_vkitti2_root(root: Path, dataset_kind: str) -> Path:
+    candidates = [root / f"vkitti_2.0.3_{dataset_kind}", root]
+    for candidate in candidates:
+        if dataset_kind in {"rgb", "depth"}:
+            pattern = f"Scene*/**/frames/{dataset_kind}/Camera_*"
+        else:
+            pattern = "Scene*/**/intrinsic.txt"
+        if candidate.is_dir() and any(candidate.glob(pattern)):
+            return candidate
+    raise FileNotFoundError(f"No VKITTI2 {dataset_kind} tree found under {root}")
 
 
 def load_depth(path: Path, scale: float) -> np.ndarray:
@@ -97,31 +107,141 @@ def default_intrinsics(width: int, height: int) -> tuple[float, float, float, fl
     return 725.0, 725.0, (width - 1) / 2.0, (height - 1) / 2.0
 
 
-def depth_to_normals(depth: np.ndarray, intrinsics: tuple[float, float, float, float]) -> tuple[np.ndarray, np.ndarray]:
+KERNEL_GX = np.array([[0, 0, 0], [-1, 0, 1], [0, 0, 0]], dtype=np.float32)
+KERNEL_GY = np.array([[0, -1, 0], [0, 0, 0], [0, 1, 0]], dtype=np.float32)
+GRADIENT_L = np.array([[-1, 1, 0]], dtype=np.float32)
+GRADIENT_R = np.array([[0, -1, 1]], dtype=np.float32)
+GRADIENT_U = np.array([[-1], [1], [0]], dtype=np.float32)
+GRADIENT_D = np.array([[0], [-1], [1]], dtype=np.float32)
+LAP_KER_ALPHA = np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=np.float32)
+
+
+def vector_normalization(normal: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    mag = np.linalg.norm(normal, axis=2, keepdims=True) + eps
+    return (normal / mag).astype(np.float32)
+
+
+def soft_min(laplace_map: np.ndarray, base: float, direction: int) -> tuple[np.ndarray, np.ndarray]:
+    height, width = laplace_map.shape
+    eps = 1e-8
+    lap_power = np.power(base, -laplace_map).astype(np.float32)
+    if direction == 0:
+        lap_pow_l = np.hstack([np.zeros((height, 1), dtype=np.float32), lap_power[:, :-1]])
+        lap_pow_r = np.hstack([lap_power[:, 1:], np.zeros((height, 1), dtype=np.float32)])
+        return (
+            (lap_pow_l + eps * 0.5) / (eps + lap_pow_l + lap_pow_r),
+            (lap_pow_r + eps * 0.5) / (eps + lap_pow_l + lap_pow_r),
+        )
+    lap_pow_u = np.vstack([np.zeros((1, width), dtype=np.float32), lap_power[:-1, :]])
+    lap_pow_d = np.vstack([lap_power[1:, :], np.zeros((1, width), dtype=np.float32)])
+    return (
+        (lap_pow_u + eps * 0.5) / (eps + lap_pow_u + lap_pow_d),
+        (lap_pow_d + eps * 0.5) / (eps + lap_pow_u + lap_pow_d),
+    )
+
+
+def get_filter(depth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    depth = np.asarray(depth, dtype=np.float32)
+    gu = cv2.filter2D(depth, -1, KERNEL_GX) / 2
+    gv = cv2.filter2D(depth, -1, KERNEL_GY) / 2
+    return gu.astype(np.float32), gv.astype(np.float32)
+
+
+def get_dag_filter(depth: np.ndarray, base: float = np.e) -> tuple[np.ndarray, np.ndarray]:
+    depth = np.asarray(depth, dtype=np.float32)
+    grad_l = cv2.filter2D(depth, -1, GRADIENT_L).astype(np.float32)
+    grad_r = cv2.filter2D(depth, -1, GRADIENT_R).astype(np.float32)
+    grad_u = cv2.filter2D(depth, -1, GRADIENT_U).astype(np.float32)
+    grad_d = cv2.filter2D(depth, -1, GRADIENT_D).astype(np.float32)
+    lap_hor = np.abs(grad_l - grad_r)
+    lap_ver = np.abs(grad_u - grad_d)
+    lambda_map1, lambda_map2 = soft_min(lap_hor, base, 0)
+    lambda_map3, lambda_map4 = soft_min(lap_ver, base, 1)
+
+    eps = 1e-8
+    thresh = base
+    mask = lambda_map1 / (lambda_map2 + eps) > thresh
+    lambda_map1[mask] = 1
+    lambda_map2[mask] = 0
+    mask = lambda_map2 / (lambda_map1 + eps) > thresh
+    lambda_map1[mask] = 0
+    lambda_map2[mask] = 1
+    mask = lambda_map3 / (lambda_map4 + eps) > thresh
+    lambda_map3[mask] = 1
+    lambda_map4[mask] = 0
+    mask = lambda_map4 / (lambda_map3 + eps) > thresh
+    lambda_map3[mask] = 0
+    lambda_map4[mask] = 1
+
+    gu = lambda_map1 * grad_l + lambda_map2 * grad_r
+    gv = lambda_map3 * grad_u + lambda_map4 * grad_d
+    return gu.astype(np.float32), gv.astype(np.float32)
+
+
+def mrf_optim(depth: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    height, width = depth.shape
+    depth = np.asarray(depth, dtype=np.float32)
+    laplace = np.abs(cv2.filter2D(depth, -1, LAP_KER_ALPHA)).astype(np.float32)
+    laplace_stack = np.array(
+        (
+            np.hstack((np.inf * np.ones((height, 1), dtype=np.float32), laplace[:, :-1])),
+            np.hstack((laplace[:, 1:], np.inf * np.ones((height, 1), dtype=np.float32))),
+            np.vstack((np.inf * np.ones((1, width), dtype=np.float32), laplace[:-1, :])),
+            np.vstack((laplace[1:, :], np.inf * np.ones((1, width), dtype=np.float32))),
+            laplace,
+        ),
+        dtype=np.float32,
+    )
+    best_loc = np.argmin(laplace_stack, axis=0).reshape(-1)
+    channels = []
+    for channel in range(3):
+        values = normal[:, :, channel].astype(np.float32)
+        stack = np.array(
+            (
+                np.hstack((np.zeros((height, 1), dtype=np.float32), values[:, :-1])),
+                np.hstack((values[:, 1:], np.zeros((height, 1), dtype=np.float32))),
+                np.vstack((np.zeros((1, width), dtype=np.float32), values[:-1, :])),
+                np.vstack((values[1:, :], np.zeros((1, width), dtype=np.float32))),
+                values,
+            ),
+            dtype=np.float32,
+        ).reshape(5, -1)
+        channels.append(stack[best_loc, np.arange(height * width)].reshape(height, width))
+    return np.stack(channels, axis=-1).astype(np.float32)
+
+
+def depth_to_normals(
+    depth: np.ndarray,
+    intrinsics: tuple[float, float, float, float],
+    method: str,
+    flip: bool,
+) -> tuple[np.ndarray, np.ndarray]:
     fx, fy, cx, cy = intrinsics
     height, width = depth.shape
-    yy, xx = np.meshgrid(np.arange(height, dtype=np.float32), np.arange(width, dtype=np.float32), indexing="ij")
-    z = depth
-    x = (xx - cx) * z / fx
-    y = (yy - cy) * z / fy
-    points = np.stack((x, y, z), axis=-1)
+    valid = (depth > 0) & np.isfinite(depth)
+    safe_depth = depth.astype(np.float32).copy()
+    safe_depth[~valid] = 0
+    u_map = np.ones((height, 1), dtype=np.float32) * np.arange(1, width + 1, dtype=np.float32) - cx
+    v_map = np.arange(1, height + 1, dtype=np.float32).reshape(height, 1) * np.ones((1, width), dtype=np.float32) - cy
 
-    dx = np.zeros_like(points)
-    dy = np.zeros_like(points)
-    dx[:, 1:-1] = points[:, 2:] - points[:, :-2]
-    dx[:, 0] = points[:, 1] - points[:, 0]
-    dx[:, -1] = points[:, -1] - points[:, -2]
-    dy[1:-1] = points[2:] - points[:-2]
-    dy[0] = points[1] - points[0]
-    dy[-1] = points[-1] - points[-2]
+    if method == "d2nt_basic":
+        gu, gv = get_filter(safe_depth)
+    else:
+        gu, gv = get_dag_filter(safe_depth)
 
-    normal = np.cross(dx, dy)
-    norm = np.linalg.norm(normal, axis=-1, keepdims=True)
-    valid = (depth > 0) & np.isfinite(depth) & (norm[..., 0] > 1e-6)
-    normal = normal / np.maximum(norm, 1e-6)
-    # Orient normals toward the camera. Camera looks along +z in this convention.
-    flip = normal[..., 2] > 0
-    normal[flip] *= -1
+    normal = np.stack(
+        (
+            gu * fx,
+            gv * fy,
+            -(safe_depth + v_map * gv + u_map * gu),
+        ),
+        axis=-1,
+    ).astype(np.float32)
+    normal = vector_normalization(normal)
+    if method == "d2nt_v3":
+        normal = mrf_optim(safe_depth, normal)
+    if flip:
+        normal *= -1
     normal[~valid] = 0
     return normal.astype(np.float32), valid
 
@@ -145,11 +265,47 @@ def corresponding_rgb(depth_path: Path, rgb_root: Path) -> Path | None:
     return None
 
 
+def process_sample(task: dict[str, Any]) -> dict[str, Any]:
+    depth_path = Path(task["depth_path"])
+    normal_path = Path(task["normal_path"])
+    mask_path = Path(task["mask_path"])
+    vis_path = Path(task["normal_vis_path"]) if task["normal_vis_path"] else None
+    should_compute = not normal_path.is_file() or not mask_path.is_file() or (vis_path is not None and not vis_path.is_file())
+    if should_compute:
+        depth = load_depth(depth_path, task["depth_scale"])
+        normal, valid = depth_to_normals(depth, task["intrinsics"], task["method"], task["flipped"])
+        normal_path.parent.mkdir(parents=True, exist_ok=True)
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(normal_path, normal)
+        Image.fromarray((valid.astype(np.uint8) * 255), mode="L").save(mask_path)
+        if vis_path is not None:
+            vis_path.parent.mkdir(parents=True, exist_ok=True)
+            normal_vis(normal).save(vis_path)
+    row = {
+        "scene": task["scene"],
+        "variant": task["variant"],
+        "camera": task["camera"],
+        "frame": task["frame"],
+        "rgb_path": task["rgb_path"],
+        "depth_path": task["depth_path"],
+        "normal_path": str(normal_path),
+        "mask_path": str(mask_path),
+        "normal_vis_path": str(vis_path) if vis_path else "",
+        "fx": task["intrinsics"][0],
+        "fy": task["intrinsics"][1],
+        "cx": task["intrinsics"][2],
+        "cy": task["intrinsics"][3],
+        "method": task["method"],
+        "flipped": task["flipped"],
+    }
+    return row
+
+
 def main() -> int:
     args = parse_args()
-    depth_root = find_one(args.root, "vkitti_2.0.3_depth")
-    rgb_root = find_one(args.root, "vkitti_2.0.3_rgb")
-    textgt_root = find_one(args.root, "vkitti_2.0.3_textgt")
+    depth_root = resolve_vkitti2_root(args.root, "depth")
+    rgb_root = resolve_vkitti2_root(args.root, "rgb")
+    textgt_root = resolve_vkitti2_root(args.root, "textgt")
 
     intrinsics = load_intrinsics(textgt_root)
     depth_files = sorted(depth_root.glob("Scene*/**/frames/depth/Camera_*/*.png"))
@@ -166,30 +322,22 @@ def main() -> int:
     if args.save_vis:
         vis_dir.mkdir(parents=True, exist_ok=True)
 
-    rows: list[dict[str, Any]] = []
-    for idx, depth_path in enumerate(depth_files):
+    tasks: list[dict[str, Any]] = []
+    for depth_path in depth_files:
         scene, variant = scene_variant(depth_path)
         camera = camera_name(depth_path)
         frame = frame_index(depth_path)
-        depth = load_depth(depth_path, args.depth_scale)
-        k = intrinsics.get((scene, variant, camera, frame), default_intrinsics(depth.shape[1], depth.shape[0]))
-        normal, valid = depth_to_normals(depth, k)
+        k = intrinsics.get((scene, variant, camera, frame), default_intrinsics(1242, 375))
 
         rel = Path(scene) / variant / camera / f"{frame:05d}"
         normal_path = normal_dir / rel.with_suffix(".npy")
         mask_path = mask_dir / rel.with_suffix(".png")
-        normal_path.parent.mkdir(parents=True, exist_ok=True)
-        mask_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(normal_path, normal)
-        Image.fromarray((valid.astype(np.uint8) * 255), mode="L").save(mask_path)
         vis_path = None
         if args.save_vis:
             vis_path = vis_dir / rel.with_suffix(".png")
-            vis_path.parent.mkdir(parents=True, exist_ok=True)
-            normal_vis(normal).save(vis_path)
 
         rgb_path = corresponding_rgb(depth_path, rgb_root)
-        rows.append(
+        tasks.append(
             {
                 "scene": scene,
                 "variant": variant,
@@ -200,16 +348,28 @@ def main() -> int:
                 "normal_path": str(normal_path),
                 "mask_path": str(mask_path),
                 "normal_vis_path": str(vis_path) if vis_path else "",
-                "fx": k[0],
-                "fy": k[1],
-                "cx": k[2],
-                "cy": k[3],
+                "intrinsics": k,
+                "depth_scale": args.depth_scale,
+                "method": args.method,
+                "flipped": not args.no_flip,
             }
         )
-        if (idx + 1) % 100 == 0:
-            print(f"processed {idx + 1}/{len(depth_files)}", flush=True)
+
+    rows: list[dict[str, Any]] = []
+    if args.workers <= 1:
+        for idx, task in enumerate(tasks):
+            rows.append(process_sample(task))
+            if (idx + 1) % 100 == 0:
+                print(f"processed {idx + 1}/{len(tasks)}", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            for idx, row in enumerate(executor.map(process_sample, tasks, chunksize=16)):
+                rows.append(row)
+                if (idx + 1) % 100 == 0:
+                    print(f"processed {idx + 1}/{len(tasks)}", flush=True)
 
     manifest = args.out_dir / "manifest.jsonl"
+    rows.sort(key=lambda row: (row["scene"], row["variant"], row["camera"], row["frame"]))
     with manifest.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")

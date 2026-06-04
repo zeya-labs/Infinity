@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,10 +11,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from infinity.models.basic import CrossAttnBlock
 from infinity.models.infinity import Infinity, sample_with_top_k_top_p_also_inplace_modifying_logits_
 from infinity.models import alias_dict
 from infinity.models.bsq_vae.vae import vae_model
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    NORMAL_FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    create_block_mask = flex_attention = None
+    NORMAL_FLEX_ATTENTION_AVAILABLE = False
+
+try:
+    from flash_attn import flash_attn_func as normal_flash_attn_func
+    NORMAL_FLASH_ATTENTION_AVAILABLE = True
+except (ImportError, OSError):
+    normal_flash_attn_func = None
+    NORMAL_FLASH_ATTENTION_AVAILABLE = False
 
 
 def normalize_normals(normals: torch.Tensor) -> torch.Tensor:
@@ -181,14 +197,35 @@ def _model_config(model_name: str) -> tuple[str, dict[str, Any]]:
 class InfinityNormalPrefixModel(Infinity):
     """Infinity normal estimator with RGB VAE tokens as self-attention prefix."""
 
-    def __init__(self, *args: Any, task_condition_len: int = 16, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        task_condition_len: int = 16,
+        normal_use_flex_attn: bool = False,
+        normal_use_segmented_flash_attn: bool = False,
+        normal_bf16_activations: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         if not self.t2i:
             raise ValueError("InfinityNormalPrefixModel keeps the pretrained text/cross-attn stack for task conditioning.")
         if task_condition_len <= 0:
             raise ValueError("task_condition_len must be positive.")
+        if normal_use_flex_attn and not NORMAL_FLEX_ATTENTION_AVAILABLE:
+            raise NotImplementedError(f"FlexAttention requires PyTorch 2.5+, got {torch.__version__}.")
+        if normal_use_segmented_flash_attn and not NORMAL_FLASH_ATTENTION_AVAILABLE:
+            raise NotImplementedError("flash-attn is required for normal segmented flash attention.")
+        if normal_use_flex_attn and normal_use_segmented_flash_attn:
+            raise ValueError("Use only one normal attention backend: flex or segmented flash.")
+        if normal_use_flex_attn:
+            torch._inductor.config.max_autotune_gemm_backends = "TRITON,ATEN"
 
         self.task_condition_len = task_condition_len
+        self.normal_use_flex_attn = normal_use_flex_attn
+        self.normal_use_segmented_flash_attn = normal_use_segmented_flash_attn
+        self.normal_bf16_activations = normal_bf16_activations
+        self.normal_flex_attention = torch.compile(flex_attention) if normal_use_flex_attn else None
+        self.normal_flex_block_masks: dict[str, Any] = {}
         self.image_word_embed = nn.Linear(self.d_vae, self.C)
         self.image_word_embed.load_state_dict(self.word_embed.state_dict())
         self.image_modality_embed = nn.Parameter(torch.zeros(1, 1, self.C))
@@ -308,6 +345,89 @@ class InfinityNormalPrefixModel(Infinity):
             level_emb = F.pad(level_emb, (0, 0, 0, x.shape[1] - level_emb.shape[1]))
         return x + level_emb
 
+    def _normal_prefix_flex_attn(
+        self,
+        *,
+        prefix_len: int,
+        stage_ids: torch.Tensor,
+        batch_size: int,
+    ):
+        if not self.normal_use_flex_attn:
+            return None
+        if self.normal_flex_attention is None:
+            raise RuntimeError("Normal FlexAttention was not initialized.")
+
+        stage_ids = stage_ids.to(dtype=torch.int32, device=stage_ids.device)
+        key = f"{batch_size}:{self.num_heads}:{prefix_len}:{stage_ids.device}:{tuple(int(item) for item in stage_ids.detach().cpu().tolist())}"
+        block_mask = self.normal_flex_block_masks.get(key)
+        if block_mask is None:
+            prefix_len_int = int(prefix_len)
+            stage_ids_for_mask = stage_ids
+
+            def normal_prefix_mask(_b, _h, q_idx, kv_idx):
+                q_is_prefix = q_idx < prefix_len_int
+                kv_is_prefix = kv_idx < prefix_len_int
+                q_stage = stage_ids_for_mask[q_idx]
+                kv_stage = stage_ids_for_mask[kv_idx]
+                return (q_is_prefix & kv_is_prefix) | ((~q_is_prefix) & (kv_is_prefix | (q_stage >= kv_stage)))
+
+            block_mask = create_block_mask(
+                normal_prefix_mask,
+                B=batch_size,
+                H=self.num_heads,
+                Q_LEN=int(stage_ids.shape[0]),
+                KV_LEN=int(stage_ids.shape[0]),
+                device=stage_ids.device,
+                _compile=True,
+            )
+            self.normal_flex_block_masks[key] = block_mask
+
+        def attn_fn(q, k, v, scale=None):
+            return self.normal_flex_attention(q.to(v.dtype), k.to(v.dtype), v, block_mask=block_mask, scale=scale)
+
+        return attn_fn
+
+    def _normal_prefix_segmented_flash_attn(
+        self,
+        *,
+        prefix_len: int,
+        stage_ids: torch.Tensor,
+    ):
+        if not self.normal_use_segmented_flash_attn:
+            return None
+        if normal_flash_attn_func is None:
+            raise RuntimeError("flash-attn was not initialized.")
+
+        stage_ids_cpu = stage_ids.detach().cpu()
+        segments: list[tuple[int, int, int]] = [(0, int(prefix_len), int(prefix_len))]
+        start = int(prefix_len)
+        total_len = int(stage_ids_cpu.numel())
+        while start < total_len:
+            stage = int(stage_ids_cpu[start].item())
+            end = start + 1
+            while end < total_len and int(stage_ids_cpu[end].item()) == stage:
+                end += 1
+            segments.append((start, end, end))
+            start = end
+
+        def attn_fn(q, k, v, scale=None):
+            pieces = []
+            for query_start, query_end, key_end in segments:
+                q_part = q[:, :, query_start:query_end, :].transpose(1, 2).contiguous()
+                k_part = k[:, :, :key_end, :].transpose(1, 2).contiguous()
+                v_part = v[:, :, :key_end, :].transpose(1, 2).contiguous()
+                out = normal_flash_attn_func(
+                    q_part.to(v_part.dtype),
+                    k_part.to(v_part.dtype),
+                    v_part,
+                    dropout_p=0,
+                    softmax_scale=scale,
+                )
+                pieces.append(out.transpose(1, 2))
+            return torch.cat(pieces, dim=2)
+
+        return attn_fn
+
     def _prepare_prefix_sequence(
         self,
         *,
@@ -330,15 +450,20 @@ class InfinityNormalPrefixModel(Infinity):
 
         l_end = x.shape[1]
         need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end
-        attn_bias = x.new_full((1, 1, l_end, l_end), -torch.inf)
-        attn_bias[:, :, :prefix_len, :prefix_len] = 0
-        attn_bias[:, :, prefix_len:l_end, :prefix_len] = 0
-        normal_mask = torch.where(
-            normal_stage_ids.view(-1, 1) >= normal_stage_ids.view(1, -1),
-            0.0,
-            -torch.inf,
-        ).to(device=x.device, dtype=x.dtype)
-        attn_bias[:, :, prefix_len:l_end, prefix_len:l_end] = normal_mask
+        if self.normal_use_flex_attn or self.normal_use_segmented_flash_attn:
+            if need_to_pad:
+                raise NotImplementedError("Normal memory-efficient attention path does not support padded sequence lengths yet.")
+            attn_bias = x.new_empty(0)
+        else:
+            attn_bias = x.new_full((1, 1, l_end, l_end), -torch.inf)
+            attn_bias[:, :, :prefix_len, :prefix_len] = 0
+            attn_bias[:, :, prefix_len:l_end, :prefix_len] = 0
+            normal_mask = torch.where(
+                normal_stage_ids.view(-1, 1) >= normal_stage_ids.view(1, -1),
+                0.0,
+                -torch.inf,
+            ).to(device=x.device, dtype=x.dtype)
+            attn_bias[:, :, prefix_len:l_end, prefix_len:l_end] = normal_mask
 
         if need_to_pad:
             attn_bias = F.pad(attn_bias, (0, need_to_pad, 0, need_to_pad), value=-torch.inf)
@@ -357,8 +482,10 @@ class InfinityNormalPrefixModel(Infinity):
         attn_bias: torch.Tensor,
         rope_schedule: list[tuple[int, int, int]],
         stage_ids: torch.Tensor,
+        attn_fn: Any | None = None,
     ) -> torch.Tensor:
         checkpointing_full_block = self.checkpointing == "full-block" and self.training
+        attn_bias_or_mask = None if attn_fn is not None else attn_bias
         if self.num_block_chunks == 1:
             for block_index, block in enumerate(self.blocks):
                 if (self.add_lvl_embeding_only_first_block and block_index == 0) or not self.add_lvl_embeding_only_first_block:
@@ -369,8 +496,8 @@ class InfinityNormalPrefixModel(Infinity):
                         x,
                         cond_BD_or_gss,
                         ca_kv,
-                        attn_bias,
-                        None,
+                        attn_bias_or_mask,
+                        attn_fn,
                         rope_schedule,
                         self.rope2d_freqs_grid,
                         use_reentrant=False,
@@ -380,8 +507,8 @@ class InfinityNormalPrefixModel(Infinity):
                         x=x,
                         cond_BD=cond_BD_or_gss,
                         ca_kv=ca_kv,
-                        attn_bias_or_two_vector=attn_bias,
-                        attn_fn=None,
+                        attn_bias_or_two_vector=attn_bias_or_mask,
+                        attn_fn=attn_fn,
                         scale_schedule=rope_schedule,
                         rope2d_freqs_grid=self.rope2d_freqs_grid,
                     )
@@ -394,8 +521,8 @@ class InfinityNormalPrefixModel(Infinity):
                 x=x,
                 cond_BD=cond_BD_or_gss,
                 ca_kv=ca_kv,
-                attn_bias_or_two_vector=attn_bias,
-                attn_fn=None,
+                attn_bias_or_two_vector=attn_bias_or_mask,
+                attn_fn=attn_fn,
                 scale_schedule=rope_schedule,
                 checkpointing_full_block=checkpointing_full_block,
                 rope2d_freqs_grid=self.rope2d_freqs_grid,
@@ -423,7 +550,20 @@ class InfinityNormalPrefixModel(Infinity):
                 prefix_schedule=scale_schedule,
                 normal_schedule=scale_schedule,
             )
-            attn_bias = attn_bias.type_as(x).to(x.device)
+            attn_fn = self._normal_prefix_segmented_flash_attn(
+                prefix_len=prefix_len,
+                stage_ids=stage_ids,
+            )
+            if attn_fn is None:
+                attn_fn = self._normal_prefix_flex_attn(
+                    prefix_len=prefix_len,
+                    stage_ids=stage_ids,
+                    batch_size=batch_size,
+                )
+            if attn_fn is None:
+                attn_bias = attn_bias.type_as(x).to(x.device)
+            if self.normal_bf16_activations:
+                x = x.to(torch.bfloat16)
 
         x = self._run_prefix_blocks(
             x=x,
@@ -432,9 +572,169 @@ class InfinityNormalPrefixModel(Infinity):
             attn_bias=attn_bias,
             rope_schedule=rope_schedule,
             stage_ids=stage_ids,
+            attn_fn=attn_fn,
         )
         hidden = x[:, prefix_len : prefix_len + normal_len]
         return self.get_logits(hidden, cond_BD)
+
+    def _iter_inference_blocks(self):
+        if self.num_block_chunks == 1:
+            for block_index, block in enumerate(self.blocks):
+                yield block_index, block
+            return
+        block_index = 0
+        for chunk in self.block_chunks:
+            for block in chunk.module:
+                yield block_index, block
+                block_index += 1
+
+    def _set_kv_caching(self, enabled: bool) -> None:
+        for _, block in self._iter_inference_blocks():
+            if isinstance(block, CrossAttnBlock):
+                block.sa.kv_caching(enabled)
+            else:
+                block.attn.kv_caching(enabled)
+
+    def _run_incremental_blocks(
+        self,
+        *,
+        x: torch.Tensor,
+        stage_ids: torch.Tensor,
+        cond_BD_or_gss: torch.Tensor,
+        ca_kv: tuple[torch.Tensor, torch.Tensor, int],
+        rope_schedule: list[tuple[int, int, int]],
+        scale_ind: int,
+    ) -> torch.Tensor:
+        for block_index, block in self._iter_inference_blocks():
+            if (self.add_lvl_embeding_only_first_block and block_index == 0) or not self.add_lvl_embeding_only_first_block:
+                x = self._add_prefix_level_embedding(x, stage_ids)
+            if isinstance(block, CrossAttnBlock):
+                x = block(
+                    x=x,
+                    cond_BD=cond_BD_or_gss,
+                    ca_kv=ca_kv,
+                    attn_bias_or_two_vector=None,
+                    attn_fn=None,
+                    scale_schedule=rope_schedule,
+                    rope2d_freqs_grid=self.rope2d_freqs_grid,
+                    scale_ind=scale_ind,
+                )
+            else:
+                x = block(
+                    x=x,
+                    cond_BD=cond_BD_or_gss,
+                    ca_kv=ca_kv,
+                    attn_bias_or_two_vector=None,
+                    attn_fn=None,
+                    scale_schedule=rope_schedule,
+                    rope2d_freqs_grid=self.rope2d_freqs_grid,
+                )
+        return x
+
+    def autoregressive_infer_prefix_fast(
+        self,
+        *,
+        vae: torch.nn.Module,
+        rgb_prefix_blc: torch.Tensor,
+        scale_schedule: list[tuple[int, int, int]],
+        top_k: int = 1,
+        top_p: float = 0.0,
+        tau: float = 1.0,
+        vae_type: int = 0,
+    ) -> torch.Tensor:
+        del vae_type
+        batch_size = rgb_prefix_blc.shape[0]
+        vae_scale_schedule = build_vae_scale_schedule(scale_schedule, self.apply_spatial_patchify)
+        sos, cond_BD, cond_BD_or_gss, ca_kv = self._task_condition(batch_size)
+        rgb_prefix_emb = self._embed_rgb_prefix(rgb_prefix_blc.float())
+        prefix_stage_ids = _stage_ids_for_schedule(scale_schedule, rgb_prefix_emb.device)
+        prefix_len = _scale_seq_len(scale_schedule)
+        full_rope_schedule = self._ensure_prefix_rope_cache(scale_schedule, scale_schedule, 2 * prefix_len)
+
+        self._set_kv_caching(True)
+        try:
+            _ = self._run_incremental_blocks(
+                x=rgb_prefix_emb,
+                stage_ids=prefix_stage_ids,
+                cond_BD_or_gss=cond_BD_or_gss,
+                ca_kv=ca_kv,
+                rope_schedule=full_rope_schedule,
+                scale_ind=0,
+            )
+
+            summed_codes: torch.Tensor | int = 0
+            for scale_index, scale_item in enumerate(scale_schedule):
+                stage_len = int(np.array(scale_item).prod())
+                if scale_index == 0:
+                    current_emb = sos.unsqueeze(1).expand(batch_size, self.first_l, -1) + self.pos_start.expand(
+                        batch_size, self.first_l, -1
+                    )
+                    current_emb = current_emb + self.normal_modality_embed
+                else:
+                    next_input = F.interpolate(
+                        summed_codes,
+                        size=vae_scale_schedule[scale_index],
+                        mode=vae.quantizer.z_interplote_down,
+                    ).contiguous()
+                    next_input = _flatten_feature_tokens(next_input, apply_spatial_patchify=self.apply_spatial_patchify)
+                    current_emb = self.word_embed(self.norm0_ve(next_input.float())) + self.normal_modality_embed
+
+                normal_stage_ids = torch.full(
+                    (stage_len,),
+                    fill_value=scale_index,
+                    dtype=torch.long,
+                    device=current_emb.device,
+                )
+                x = self._run_incremental_blocks(
+                    x=current_emb,
+                    stage_ids=normal_stage_ids,
+                    cond_BD_or_gss=cond_BD_or_gss,
+                    ca_kv=ca_kv,
+                    rope_schedule=full_rope_schedule,
+                    scale_ind=len(scale_schedule) + scale_index,
+                )
+                logits = self.get_logits(x, cond_BD).mul(1.0 / max(float(tau), 1e-6))
+
+                if self.use_bit_label:
+                    stage_bits = logits.reshape(batch_size, stage_len, -1, 2)
+                    sampled = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                        stage_bits.reshape(batch_size, -1, 2),
+                        rng=None,
+                        top_k=top_k,
+                        top_p=top_p,
+                        num_samples=1,
+                    )[:, :, 0]
+                    stage_bits = sampled.reshape(batch_size, stage_len, -1).float()
+                    stage_bits = stage_bits.reshape(batch_size, scale_item[0], scale_item[1], scale_item[2], -1)
+                    if self.apply_spatial_patchify:
+                        assert scale_item[0] == 1
+                        stage_bits = stage_bits.squeeze(1).permute(0, 3, 1, 2)
+                        stage_bits = torch.nn.functional.pixel_shuffle(stage_bits, 2)
+                        stage_bits = stage_bits.permute(0, 2, 3, 1).unsqueeze(1)
+                    codes = vae.quantizer.lfq.indices_to_codes(stage_bits, label_type="bit_label")
+                else:
+                    stage_indices = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                        logits,
+                        rng=None,
+                        top_k=top_k,
+                        top_p=top_p,
+                        num_samples=1,
+                    )[:, :, 0]
+                    stage_indices = stage_indices.reshape(batch_size, scale_item[0], scale_item[1], scale_item[2])
+                    codes = vae.quantizer.lfq.indices_to_codes(stage_indices, label_type="int_label")
+
+                if scale_index == len(scale_schedule) - 1:
+                    summed_codes = summed_codes + codes
+                else:
+                    summed_codes = summed_codes + F.interpolate(
+                        codes,
+                        size=vae_scale_schedule[-1],
+                        mode=vae.quantizer.z_interplote_up,
+                    ).contiguous()
+        finally:
+            self._set_kv_caching(False)
+
+        return vae.decode(summed_codes.squeeze(-3)).clamp(-1.0, 1.0)
 
     @torch.no_grad()
     def autoregressive_infer_prefix(
@@ -448,6 +748,16 @@ class InfinityNormalPrefixModel(Infinity):
         tau: float = 1.0,
         vae_type: int = 0,
     ) -> torch.Tensor:
+        if os.environ.get("INFINITY_NORMAL_ENABLE_KV_FAST", "").strip().lower() in {"1", "true", "yes", "y"}:
+            return self.autoregressive_infer_prefix_fast(
+                vae=vae,
+                rgb_prefix_blc=rgb_prefix_blc,
+                scale_schedule=scale_schedule,
+                top_k=top_k,
+                top_p=top_p,
+                tau=tau,
+                vae_type=vae_type,
+            )
         del vae_type
         batch_size = rgb_prefix_blc.shape[0]
         vae_scale_schedule = build_vae_scale_schedule(scale_schedule, self.apply_spatial_patchify)
@@ -544,6 +854,12 @@ def build_infinity_normal_model(
     rope2d_normalized_by_hw: int,
     apply_spatial_patchify: bool,
     device: torch.device,
+    checkpointing: str | None = "full-block",
+    normal_use_flex_attn: bool = False,
+    normal_use_segmented_flash_attn: bool = False,
+    normal_bf16_activations: bool = False,
+    fused_mlp: bool = False,
+    fused_norm: bool = False,
     text_channels: int = 2048,
     text_maxlen: int = 512,
     task_condition_len: int = 16,
@@ -554,6 +870,9 @@ def build_infinity_normal_model(
         text_channels=text_channels,
         text_maxlen=text_maxlen,
         task_condition_len=task_condition_len,
+        normal_use_flex_attn=normal_use_flex_attn,
+        normal_use_segmented_flash_attn=normal_use_segmented_flash_attn,
+        normal_bf16_activations=normal_bf16_activations,
         raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         shared_aln=True,
         cond_drop_rate=0.1,
@@ -561,7 +880,9 @@ def build_infinity_normal_model(
         tau=1,
         cos_attn=True,
         head_depth=1,
-        checkpointing="full-block",
+        fused_mlp=fused_mlp,
+        fused_norm=fused_norm,
+        checkpointing=checkpointing,
         pad_to_multiplier=1,
         use_flex_attn=False,
         batch_size=batch_size,
@@ -573,6 +894,7 @@ def build_infinity_normal_model(
         train_h_div_w_list=h_div_w_templates.tolist(),
         always_training_scales=100,
         apply_spatial_patchify=apply_spatial_patchify,
+        bf16_activations=normal_bf16_activations,
         **model_config,
     )
     return model.to(device)

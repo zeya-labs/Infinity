@@ -186,6 +186,8 @@ def resolve_image_dir(dataset: str, data_root: Path) -> Path:
 
 
 def resolve_image_paths(input_dir: Path) -> list[Path]:
+    if not input_dir.exists():
+        return []
     if input_dir.is_file():
         return [input_dir]
     return sorted(path for path in input_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
@@ -210,11 +212,18 @@ def prepare_input_shards(input_dir: Path, shard_root: Path, shard_count: int) ->
 
 def merge_shard_outputs(shard_outputs: list[Path], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    timing_rows: list[dict[str, object]] = []
     for shard_output in shard_outputs:
         if not shard_output.exists():
             continue
+        timing_path = shard_output / "inference_times.json"
+        if timing_path.exists():
+            payload = json.loads(timing_path.read_text(encoding="utf-8"))
+            rows = payload.get("images") if isinstance(payload, dict) else payload
+            if isinstance(rows, list):
+                timing_rows.extend(row for row in rows if isinstance(row, dict))
         for path in shard_output.rglob("*"):
-            if not path.is_file() or path.name == "metrics.json":
+            if not path.is_file() or path.name in {"metrics.json", "inference_times.json"}:
                 continue
             relative = path.relative_to(shard_output)
             target = output_dir / relative
@@ -222,6 +231,11 @@ def merge_shard_outputs(shard_outputs: list[Path], output_dir: Path) -> None:
             if target.exists():
                 target.unlink()
             shutil.copy2(path, target)
+    if timing_rows:
+        (output_dir / "inference_times.json").write_text(
+            json.dumps({"images": timing_rows}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def save_image_tensor(image_chw: torch.Tensor, path: Path) -> None:
@@ -349,11 +363,17 @@ def ours_command(args: argparse.Namespace, input_dir: Path, output_dir: Path) ->
         "--tau",
         args.ours_tau,
         "--save-npy",
+        "--timing-warmup",
+        str(args.timing_warmup),
+        "--timing-repeats",
+        str(args.timing_repeats),
     ]
     if args.normal_tokenizer_ckpt:
         cmd.extend(["--normal-vae-ckpt", str(args.normal_tokenizer_ckpt)])
     if args.normal_vae_type:
         cmd.extend(["--normal-vae-type", str(args.normal_vae_type)])
+    if args.ours_kv_cache_fast:
+        cmd.append("--normal-kv-cache-fast")
     return cmd
 
 
@@ -363,7 +383,8 @@ def run_ours_sharded(args: argparse.Namespace, input_dir: Path, output_dir: Path
     if len(input_shards) == 1:
         cmd = ours_command(args, input_shards[0], output_dir)
         device = devices[0] if devices else None
-        return run_command(cmd, cwd=ROOT, dry_run=args.dry_run, env=clean_env(device), cuda_device=device), [cmd]
+        code = run_command(cmd, cwd=ROOT, dry_run=args.dry_run, env=clean_env(device), cuda_device=device)
+        return code, [cmd]
 
     shard_output_root = output_dir / "_shards"
     if shard_output_root.exists():
@@ -388,13 +409,93 @@ def run_ours_sharded(args: argparse.Namespace, input_dir: Path, output_dir: Path
     return 0, commands
 
 
-def write_image_only_metrics(output_dir: Path, method: str) -> None:
+def timing_protocol() -> str:
+    return (
+        "Batch-size-1 per-image model inference latency measured inside each predictor with time.perf_counter and CUDA "
+        "synchronization around the model-call section only. Each image uses unmeasured warmup iterations followed by "
+        "measured repeats. Model loading, process startup, dataset export, image file I/O, metric computation, "
+        "visualization writing, and result serialization are excluded."
+    )
+
+
+def load_inference_timing(method_dir: Path, method: str, enabled: bool) -> dict[str, object]:
+    path = method_dir / "inference_times.json"
+    unavailable = {
+        "enabled": bool(enabled),
+        "available": False,
+        "method": method,
+        "protocol": timing_protocol(),
+        "reason": "No per-image inference_times.json was produced by this method wrapper.",
+    }
+    if not enabled:
+        unavailable["reason"] = "Inference-time comparison disabled."
+        return unavailable
+    if not path.exists():
+        return unavailable
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("images") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        unavailable["reason"] = f"Malformed timing file: {path}"
+        return unavailable
+    seconds: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        repeats = row.get("repeat_inference_seconds")
+        if isinstance(repeats, list):
+            seconds.extend(float(value) for value in repeats if isinstance(value, (int, float)))
+        elif isinstance(row.get("inference_seconds"), (int, float)):
+            seconds.append(float(row["inference_seconds"]))
+    if not seconds:
+        unavailable["reason"] = f"No valid per-image inference_seconds in {path}"
+        return unavailable
+    arr = np.asarray(seconds, dtype=np.float64)
+    ci95 = float(1.96 * arr.std(ddof=1) / np.sqrt(arr.size)) if arr.size > 1 else 0.0
+    return {
+        "enabled": True,
+        "available": True,
+        "method": method,
+        "protocol": timing_protocol(),
+        "timed_observations": int(arr.size),
+        "images": int(len(rows)),
+        "mean_seconds": float(arr.mean()),
+        "median_seconds": float(np.median(arr)),
+        "std_seconds": float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
+        "ci95_seconds": ci95,
+        "min_seconds": float(arr.min()),
+        "max_seconds": float(arr.max()),
+        "images_per_second": float(1.0 / arr.mean()) if arr.mean() > 0 else None,
+        "per_image_file": str(path),
+    }
+
+
+def update_metrics_timing(method_dir: Path, method: str, timing: dict[str, object]) -> None:
+    path = method_dir / "metrics.json"
+    payload: dict[str, object]
+    if path.exists():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        payload = loaded if isinstance(loaded, dict) else {}
+    else:
+        payload = {"method": method}
+    payload["inference_time"] = timing
+    metrics = payload.get("metrics")
+    if isinstance(metrics, dict) and timing.get("available"):
+        for key in ("mean_seconds", "median_seconds", "std_seconds", "images_per_second"):
+            value = timing.get(key)
+            if isinstance(value, (int, float)):
+                metrics[f"inference_{key}"] = float(value)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_image_only_metrics(output_dir: Path, method: str, timing: dict[str, object] | None = None) -> None:
     payload = {
         "method": method,
         "num_png": len(list(output_dir.glob("*_normal.png"))),
         "num_npy": len(list(output_dir.glob("*_normal.npy"))),
         "metrics": {},
     }
+    if timing is not None:
+        payload["inference_time"] = timing
     (output_dir / "metrics.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -895,6 +996,15 @@ def main() -> int:
     parser.add_argument("--ours-top-p", default="0.0")
     parser.add_argument("--ours-tau", default="1.0")
     parser.add_argument("--parallel-shards", default="auto")
+    parser.add_argument("--timing-warmup", type=int, default=3)
+    parser.add_argument("--timing-repeats", type=int, default=5)
+    parser.add_argument("--ours-kv-cache-fast", action="store_true")
+    parser.add_argument(
+        "--compare-inference-time",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Measure and compare per-image model inference time only.",
+    )
     parser.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -946,6 +1056,12 @@ def main() -> int:
         "ours_checkpoint": str(args.ours_checkpoint),
         "normal_tokenizer_ckpt": str(args.normal_tokenizer_ckpt) if args.normal_tokenizer_ckpt else "",
         "visible_cuda_devices": devices,
+        "parallel_shards": args.parallel_shards,
+        "compare_inference_time": bool(args.compare_inference_time),
+        "timing_warmup": args.timing_warmup,
+        "timing_repeats": args.timing_repeats,
+        "ours_kv_cache_fast": bool(args.ours_kv_cache_fast),
+        "inference_time_protocol": timing_protocol(),
         "normal_conventions": {
             "canonical": EVAL_CONVENTION,
             "dataset_targets": {key: asdict(value) for key, value in DATASET_TARGET_CONVENTIONS.items()},
@@ -960,44 +1076,65 @@ def main() -> int:
     (output_dir / "eval_experiment.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(meta, ensure_ascii=False), flush=True)
 
+    timing_by_method: dict[str, dict[str, object]] = {}
+
     if "ours" in methods:
         ours_out = output_dir / "ours"
         ours_out.mkdir(parents=True, exist_ok=True)
         code, ours_commands = run_ours_sharded(args, input_dir, ours_out, devices)
+        timing_by_method["ours"] = load_inference_timing(ours_out, "ours", args.compare_inference_time and not args.dry_run)
         commands["ours"] = ours_commands[0] if len(ours_commands) == 1 else ours_commands
         if code != 0:
             failures.append(f"ours: exited with {code}")
         elif manifest and not args.dry_run:
             evaluate_predictions(ours_out, manifest, "ours", args.dataset)
+            update_metrics_timing(ours_out, "ours", timing_by_method["ours"])
         elif not manifest:
-            write_image_only_metrics(ours_out, "ours")
+            write_image_only_metrics(ours_out, "ours", timing_by_method["ours"])
 
     baseline_methods = [method for method in methods if method != "ours"]
     if baseline_methods:
-        baseline_cmd = [
-            str(PYTHON),
-            str(BASELINE_RUNNER),
-            "--input-dir",
-            str(input_dir),
-            "--output-dir",
-            str(output_dir),
-            "--methods",
-            *baseline_methods,
-            "--parallel-shards",
-            args.parallel_shards,
-        ]
-        if args.bootstrap:
-            baseline_cmd.append("--bootstrap")
-        if args.dry_run:
-            baseline_cmd.append("--dry-run")
-        commands["baselines"] = baseline_cmd
-        code = run_command(baseline_cmd, cwd=ROOT, dry_run=False, env=no_proxy_env())
-        if code != 0:
-            failures.append(f"baselines: exited with {code}")
-        elif manifest and not args.dry_run:
-            for method in baseline_methods:
+        baseline_groups = [[method] for method in baseline_methods] if args.compare_inference_time else [baseline_methods]
+        for baseline_group in baseline_groups:
+            baseline_cmd = [
+                str(PYTHON),
+                str(BASELINE_RUNNER),
+                "--input-dir",
+                str(input_dir),
+                "--output-dir",
+                str(output_dir),
+                "--methods",
+                *baseline_group,
+                "--parallel-shards",
+                args.parallel_shards,
+                "--timing-warmup",
+                str(args.timing_warmup),
+                "--timing-repeats",
+                str(args.timing_repeats),
+            ]
+            if args.bootstrap:
+                baseline_cmd.append("--bootstrap")
+            if args.dry_run:
+                baseline_cmd.append("--dry-run")
+            command_key = baseline_group[0] if len(baseline_group) == 1 else "baselines"
+            commands[command_key] = baseline_cmd
+            code = run_command(baseline_cmd, cwd=ROOT, dry_run=False, env=no_proxy_env())
+            if len(baseline_group) == 1:
+                method = baseline_group[0]
+                timing_by_method[method] = load_inference_timing(output_dir / method, method, args.compare_inference_time and not args.dry_run)
+            if code != 0:
+                failures.append(f"{command_key}: exited with {code}")
+                continue
+            for method in baseline_group:
+                if method in timing_by_method:
+                    update_metrics_timing(output_dir / method, method, timing_by_method[method])
+            if not manifest or args.dry_run:
+                continue
+            for method in baseline_group:
                 try:
                     evaluate_predictions(output_dir / method, manifest, method, args.dataset)
+                    if method in timing_by_method:
+                        update_metrics_timing(output_dir / method, method, timing_by_method[method])
                 except Exception as exc:
                     failures.append(f"{method}: eval failed: {exc}")
 
@@ -1011,6 +1148,29 @@ def main() -> int:
         if isinstance(metrics, dict):
             summary[method] = {str(key): float(value) for key, value in metrics.items() if isinstance(value, (int, float))}
     (output_dir / "metrics_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    if timing_by_method:
+        def timing_sort_key(item: tuple[str, dict[str, object]]) -> float:
+            value = item[1].get("mean_seconds")
+            return float(value) if isinstance(value, (int, float)) else float("inf")
+
+        timing_summary = {
+            method: timing
+            for method, timing in sorted(
+                timing_by_method.items(),
+                key=timing_sort_key,
+            )
+        }
+        (output_dir / "inference_time_summary.json").write_text(
+            json.dumps(
+                {
+                    "protocol": timing_protocol(),
+                    "methods": timing_summary,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     if manifest and not args.dry_run:
         write_method_comparison_visualization(
             output_dir=output_dir,

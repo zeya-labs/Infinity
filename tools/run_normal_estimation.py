@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-npy", action="store_true", default=False)
     parser.add_argument("--save-visualization", action="store_true", default=True)
     parser.add_argument("--disable-save-visualization", dest="save_visualization", action="store_false")
+    parser.add_argument("--timing-warmup", type=int, default=3)
+    parser.add_argument("--timing-repeats", type=int, default=5)
+    parser.add_argument("--normal-kv-cache-fast", action="store_true", help="Use experimental KV-cache AR path for normal inference.")
     return parser.parse_args()
 
 
@@ -91,8 +96,46 @@ def _save_visualization(image_chw: torch.Tensor, normal_vis_chw: torch.Tensor, p
     _save_png(cat, path)
 
 
+def _sync_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _predict_normal(
+    *,
+    image_tensor: torch.Tensor,
+    rgb_vae: torch.nn.Module,
+    normal_vae: torch.nn.Module,
+    model: torch.nn.Module,
+    scale_schedule: list[tuple[int, int, int]],
+    normal_vae_type: int,
+    rgb_apply_spatial_patchify: bool,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    rgb_prefix_blc = build_prefix_tokens_from_image(
+        image_01=image_tensor,
+        rgb_vae=rgb_vae,
+        scale_schedule=scale_schedule,
+        apply_spatial_patchify=rgb_apply_spatial_patchify,
+    )
+    return model.autoregressive_infer_prefix(
+        vae=normal_vae,
+        rgb_prefix_blc=rgb_prefix_blc,
+        scale_schedule=scale_schedule,
+        tau=args.tau,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        vae_type=normal_vae_type,
+    )
+
+
 def main() -> int:
     args = parse_args()
+    if args.normal_kv_cache_fast:
+        os.environ["INFINITY_NORMAL_ENABLE_KV_FAST"] = "1"
+    else:
+        os.environ.pop("INFINITY_NORMAL_ENABLE_KV_FAST", None)
     model_path = Path(args.model_path)
     checkpoint_args = _load_checkpoint_args(model_path) if model_path.is_file() else {}
 
@@ -162,6 +205,7 @@ def main() -> int:
     print(json.dumps({"missing": len(missing), "unexpected": len(unexpected)}, indent=2))
     model.eval()
 
+    timing_rows: list[dict[str, object]] = []
     for image_path in input_paths:
         with Image.open(image_path) as image_handle:
             image = image_handle.convert("RGB")
@@ -171,34 +215,67 @@ def main() -> int:
             image_np = np.asarray(resized, dtype=np.float32) / 255.0
             image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
+        repeat_seconds: list[float] = []
+        raw_normal = None
         with torch.no_grad():
-            rgb_prefix_blc = build_prefix_tokens_from_image(
-                image_01=image_tensor,
-                rgb_vae=rgb_vae,
-                scale_schedule=scale_schedule,
-                apply_spatial_patchify=rgb_apply_spatial_patchify,
-            )
-            raw_normal = model.autoregressive_infer_prefix(
-                vae=normal_vae,
-                rgb_prefix_blc=rgb_prefix_blc,
-                scale_schedule=scale_schedule,
-                tau=args.tau,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                vae_type=normal_vae_type,
-            )
+            for _ in range(max(0, args.timing_warmup)):
+                _ = _predict_normal(
+                    image_tensor=image_tensor,
+                    rgb_vae=rgb_vae,
+                    normal_vae=normal_vae,
+                    model=model,
+                    scale_schedule=scale_schedule,
+                    normal_vae_type=normal_vae_type,
+                    rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
+                    device=device,
+                    args=args,
+                )
+            for _ in range(max(1, args.timing_repeats)):
+                _sync_device(device)
+                inference_start = time.perf_counter()
+                raw_normal = _predict_normal(
+                    image_tensor=image_tensor,
+                    rgb_vae=rgb_vae,
+                    normal_vae=normal_vae,
+                    model=model,
+                    scale_schedule=scale_schedule,
+                    normal_vae_type=normal_vae_type,
+                    rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
+                    device=device,
+                    args=args,
+                )
+                _sync_device(device)
+                repeat_seconds.append(time.perf_counter() - inference_start)
+            assert raw_normal is not None
             raw_normal = F.interpolate(raw_normal, size=(original_height, original_width), mode="bilinear", align_corners=False)
             raw_normal = normalize_normals(raw_normal)
             normal_vis = normals_to_vis(raw_normal)[0]
             image_vis = F.interpolate(image_tensor, size=(original_height, original_width), mode="bilinear", align_corners=False)[0].cpu()
 
         stem = image_path.stem
+        timing_rows.append(
+            {
+                "id": stem,
+                "image": str(image_path),
+                "height": int(original_height),
+                "width": int(original_width),
+                "warmup": int(max(0, args.timing_warmup)),
+                "repeats": int(max(1, args.timing_repeats)),
+                "repeat_inference_seconds": repeat_seconds,
+                "inference_seconds": float(np.median(np.asarray(repeat_seconds, dtype=np.float64))),
+                "timed_section": "rgb VAE prefix encoding + autoregressive normal generation only; excludes model loading, file I/O, resize, normalization, and saving.",
+            }
+        )
         _save_png(normal_vis, output_dir / f"{stem}_normal.png")
         if args.save_visualization:
             _save_visualization(image_vis, normal_vis, output_dir / f"{stem}_visualization.png")
         if args.save_npy:
             np.save(output_dir / f"{stem}_normal.npy", raw_normal[0].permute(1, 2, 0).cpu().numpy())
 
+    (output_dir / "inference_times.json").write_text(
+        json.dumps({"images": timing_rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return 0
 
 

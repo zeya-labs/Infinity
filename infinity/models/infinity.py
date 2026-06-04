@@ -62,11 +62,33 @@ class MultipleLayers(nn.Module):
         for i in range(index, index+num_blocks_in_a_chunk):
             self.module.append(ls[i])
 
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, checkpointing_full_block=False, rope2d_freqs_grid=None):
+    def forward(
+        self,
+        x,
+        cond_BD,
+        ca_kv,
+        attn_bias_or_two_vector,
+        attn_fn=None,
+        scale_schedule=None,
+        checkpointing_full_block=False,
+        rope2d_freqs_grid=None,
+        scale_ind=0,
+    ):
         h = x
         for m in self.module:
             if checkpointing_full_block:
                 h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
+            elif isinstance(m, CrossAttnBlock):
+                h = m(
+                    h,
+                    cond_BD,
+                    ca_kv,
+                    attn_bias_or_two_vector,
+                    attn_fn,
+                    scale_schedule,
+                    rope2d_freqs_grid,
+                    scale_ind=scale_ind,
+                )
             else:
                 h = m(h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
         return h
@@ -91,6 +113,7 @@ class Infinity(nn.Module):
         checkpointing=None,
         pad_to_multiplier=0,
         use_flex_attn=False,
+        bf16_activations=False,
         batch_size=2,
         add_lvl_embeding_only_first_block=1,
         use_bit_label=1,
@@ -260,6 +283,7 @@ class Infinity(nn.Module):
                 swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
                 checkpointing_sa_only=self.checkpointing == 'self-attn',
                 use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                bf16_activations=bf16_activations,
             )
             self.unregistered_blocks.append(block)
         

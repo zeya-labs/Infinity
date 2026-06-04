@@ -105,25 +105,29 @@ def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_
 
 
 def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind):
-    qk = torch.stack((q, k), dim=0)  #(2, batch_size, heads, seq_len, head_dim)
-    device_type = qk.device.type
+    device_type = q.device.type
     device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
     with torch.autocast(device_type=device_type, enabled=False):
-        seq_len = qk.shape[3]
+        seq_len = q.shape[2]
         start = 0
         if scale_ind >= 1:
             assert len(scale_schedule[0]) == 3
             start = np.sum([item[0] * item[1] * item[2] for item in scale_schedule[:scale_ind]])
-        rope2d_freqs_grid[str(tuple(scale_schedule))] = rope2d_freqs_grid[str(tuple(scale_schedule))].to(qk.device)
+        rope2d_freqs_grid[str(tuple(scale_schedule))] = rope2d_freqs_grid[str(tuple(scale_schedule))].to(q.device)
         assert start+seq_len <= rope2d_freqs_grid[str(tuple(scale_schedule))].shape[4]
-        rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][:, :, :, :, start:start+seq_len] # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]
-        qk = qk.reshape(*qk.shape[:-1], -1, 2) #(2, batch_size, heads, seq_len, half_head_dim, 2)
-        qk = torch.stack([
-            rope_cache[0] * qk[...,0] - rope_cache[1] * qk[...,1],
-            rope_cache[1] * qk[...,0] + rope_cache[0] * qk[...,1],
-        ], dim=-1) # (2, batch_size, heads, seq_len, half_head_dim, 2), here stack + reshape should not be concate
-        qk = qk.reshape(*qk.shape[:-2], -1) #(2, batch_size, heads, seq_len, head_dim)
-        q, k = qk.unbind(dim=0) # (batch_size, heads, seq_len, head_dim)
+        output_dtype = q.dtype
+        rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][:, :, :, :, start:start+seq_len].float() # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]
+        cos, sin = rope_cache[0], rope_cache[1]
+
+        def rotate(x):
+            x_pair = x.float().reshape(*x.shape[:-1], -1, 2)
+            out = torch.empty_like(x_pair)
+            x0, x1 = x_pair[..., 0], x_pair[..., 1]
+            out[..., 0] = cos * x0 - sin * x1
+            out[..., 1] = sin * x0 + cos * x1
+            return out.reshape_as(x).to(output_dtype)
+
+        q, k = rotate(q), rotate(k)
     return q, k
 
 
@@ -207,7 +211,7 @@ class SelfAttention(nn.Module):
     def __init__(
         self, embed_dim=768, num_heads=12,
         proj_drop=0., tau=1, cos_attn=False, customized_flash_attn=True, use_flex_attn=False, 
-        batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0,
+        batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0, bf16_activations=False,
     ):
         """
         :param embed_dim: model's width
@@ -245,6 +249,7 @@ class SelfAttention(nn.Module):
 
         self.batch_size = batch_size
         self.use_flex_attn = use_flex_attn
+        self.bf16_activations = bf16_activations
         self.pad_to_multiplier = pad_to_multiplier
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
@@ -285,15 +290,26 @@ class SelfAttention(nn.Module):
         B, L, C = x.shape
         
         # qkv: amp, bf16
-        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
-        if self.using_flash: q, k, v = qkv.unbind(dim=2); L_dim = 1           # q or k or v: all are shaped in (B:batch_size, L:seq_len, H:heads, c:head_dim)
-        else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); L_dim = 2   # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
+        if self.bf16_activations and attn_fn is not None and not self.using_flash:
+            q_weight, k_weight, v_weight = self.mat_qkv.weight.chunk(3, dim=0)
+            q = F.linear(input=x, weight=q_weight, bias=self.q_bias).view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            k = F.linear(input=x, weight=k_weight, bias=self.zero_k_bias).view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = F.linear(input=x, weight=v_weight, bias=self.v_bias).view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            L_dim = 2
+        else:
+            qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
+            if self.using_flash: q, k, v = qkv.unbind(dim=2); L_dim = 1           # q or k or v: all are shaped in (B:batch_size, L:seq_len, H:heads, c:head_dim)
+            else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); L_dim = 2   # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
         
         if self.cos_attn:   # always True
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp() # 11H1 (flash), or 1H11 (not flash)
-            q = F.normalize(q, dim=-1, eps=1e-12).mul(scale_mul).contiguous()   # fp32
-            k = F.normalize(k, dim=-1, eps=1e-12).contiguous()                  # fp32
             v = v.contiguous()                                                  # bf16
+            if self.bf16_activations:
+                q = F.normalize(q.float(), dim=-1, eps=1e-12).mul(scale_mul).to(v.dtype).contiguous()
+                k = F.normalize(k.float(), dim=-1, eps=1e-12).to(v.dtype).contiguous()
+            else:
+                q = F.normalize(q, dim=-1, eps=1e-12).mul(scale_mul).contiguous()   # fp32
+                k = F.normalize(k, dim=-1, eps=1e-12).contiguous()                  # fp32
         else:   # be contiguous, to make kernel happy
             q = q.contiguous()      # bf16
             k = k.contiguous()      # bf16
@@ -313,7 +329,7 @@ class SelfAttention(nn.Module):
         else:
             # if self.cos_attn: q, k are in fp32; v is in bf16
             # else: q, k, v are in bf16
-            if self.use_flex_attn and attn_fn is not None:
+            if attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
                 oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C)
@@ -482,6 +498,7 @@ class CrossAttnBlock(nn.Module):
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
+        bf16_activations=False,
     ):
         super(CrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
@@ -490,6 +507,7 @@ class CrossAttnBlock(nn.Module):
         self.sa = SelfAttention(
             embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn,
             use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+            bf16_activations=bf16_activations,
         )
         self.ca = CrossAttention(embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn)
         self.using_swiglu = swiglu
@@ -513,6 +531,7 @@ class CrossAttnBlock(nn.Module):
             self.ca_gamma = 1
         
         self.checkpointing_sa_only = checkpointing_sa_only
+        self.bf16_activations = bf16_activations
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
@@ -523,23 +542,65 @@ class CrossAttnBlock(nn.Module):
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
         
         if self.fused_norm_func is None:
-            x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1)
-            if self.checkpointing_sa_only and self.training:
-                x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
+            if self.bf16_activations:
+                x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1).to(x.dtype)
+                gamma1_for_x = gamma1.to(x.dtype)
+                gamma2_for_x = gamma2.to(x.dtype)
+                ca_gamma_for_x = self.ca_gamma.to(x.dtype) if isinstance(self.ca_gamma, torch.Tensor) else self.ca_gamma
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
-            x = x + self.drop_path(x_sa.mul_(gamma1))
-            x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
-            x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
-        else:
-            x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
+                x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1)
+                gamma1_for_x = gamma1
+                gamma2_for_x = gamma2
+                ca_gamma_for_x = self.ca_gamma
             if self.checkpointing_sa_only and self.training:
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
-            x = x + self.drop_path(x_sa.mul_(gamma1))
-            x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
-            x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+            x = x + self.drop_path(x_sa.mul_(gamma1_for_x))
+            ca_update = self.ca(self.ca_norm(x.float()).to(x.dtype) if self.bf16_activations else self.ca_norm(x), ca_kv)
+            if not self.bf16_activations:
+                ca_update = ca_update.float()
+            x = x + ca_update.mul_(ca_gamma_for_x)
+            if self.bf16_activations:
+                ffn_in = self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2).to(x.dtype)
+            else:
+                ffn_in = self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2)
+            x = x + self.drop_path(self.ffn(ffn_in).mul(gamma2_for_x)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
+        else:
+            if self.bf16_activations:
+                scale1_for_x = scale1.to(x.dtype)
+                scale2_for_x = scale2.to(x.dtype)
+                shift1_for_x = shift1.to(x.dtype)
+                shift2_for_x = shift2.to(x.dtype)
+                gamma1_for_x = gamma1.to(x.dtype)
+                gamma2_for_x = gamma2.to(x.dtype)
+                ca_gamma_for_x = self.ca_gamma.to(x.dtype) if isinstance(self.ca_gamma, torch.Tensor) else self.ca_gamma
+            else:
+                scale1_for_x = scale1
+                scale2_for_x = scale2
+                shift1_for_x = shift1
+                shift2_for_x = shift2
+                gamma1_for_x = gamma1
+                gamma2_for_x = gamma2
+                ca_gamma_for_x = self.ca_gamma
+            if self.bf16_activations:
+                x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x.float(), scale=scale1, shift=shift1).to(x.dtype)
+            else:
+                x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1_for_x, shift=shift1_for_x)
+            if self.checkpointing_sa_only and self.training:
+                x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
+            else:
+                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
+            x = x + self.drop_path(x_sa.mul_(gamma1_for_x))
+            ca_update = self.ca(self.ca_norm(x.float()).to(x.dtype) if self.bf16_activations else self.ca_norm(x), ca_kv)
+            if not self.bf16_activations:
+                ca_update = ca_update.float()
+            x = x + ca_update.mul_(ca_gamma_for_x)
+            if self.bf16_activations:
+                ffn_in = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x.float(), scale=scale2, shift=shift2).to(x.dtype)
+            else:
+                ffn_in = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2_for_x, shift=shift2_for_x)
+            x = x + self.drop_path(self.ffn(ffn_in).mul(gamma2_for_x)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         return x
     
     def extra_repr(self) -> str:

@@ -48,6 +48,8 @@ VOLC_DEFAULT_RESOURCE_FAMILY = os.environ.get("INFINITY_VOLC_RESOURCE_FAMILY", "
 VOLC_DEFAULT_RESOURCE_CPU = os.environ.get("INFINITY_VOLC_RESOURCE_CPU", "112")
 VOLC_DEFAULT_RESOURCE_MEMORY = os.environ.get("INFINITY_VOLC_RESOURCE_MEMORY", "1960")
 VOLC_DEFAULT_PRIORITY = os.environ.get("INFINITY_VOLC_PRIORITY", "6")
+VOLC_DEFAULT_RETRY_TIMES = os.environ.get("INFINITY_VOLC_RETRY_TIMES", "5")
+VOLC_DEFAULT_RETRY_INTERVAL_SECONDS = os.environ.get("INFINITY_VOLC_RETRY_INTERVAL_SECONDS", "120")
 
 @dataclass
 class Field:
@@ -93,6 +95,13 @@ class VolcConfig:
 
 def shell_join(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
+
+
+def shell_join_volc_command(cmd: list[str]) -> str:
+    line = shell_join(cmd)
+    for name in ("MLP_WORKER_NUM", "MLP_ROLE_INDEX", "MLP_WORKER_0_HOST", "MLP_WORKER_0_PORT", "MLP_WORKER_GPU"):
+        line = line.replace(f"__{name}__", f"${name}")
+    return line
 
 
 def shell_export(env: dict[str, str]) -> str:
@@ -468,36 +477,150 @@ def volc_envs(
     return [{"Name": key, "Value": value} for key, value in envs.items() if value != ""]
 
 
-def volc_resource_spec(config: VolcConfig, gpu_count: int) -> dict[str, object]:
+def parse_volc_topology(values: dict[str, str], config: VolcConfig) -> tuple[int, int]:
+    raw = values.get("volc_topology") or os.environ.get("INFINITY_VOLC_TOPOLOGY", "")
+    raw = raw.strip().lower()
+    if raw:
+        match = re.fullmatch(r"(\d+)\s*x\s*(\d+)", raw)
+        if not match:
+            raise ValueError(f"Volc topology 必须形如 1x8/2x4/4x2/8x1，当前是: {raw}")
+        worker_count = int(match.group(1))
+        gpus_per_worker = int(match.group(2))
+        if worker_count <= 0 or gpus_per_worker <= 0:
+            raise ValueError(f"Volc topology 必须为正数，当前是: {raw}")
+        return worker_count, gpus_per_worker
+    return (
+        parse_positive_int(os.environ.get("INFINITY_VOLC_ROLE_REPLICAS", "1"), "Worker 数"),
+        parse_positive_int(config.gpus, "Volc GPU 数"),
+    )
+
+
+def volc_pni2_flavor(gpus_per_worker: int) -> str:
+    return {
+        1: "ml.pni2.3xlarge",
+        2: "ml.pni2.7xlarge",
+        4: "ml.pni2.14xlarge",
+        8: "ml.pni2.28xlarge",
+    }.get(gpus_per_worker, "")
+
+
+def scale_resource_value(value: str, gpus_per_worker: int, base_gpus: int) -> int:
+    parsed = parse_positive_int(value, "Volc 资源")
+    if os.environ.get("INFINITY_VOLC_SCALE_RESOURCES", "1").strip().lower() in {"0", "false", "no", "n"}:
+        return parsed
+    return max(1, math.ceil(parsed * gpus_per_worker / max(1, base_gpus)))
+
+
+def volc_resource_spec(config: VolcConfig, gpus_per_worker: int, worker_count: int) -> dict[str, object]:
     spec: dict[str, object] = {
         "RoleName": "worker",
-        "RoleReplicas": parse_positive_int(os.environ.get("INFINITY_VOLC_ROLE_REPLICAS", "1"), "Worker 数"),
+        "RoleReplicas": worker_count,
     }
-    if config.flavor and config.flavor != "custom":
+    if config.resource_family == "ml.pni2":
+        flavor = volc_pni2_flavor(gpus_per_worker)
+        if flavor:
+            spec["Flavor"] = flavor
+            return spec
+    if config.flavor and config.flavor != "custom" and worker_count == 1 and gpus_per_worker == parse_positive_int(config.gpus, "Volc GPU 数"):
         spec["Flavor"] = config.flavor
         return spec
+    base_gpus = parse_positive_int(config.gpus, "Volc GPU 数")
     spec["Flavor"] = "custom"
     spec["ResourceSpec"] = {
         "Family": config.resource_family,
-        "CPU": parse_positive_int(config.resource_cpu, "Volc CPU"),
-        "Memory": parse_positive_int(config.resource_memory, "Volc Memory"),
-        "GPUNum": gpu_count,
+        "CPU": scale_resource_value(config.resource_cpu, gpus_per_worker, base_gpus),
+        "Memory": scale_resource_value(config.resource_memory, gpus_per_worker, base_gpus),
+        "GPUNum": gpus_per_worker,
     }
     return spec
 
 
-def volc_runtime_values(task: Task, values: dict[str, str], gpu_count: int) -> dict[str, str]:
+def volc_runtime_values(task: Task, values: dict[str, str], gpus_per_worker: int) -> dict[str, str]:
     runtime = dict(values)
     if "gpus" in runtime:
-        runtime["gpus"] = str(gpu_count)
+        runtime["gpus"] = str(gpus_per_worker)
     if "cuda" in runtime:
-        runtime["cuda"] = cuda_list(gpu_count)
+        runtime["cuda"] = cuda_list(gpus_per_worker)
     return runtime
 
 
+def volc_distributed_command(command: list[str], worker_count: int, gpus_per_worker: int) -> list[str]:
+    if worker_count <= 1 or not command or not command[0].endswith("torchrun"):
+        return command
+    transformed = [command[0]]
+    inserted = False
+    index = 1
+    while index < len(command):
+        part = command[index]
+        if part == "--standalone":
+            index += 1
+            continue
+        if part == "--nproc_per_node" and index + 1 < len(command):
+            transformed.extend([part, "__MLP_WORKER_GPU__"])
+            index += 2
+            continue
+        if part.startswith("--nproc_per_node="):
+            transformed.append("--nproc_per_node=__MLP_WORKER_GPU__")
+            index += 1
+            continue
+        if not inserted and (part.endswith(".py") or part.endswith(".sh")):
+            transformed.extend([
+                "--nnodes",
+                "__MLP_WORKER_NUM__",
+                "--node_rank",
+                "__MLP_ROLE_INDEX__",
+                "--master_addr",
+                "__MLP_WORKER_0_HOST__",
+                "--master_port",
+                "__MLP_WORKER_0_PORT__",
+            ])
+            inserted = True
+        transformed.append(part)
+        index += 1
+    return transformed
+
+
+def command_has_resume_arg(command: list[str]) -> bool:
+    return any(part == "--resume" or part.startswith("--resume=") for part in command)
+
+
+def command_supports_resume(command: list[str]) -> bool:
+    resume_scripts = {
+        "tools/train_normal_estimation.py",
+        "tools/train_normal_tokenizer.py",
+    }
+    return any(part in resume_scripts or part.endswith("/" + script) for part in command for script in resume_scripts)
+
+
+def volc_auto_resume_lines(command: list[str], values: dict[str, str], config: VolcConfig) -> list[str]:
+    if command_has_resume_arg(command) or not command_supports_resume(command):
+        return []
+    output_dir = values.get("output_dir", "").strip()
+    if not output_dir:
+        return []
+    remote_output_dir = remoteize_value(output_dir, config.remote_root).rstrip("/")
+    last_step = f"{remote_output_dir}/checkpoints/last_step.pth"
+    last_epoch = f"{remote_output_dir}/checkpoints/last.pth"
+    return [
+        "AUTO_RESUME_ARG=",
+        "AUTO_RESUME_PATH=",
+        'if [ "${INFINITY_VOLC_AUTO_RESUME:-1}" != "0" ]; then',
+        f"  if [ -f {shlex.quote(last_step)} ]; then",
+        "    AUTO_RESUME_ARG=--resume",
+        f"    AUTO_RESUME_PATH={shlex.quote(last_step)}",
+        f"  elif [ -f {shlex.quote(last_epoch)} ]; then",
+        "    AUTO_RESUME_ARG=--resume",
+        f"    AUTO_RESUME_PATH={shlex.quote(last_epoch)}",
+        "  fi",
+        "fi",
+    ]
+
+
 def build_volc_entrypoint(task: Task, values: dict[str, str], config: VolcConfig, gpu_count: int) -> tuple[str, str]:
+    worker_count, gpus_per_worker = parse_volc_topology(values, config)
     command = remoteize_command(task.build(values), config.remote_root)
-    command_line = shell_join(command)
+    command = volc_distributed_command(command, worker_count, gpus_per_worker)
+    command_line = shell_join_volc_command(command)
     env_exports = volc_envs(config, gpu_count, task.env(values))
     lines = [
         "set -e",
@@ -505,11 +628,38 @@ def build_volc_entrypoint(task: Task, values: dict[str, str], config: VolcConfig
     ]
     for env in env_exports:
         lines.append(f"export {env['Name']}={shlex.quote(env['Value'])}")
-    lines += [
-        f"echo {shlex.quote('$ ' + command_line)}",
-        command_line,
-    ]
+    auto_resume_lines = volc_auto_resume_lines(command, values, config)
+    if auto_resume_lines:
+        lines.extend(auto_resume_lines)
+        lines += [
+            'if [ -n "$AUTO_RESUME_ARG" ]; then',
+            f"  echo {shlex.quote('$ ' + command_line)} \"$AUTO_RESUME_ARG\" \"$AUTO_RESUME_PATH\"",
+            f"  {command_line} \"$AUTO_RESUME_ARG\" \"$AUTO_RESUME_PATH\"",
+            "else",
+            f"  echo {shlex.quote('$ ' + command_line)}",
+            f"  {command_line}",
+            "fi",
+        ]
+    else:
+        lines += [
+            f"echo {shlex.quote('$ ' + command_line)}",
+            command_line,
+        ]
     return "\n".join(lines), command_line
+
+
+def volc_retry_options() -> dict[str, object]:
+    policy_sets = [
+        item.strip()
+        for item in os.environ.get("INFINITY_VOLC_RETRY_POLICY_SETS", "Failed,InstanceReclaimed").split(",")
+        if item.strip()
+    ]
+    return {
+        "EnableRetry": True,
+        "MaxRetryTimes": parse_positive_int(VOLC_DEFAULT_RETRY_TIMES, "Volc 重试次数"),
+        "IntervalSeconds": parse_positive_int(VOLC_DEFAULT_RETRY_INTERVAL_SECONDS, "Volc 重试间隔秒"),
+        "PolicySets": policy_sets,
+    }
 
 
 def build_volc_task_config(
@@ -518,26 +668,28 @@ def build_volc_task_config(
     started_at: datetime,
     config: VolcConfig,
 ) -> tuple[dict[str, object], str]:
-    gpu_count = parse_positive_int(config.gpus, "Volc GPU 数")
+    worker_count, gpus_per_worker = parse_volc_topology(values, config)
     active_deadline = parse_positive_int(config.active_deadline_seconds, "Volc 最长运行秒")
     priority = parse_positive_int(config.priority, "Volc 优先级")
-    runtime_values = volc_runtime_values(task, values, gpu_count)
-    entrypoint, command_line = build_volc_entrypoint(task, runtime_values, config, gpu_count)
+    runtime_values = volc_runtime_values(task, values, gpus_per_worker)
+    entrypoint, command_line = build_volc_entrypoint(task, runtime_values, config, gpus_per_worker)
+    framework = "PyTorchDDP" if worker_count > 1 else config.framework
     task_config = remove_empty_config({
         "TaskName": volc_task_name(task, started_at),
         "Description": f"Submitted from Infinity TUI at {started_at.isoformat(timespec='seconds')}",
         "ImageUrl": config.image,
-        "Framework": config.framework,
+        "Framework": framework,
         "Entrypoint": entrypoint,
         "UserCodePath": config.user_code_path,
         "RemoteMountCodePath": config.remote_code_path,
-        "TaskRoleSpecs": [volc_resource_spec(config, gpu_count)],
-        "Envs": volc_envs(config, gpu_count, task.env(runtime_values)),
+        "TaskRoleSpecs": [volc_resource_spec(config, gpus_per_worker, worker_count)],
+        "Envs": volc_envs(config, gpus_per_worker, task.env(runtime_values)),
         "Storages": volc_storages(config),
         "ActiveDeadlineSeconds": active_deadline,
         "EnableTensorBoard": False,
         "Preemptible": parse_bool(config.preemptible),
         "Priority": priority,
+        "RetryOptions": volc_retry_options(),
         "Tags": ["infinity", experiment_slug(task)],
     })
     if config.queue_id:
@@ -702,7 +854,17 @@ def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
         values["ours_tau"],
         "--parallel-shards",
         values["parallel_shards"],
+        "--timing-warmup",
+        values["timing_warmup"],
+        "--timing-repeats",
+        values["timing_repeats"],
     ]
+    if values["ours_kv_cache_fast"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--ours-kv-cache-fast")
+    if values["compare_inference_time"].lower() in {"0", "no", "false", "n"}:
+        cmd.append("--no-compare-inference-time")
+    else:
+        cmd.append("--compare-inference-time")
     if values["bootstrap"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--bootstrap")
     if values["dry_run"].lower() in {"1", "yes", "true", "y"}:
@@ -754,12 +916,18 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["beta2"],
         "--weight-decay",
         values["weight_decay"],
+        "--train-normal-metrics-every",
+        values["train_normal_metrics_every"],
+        "--token-cache-dir",
+        values["token_cache_dir"],
         "--grad-clip",
         values["grad_clip"],
         "--precision",
         values["precision"],
         "--zero",
         values["zero"],
+        "--checkpointing",
+        values["checkpointing"],
         "--epochs",
         values["epochs"],
         "--max-steps",
@@ -813,6 +981,14 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         cmd += ["--swanlab-experiment-name", values["swanlab_experiment"]]
     if values["save_optimizer_state"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--save-optimizer-state")
+    if values["token_cache_memory"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--token-cache-memory")
+    if values["normal_use_segmented_flash_attn"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--normal-use-segmented-flash-attn")
+    if values["normal_bf16_activations"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--normal-bf16-activations")
+    if values["normal_save_activations_on_cpu"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--normal-save-activations-on-cpu")
     if values["spatial_patchify"].lower() in {"1", "yes", "true", "y"}:
         cmd += ["--normal-apply-spatial-patchify", "--rgb-apply-spatial-patchify"]
     else:
@@ -970,6 +1146,7 @@ TASKS: list[Task] = [
         "启动 normal estimation 正式训练。",
         [
             Field("gpus", "GPU 数", "2"),
+            Field("volc_topology", "Volc topology", "1x8", choices=("1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
             Field("data_root", "数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
             Field(
@@ -992,16 +1169,23 @@ TASKS: list[Task] = [
             Field("val_batch_size", "Val batch/GPU", "4"),
             Field("num_workers", "Workers", "4"),
             Field("prefetch_factor", "Prefetch factor", "4"),
-            Field("lr", "Learning rate", "3e-5"),
-            Field("min_lr", "Min LR", "1e-5"),
+            Field("lr", "Learning rate", "2e-5"),
+            Field("min_lr", "Min LR", "1e-6"),
             Field("warmup_ratio", "Warmup ratio", "0.03"),
             Field("beta1", "Adam beta1", "0.9"),
             Field("beta2", "Adam beta2", "0.95"),
             Field("weight_decay", "Weight decay", "1e-4"),
+            Field("train_normal_metrics_every", "Train normal metrics every", "10"),
+            Field("token_cache_dir", "Token cache dir", "outputs/normal_token_cache"),
+            Field("token_cache_memory", "Memory token cache", "1", choices=("0", "1")),
             Field("grad_clip", "Grad clip", "1.0"),
             Field("precision", "Precision", "bf16", choices=("bf16", "fp16", "fp32")),
             Field("zero", "ZeRO", "0", choices=("0", "2", "3")),
-            Field("epochs", "Epochs", "20"),
+            Field("checkpointing", "Checkpointing", "full-block", choices=("full-block", "self-attn", "none")),
+            Field("normal_use_segmented_flash_attn", "Segmented flash attn", "1", choices=("0", "1")),
+            Field("normal_bf16_activations", "BF16 activations", "1", choices=("0", "1")),
+            Field("normal_save_activations_on_cpu", "CPU activation offload", "0", choices=("0", "1")),
+            Field("epochs", "Epochs", "10"),
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
@@ -1041,6 +1225,7 @@ TASKS: list[Task] = [
         "启动 normal tokenizer 正式微调。",
         [
             Field("gpus", "GPU 数", "2"),
+            Field("volc_topology", "Volc topology", "2x4", choices=("1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_tokenizer")),
             Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
@@ -1133,7 +1318,11 @@ TASKS: list[Task] = [
             Field("ours_top_k", "Ours top-k", "1"),
             Field("ours_top_p", "Ours top-p", "0.0"),
             Field("ours_tau", "Ours tau", "1.0"),
-            Field("parallel_shards", "并行分片数", "auto", help="auto=按可见 GPU 数分片；1=单进程"),
+            Field("parallel_shards", "并行分片数", "auto", help="auto=按可见 GPU 分片并行；每个进程仍按 batch=1 逐图计时"),
+            Field("compare_inference_time", "比较推理时间", "1", choices=("1", "0"), help="1=只统计单图模型推理段，输出 inference_time_summary.json"),
+            Field("timing_warmup", "计时 warmup", "3", help="每张图预热次数，不计入结果"),
+            Field("timing_repeats", "计时 repeats", "5", help="每张图正式计时重复次数"),
+            Field("ours_kv_cache_fast", "Ours KV fast", "0", choices=("0", "1"), help="实验性 KV cache 推理；需单独验证指标"),
             Field("bootstrap", "下载代码/权重", "0", choices=("0", "1")),
             Field("dry_run", "只打印命令", "0", choices=("0", "1")),
             Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),

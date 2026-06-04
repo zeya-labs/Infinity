@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -8,7 +9,8 @@ import os
 import random
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +57,7 @@ from infinity.models.infinity import MultipleLayers  # noqa: E402
 
 
 LOGGER = logging.getLogger("train_normal_estimation")
+TOKEN_CACHE_MEMORY: dict[str, dict[str, torch.Tensor]] = {}
 FULLSTATE_SAVE_POLICY = (
     FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     if FullStateDictConfig is not None
@@ -94,12 +97,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--precision", type=str, choices=("fp32", "bf16", "fp16"), default="bf16")
     parser.add_argument("--zero", type=int, choices=(0, 2, 3), default=0)
+    parser.add_argument(
+        "--ddp-bucket-cap-mb",
+        type=float,
+        default=8.0,
+        help="DDP gradient bucket size in MiB. Smaller buckets avoid very large first allreduces after resume.",
+    )
+    parser.add_argument("--disable-ddp-static-graph", dest="ddp_static_graph", action="store_false")
+    parser.set_defaults(ddp_static_graph=True)
     parser.add_argument("--enable-hybrid-shard", action="store_true", default=False)
     parser.add_argument("--inner-shard-degree", type=int, default=1)
     parser.add_argument("--fsdp-use-orig-params", action="store_true", default=True)
     parser.add_argument("--disable-fsdp-use-orig-params", dest="fsdp_use_orig_params", action="store_false")
+    parser.add_argument(
+        "--checkpointing",
+        type=str,
+        choices=("full-block", "self-attn", "none"),
+        default="full-block",
+        help="Activation checkpointing mode for Infinity blocks. Use 'none' for speed if memory allows.",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--image-log-every", type=int, default=200)
+    parser.add_argument(
+        "--train-normal-metrics-every",
+        type=int,
+        default=100,
+        help="Compute decoded normal train metrics every N optimizer steps; 0 disables them during train. Validation is unchanged.",
+    )
     parser.add_argument("--ar-eval-every", type=int, default=0)
     parser.add_argument("--ar-eval-samples", type=int, default=32)
     parser.add_argument("--ar-eval-top-k", type=int, default=1)
@@ -113,12 +137,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-partition", type=str, default="val")
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument(
+        "--token-cache-dir",
+        type=str,
+        default="",
+        help="Optional directory for deterministic train token cache. Skips RGB/normal VAE tokenization on cache hits.",
+    )
+    parser.add_argument("--token-cache-memory", action="store_true", default=False, help="Keep token cache entries in host memory after first load/write.")
     parser.add_argument("--model-name", type=str, default="infinity_8b")
     parser.add_argument("--use-bit-label", action="store_true", default=True)
     parser.add_argument("--disable-bit-label", dest="use_bit_label", action="store_false")
     parser.add_argument("--add-lvl-embeding-only-first-block", type=int, choices=(0, 1), default=1)
     parser.add_argument("--rope2d-each-sa-layer", type=int, choices=(0, 1), default=1)
     parser.add_argument("--rope2d-normalized-by-hw", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument("--normal-use-flex-attn", action="store_true", default=False)
+    parser.add_argument("--normal-use-segmented-flash-attn", action="store_true", default=False)
+    parser.add_argument("--normal-bf16-activations", action="store_true", default=False)
+    parser.add_argument(
+        "--normal-save-activations-on-cpu",
+        action="store_true",
+        default=False,
+        help="Offload tensors saved for autograd during the normal transformer forward to CPU pinned memory. This avoids recompute but trades GPU memory for PCIe traffic.",
+    )
+    parser.add_argument("--fused-mlp", action="store_true", default=False)
+    parser.add_argument("--fused-norm", action="store_true", default=False)
     parser.add_argument("--always-training-scales", type=int, default=100)
     parser.add_argument("--ce-weight", type=float, default=1.0)
     parser.add_argument("--normal-l1-weight", type=float, default=0.25)
@@ -286,16 +328,106 @@ def maybe_resize_target_for_prediction(
     return target, mask
 
 
+def token_cache_enabled(args: argparse.Namespace) -> bool:
+    return bool(args.token_cache_dir) and not (
+        args.noise_apply_layers >= 0 and args.noise_apply_strength > 0
+    )
+
+
+def token_cache_signature(args: argparse.Namespace, scale_schedule: list[tuple[int, int, int]]) -> str:
+    payload = {
+        "version": 1,
+        "pn": args.pn,
+        "scale_schedule": scale_schedule,
+        "always_training_scales": args.always_training_scales,
+        "normal_vae_ckpt": str(Path(args.normal_vae_ckpt).resolve()),
+        "normal_vae_type": args.normal_vae_type,
+        "normal_apply_spatial_patchify": args.normal_apply_spatial_patchify,
+        "rgb_vae_ckpt": str(Path(args.rgb_vae_ckpt).resolve()),
+        "rgb_vae_type": args.rgb_vae_type,
+        "rgb_apply_spatial_patchify": args.rgb_apply_spatial_patchify,
+        "use_bit_label": args.use_bit_label,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:16]
+
+
+def token_cache_sample_key(metadata: dict[str, Any], signature: str) -> str:
+    source = "|".join(
+        str(metadata.get(key, ""))
+        for key in ("partition", "index", "image_path", "normal_path", "target_size")
+    )
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:24]
+    return f"{signature}_{digest}.pt"
+
+
+def load_token_cache_batch(
+    cache_dir: Path,
+    metadata: list[dict[str, Any]],
+    signature: str,
+    device: torch.device,
+    use_memory_cache: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    payloads = []
+    for item in metadata:
+        path = cache_dir / token_cache_sample_key(item, signature)
+        path_key = str(path)
+        payload = TOKEN_CACHE_MEMORY.get(path_key) if use_memory_cache else None
+        if payload is None:
+            if not path.is_file():
+                return None
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            if use_memory_cache:
+                TOKEN_CACHE_MEMORY[path_key] = payload
+        payloads.append(payload)
+    return (
+        torch.stack([payload["rgb_prefix_blc"] for payload in payloads], dim=0).to(device, non_blocking=True),
+        torch.stack([payload["x_blc_without_prefix"] for payload in payloads], dim=0).to(device, non_blocking=True),
+        torch.stack([payload["gt_bl"] for payload in payloads], dim=0).to(device, non_blocking=True),
+        torch.stack([payload["raw_features"] for payload in payloads], dim=0).to(device, non_blocking=True),
+    )
+
+
+def save_token_cache_batch(
+    cache_dir: Path,
+    metadata: list[dict[str, Any]],
+    signature: str,
+    rgb_prefix_blc: torch.Tensor,
+    x_blc_without_prefix: torch.Tensor,
+    gt_bl: torch.Tensor,
+    raw_features: torch.Tensor,
+    use_memory_cache: bool,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tensors = {
+        "rgb_prefix_blc": rgb_prefix_blc.detach().cpu(),
+        "x_blc_without_prefix": x_blc_without_prefix.detach().cpu(),
+        "gt_bl": gt_bl.detach().cpu(),
+        "raw_features": raw_features.detach().cpu(),
+    }
+    for sample_index, item in enumerate(metadata):
+        path = cache_dir / token_cache_sample_key(item, signature)
+        if path.is_file():
+            continue
+        payload = {key: value[sample_index].clone().contiguous() for key, value in tensors.items()}
+        if use_memory_cache:
+            TOKEN_CACHE_MEMORY[str(path)] = payload
+        tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+
+
 def compute_ce_loss(
     logits_blv: torch.Tensor,
     gt_bl: torch.Tensor,
     *,
     use_bit_label: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    logits_for_loss = logits_blv.float()
     if use_bit_label:
         batch_size, seq_len, _ = logits_blv.shape
         loss = F.cross_entropy(
-            logits_blv.reshape(batch_size, seq_len, -1, 2).permute(0, 3, 1, 2),
+            logits_for_loss.reshape(batch_size, seq_len, -1, 2).permute(0, 3, 1, 2),
             gt_bl,
             reduction="none",
         ).mean(dim=-1)
@@ -305,7 +437,7 @@ def compute_ce_loss(
     else:
         batch_size, seq_len, vocab = logits_blv.shape
         loss = F.cross_entropy(
-            logits_blv.reshape(batch_size * seq_len, vocab),
+            logits_for_loss.reshape(batch_size * seq_len, vocab),
             gt_bl.reshape(batch_size * seq_len),
             reduction="none",
         ).reshape(batch_size, seq_len)
@@ -358,7 +490,20 @@ def build_training_model(
 ) -> torch.nn.Module:
     if args.zero == 0:
         if distributed:
-            return DDP(model, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)
+            LOGGER.info(
+                "DDP init bucket_cap_mb=%.2f static_graph=%s gradient_as_bucket_view=True",
+                args.ddp_bucket_cap_mb,
+                args.ddp_static_graph,
+            )
+            return DDP(
+                model,
+                device_ids=[device.index],
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+                bucket_cap_mb=args.ddp_bucket_cap_mb,
+                gradient_as_bucket_view=True,
+                static_graph=args.ddp_static_graph,
+            )
         return model
 
     if not distributed:
@@ -433,6 +578,64 @@ def swanlab_state_path(output_dir: Path) -> Path:
     return output_dir / "swanlab_run.json"
 
 
+def find_swanlab_local_run_dir(logdir: Path, run_id: str, state: dict[str, Any]) -> Path | None:
+    saved = str(state.get("local_run_dir", "")).strip()
+    if saved and Path(saved).is_dir():
+        return Path(saved)
+    if not run_id:
+        return None
+    matches = sorted(logdir.glob(f"run-*-{run_id}"))
+    return matches[-1] if matches else None
+
+
+@contextmanager
+def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
+    if not run_id or run_dir is None:
+        yield
+        return
+    try:
+        import swanlab.data.callbacker.local as swanlab_local
+        import swanlab.data.sdk as swanlab_sdk
+    except Exception:
+        yield
+        return
+
+    parts = run_dir.name.split("-")
+    if len(parts) < 3:
+        yield
+        return
+    try:
+        fixed_now = datetime.strptime(parts[1], "%Y%m%d_%H%M%S")
+    except ValueError:
+        yield
+        return
+
+    original_generate_run_id = swanlab_local.N.generate_run_id
+    original_datetime = swanlab_sdk.datetime
+    original_mkdir = swanlab_sdk.os.mkdir
+    target_run_dir = run_dir.resolve()
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls):
+            return fixed_now
+
+    def mkdir_existing_run(path, mode=0o777, *args, **kwargs):
+        if Path(path).resolve() == target_run_dir and target_run_dir.is_dir():
+            return None
+        return original_mkdir(path, mode, *args, **kwargs)
+
+    swanlab_local.N.generate_run_id = lambda: run_id
+    swanlab_sdk.datetime = FixedDatetime
+    swanlab_sdk.os.mkdir = mkdir_existing_run
+    try:
+        yield
+    finally:
+        swanlab_local.N.generate_run_id = original_generate_run_id
+        swanlab_sdk.datetime = original_datetime
+        swanlab_sdk.os.mkdir = original_mkdir
+
+
 def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> Any | None:
     if not enabled or args.swanlab_mode == "disabled":
         return None
@@ -440,6 +643,7 @@ def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> A
         raise ImportError("swanlab is not installed, but SwanLab logging is enabled.")
 
     state_path = swanlab_state_path(output_dir)
+    state: dict[str, Any] = {}
     run_id = ""
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -465,9 +669,12 @@ def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> A
         init_kwargs["id"] = run_id
         init_kwargs["resume"] = "allow"
 
-    run = swanlab.init(**init_kwargs)
+    local_run_dir = find_swanlab_local_run_dir(logdir, run_id, state) if args.swanlab_mode == "local" else None
+    with swanlab_local_resume_patch(logdir, run_id, local_run_dir):
+        run = swanlab.init(**init_kwargs)
     run_public = getattr(run, "public", None)
     current_run_id = str(getattr(run_public, "run_id", "")).strip()
+    current_run_dir = str(getattr(run_public, "run_dir", "")).strip()
     state_payload = {
         "project": args.swanlab_project,
         "workspace": workspace,
@@ -477,6 +684,8 @@ def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> A
     }
     if current_run_id:
         state_payload["run_id"] = current_run_id
+    if args.swanlab_mode == "local" and current_run_dir:
+        state_payload["local_run_dir"] = current_run_dir
     state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return run
 
@@ -689,74 +898,132 @@ def forward_batch(
     args: argparse.Namespace,
     device: torch.device,
     precision: str,
+    compute_decoded_metrics: bool = True,
+    include_aux_loss: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    image = batch["image"].to(device, non_blocking=True)
-    target = batch["target"].to(device, non_blocking=True)
-    mask = batch["mask"].to(device, non_blocking=True)
-    scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target.shape[-2], target.shape[-1], args.pn)[1]]
+    target_cpu = batch["target"]
+    scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target_cpu.shape[-2], target_cpu.shape[-1], args.pn)[1]]
     training_scales = min(args.always_training_scales, len(scale_schedule))
     scale_schedule = scale_schedule[:training_scales]
+    image: torch.Tensor | None = None
+    target: torch.Tensor | None = None
+    mask: torch.Tensor | None = None
 
     with torch.no_grad():
-        rgb_prefix_blc = build_prefix_tokens_from_image(
-            image_01=image,
-            rgb_vae=rgb_vae,
-            scale_schedule=scale_schedule,
-            apply_spatial_patchify=args.rgb_apply_spatial_patchify,
+        cache_dir = Path(args.token_cache_dir) if token_cache_enabled(args) else None
+        cache_signature = token_cache_signature(args, scale_schedule) if cache_dir is not None else ""
+        cached_tokens = (
+            load_token_cache_batch(cache_dir, batch["metadata"], cache_signature, device, args.token_cache_memory)
+            if cache_dir is not None
+            else None
         )
-        normal_vae_scale_schedule = [
-            (pt, 2 * ph, 2 * pw) if args.normal_apply_spatial_patchify else (pt, ph, pw)
-            for pt, ph, pw in scale_schedule
-        ]
-        raw_features, _, _ = normal_vae.encode_for_raw_features(target, scale_schedule=normal_vae_scale_schedule)
-        x_blc_without_prefix, gt_ms_idx_bl = build_multiscale_var_inputs(
-            vae=normal_vae,
-            raw_features=raw_features,
-            vae_scale_schedule=normal_vae_scale_schedule,
-            apply_spatial_patchify=args.normal_apply_spatial_patchify,
-            noise_apply_layers=args.noise_apply_layers,
-            noise_apply_strength=args.noise_apply_strength,
-            noise_apply_requant=args.noise_apply_requant,
-        )
+        if cached_tokens is not None:
+            rgb_prefix_blc, x_blc_without_prefix, gt_bl, raw_features = cached_tokens
+        else:
+            image = batch["image"].to(device, non_blocking=True)
+            target = target_cpu.to(device, non_blocking=True)
+            rgb_prefix_blc = build_prefix_tokens_from_image(
+                image_01=image,
+                rgb_vae=rgb_vae,
+                scale_schedule=scale_schedule,
+                apply_spatial_patchify=args.rgb_apply_spatial_patchify,
+            )
+            normal_vae_scale_schedule = [
+                (pt, 2 * ph, 2 * pw) if args.normal_apply_spatial_patchify else (pt, ph, pw)
+                for pt, ph, pw in scale_schedule
+            ]
+            raw_features, _, _ = normal_vae.encode_for_raw_features(target, scale_schedule=normal_vae_scale_schedule)
+            x_blc_without_prefix, gt_ms_idx_bl = build_multiscale_var_inputs(
+                vae=normal_vae,
+                raw_features=raw_features,
+                vae_scale_schedule=normal_vae_scale_schedule,
+                apply_spatial_patchify=args.normal_apply_spatial_patchify,
+                noise_apply_layers=args.noise_apply_layers,
+                noise_apply_strength=args.noise_apply_strength,
+                noise_apply_requant=args.noise_apply_requant,
+            )
+            total_seq_len = int(sum(np.array(item).prod() for item in scale_schedule))
+            gt_bl = torch.cat(gt_ms_idx_bl, dim=1)[:, :total_seq_len].contiguous().long()
+            if cache_dir is not None:
+                first_stage_len = int(np.array(scale_schedule[0]).prod())
+                cache_x_blc = x_blc_without_prefix[:, : total_seq_len - first_stage_len, :].contiguous()
+                save_token_cache_batch(
+                    cache_dir,
+                    batch["metadata"],
+                    cache_signature,
+                    rgb_prefix_blc,
+                    cache_x_blc,
+                    gt_bl,
+                    raw_features,
+                    args.token_cache_memory,
+                )
 
     total_seq_len = int(sum(np.array(item).prod() for item in scale_schedule))
     first_stage_len = int(np.array(scale_schedule[0]).prod())
     x_blc_without_prefix = x_blc_without_prefix[:, : total_seq_len - first_stage_len, :]
-    gt_bl = torch.cat(gt_ms_idx_bl, dim=1)[:, :total_seq_len].contiguous().long()
+    gt_bl = gt_bl[:, :total_seq_len].contiguous().long()
+
+    activation_context = (
+        torch.autograd.graph.save_on_cpu(pin_memory=True)
+        if getattr(args, "normal_save_activations_on_cpu", False)
+        else nullcontext()
+    )
 
     with precision_context(precision):
-        logits_blv = model(rgb_prefix_blc, x_blc_without_prefix, scale_schedule=scale_schedule)
+        with activation_context:
+            logits_blv = model(rgb_prefix_blc, x_blc_without_prefix, scale_schedule=scale_schedule)
         ce_loss, ce_metrics = compute_ce_loss(logits_blv, gt_bl, use_bit_label=args.use_bit_label)
-        prediction, latent_prediction = decode_logits_to_normal(
-            logits_blv=logits_blv,
-            vae=normal_vae,
-            scale_schedule=scale_schedule,
-            use_bit_label=args.use_bit_label,
-            apply_spatial_patchify=args.normal_apply_spatial_patchify,
-        )
-        target_for_prediction, mask_for_prediction = maybe_resize_target_for_prediction(prediction, target, mask)
-        if latent_prediction.shape == raw_features.unsqueeze(2).shape:
-            latent_target = raw_features.unsqueeze(2)
+        if compute_decoded_metrics:
+            if target is None:
+                target = target_cpu.to(device, non_blocking=True)
+            if mask is None:
+                mask = batch["mask"].to(device, non_blocking=True)
+            prediction, latent_prediction = decode_logits_to_normal(
+                logits_blv=logits_blv,
+                vae=normal_vae,
+                scale_schedule=scale_schedule,
+                use_bit_label=args.use_bit_label,
+                apply_spatial_patchify=args.normal_apply_spatial_patchify,
+            )
+            target_for_prediction, mask_for_prediction = maybe_resize_target_for_prediction(prediction, target, mask)
+            if latent_prediction.shape == raw_features.unsqueeze(2).shape:
+                latent_target = raw_features.unsqueeze(2)
+            else:
+                latent_target = None
+            aux_loss, aux_metrics = compute_normal_metrics(
+                prediction=prediction,
+                target=target_for_prediction,
+                mask=mask_for_prediction,
+                latent_prediction=latent_prediction,
+                latent_target=latent_target,
+                l1_weight=args.normal_l1_weight,
+                angular_weight=args.normal_angular_weight,
+                latent_weight=args.normal_latent_weight,
+                norm_weight=args.normal_norm_weight,
+            )
         else:
-            latent_target = None
-        aux_loss, aux_metrics = compute_normal_metrics(
-            prediction=prediction,
-            target=target_for_prediction,
-            mask=mask_for_prediction,
-            latent_prediction=latent_prediction,
-            latent_target=latent_target,
-            l1_weight=args.normal_l1_weight,
-            angular_weight=args.normal_angular_weight,
-            latent_weight=args.normal_latent_weight,
-            norm_weight=args.normal_norm_weight,
-        )
-        total_loss = args.ce_weight * ce_loss + aux_loss
+            prediction = target if target is not None else target_cpu
+            aux_loss = ce_loss.new_tensor(0.0)
+            aux_metrics = {
+                "loss_l1": aux_loss.detach(),
+                "loss_angular_rad": aux_loss.detach(),
+                "loss_latent": aux_loss.detach(),
+                "loss_norm": aux_loss.detach(),
+                "angle_deg": aux_loss.new_tensor(float("nan")),
+                "acc_11_25": aux_loss.new_tensor(float("nan")),
+                "acc_22_5": aux_loss.new_tensor(float("nan")),
+                "acc_30": aux_loss.new_tensor(float("nan")),
+                "loss_total_aux": aux_loss.detach(),
+            }
+        total_loss = args.ce_weight * ce_loss + (aux_loss if include_aux_loss else ce_loss.new_tensor(0.0))
 
     metrics = {
         **ce_metrics,
         **aux_metrics,
         "loss_total": total_loss.detach(),
     }
+    if image is None:
+        image = batch["image"]
     return total_loss, metrics, prediction.detach(), image.detach()
 
 
@@ -980,6 +1247,12 @@ def main() -> int:
             rope2d_each_sa_layer=args.rope2d_each_sa_layer,
             rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
             apply_spatial_patchify=args.normal_apply_spatial_patchify,
+            checkpointing=None if args.checkpointing == "none" else args.checkpointing,
+            normal_use_flex_attn=args.normal_use_flex_attn,
+            normal_use_segmented_flash_attn=args.normal_use_segmented_flash_attn,
+            normal_bf16_activations=args.normal_bf16_activations,
+            fused_mlp=args.fused_mlp,
+            fused_norm=args.fused_norm,
             device=device,
         )
         model = convert_model_precision(model, args.precision)
@@ -1030,6 +1303,12 @@ def main() -> int:
             for batch_idx, batch in enumerate(train_loader):
                 if batch_idx < resume_batch_offset:
                     continue
+                next_step = global_step + 1
+                should_log_step = next_step % args.log_every == 0 or next_step == 1
+                should_log_image = next_step % args.image_log_every == 0 or next_step == 1
+                should_compute_train_normals = should_log_image or (
+                    args.train_normal_metrics_every > 0 and next_step % args.train_normal_metrics_every == 0
+                )
                 optimizer.zero_grad(set_to_none=True)
                 total_loss, metrics, prediction, image = forward_batch(
                     model=model,
@@ -1039,6 +1318,8 @@ def main() -> int:
                     args=args,
                     device=device,
                     precision=args.precision,
+                    compute_decoded_metrics=should_compute_train_normals,
+                    include_aux_loss=False,
                 )
 
                 if args.precision == "fp16":
@@ -1055,12 +1336,15 @@ def main() -> int:
                 scheduler.step()
                 global_step += 1
 
-                reduced = reduce_metrics(metrics, distributed)
                 current_lr = optimizer.param_groups[0]["lr"]
-                if rank == 0 and (global_step % args.log_every == 0 or global_step == 1):
+                if should_log_step:
+                    reduced = reduce_metrics(metrics, distributed)
+                if rank == 0 and should_log_step:
                     LOGGER.info(
-                        "epoch=%d step=%d/%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f lr=%.2e",
+                        "epoch=%d batch=%d/%d global_step=%d/%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f lr=%.2e",
                         epoch + 1,
+                        batch_idx + 1,
+                        len(train_loader),
                         global_step,
                         total_steps,
                         reduced["loss_total"],
@@ -1077,7 +1361,7 @@ def main() -> int:
                         payload["train/lr"] = current_lr
                         payload["train/epoch"] = epoch + 1
                         swanlab_run.log(payload, step=global_step)
-                if rank == 0 and (global_step % args.image_log_every == 0 or global_step == 1):
+                if rank == 0 and should_log_image:
                     save_visuals(
                         output_dir,
                         swanlab_run,

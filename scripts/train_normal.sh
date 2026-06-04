@@ -20,6 +20,9 @@ MODEL_NAME_DEFAULT="${NORMAL_MODEL_NAME:-infinity_8b}"
 TRAIN_BATCH_DEFAULT="${NORMAL_BATCH_SIZE:-4}"
 VAL_BATCH_DEFAULT="${NORMAL_VAL_BATCH_SIZE:-4}"
 NUM_WORKERS_DEFAULT="${NORMAL_NUM_WORKERS:-4}"
+TOKEN_CACHE_DIR_DEFAULT="${NORMAL_TOKEN_CACHE_DIR:-${ROOT_DIR}/outputs/normal_token_cache}"
+TOKEN_CACHE_MEMORY_DEFAULT="${NORMAL_TOKEN_CACHE_MEMORY:-1}"
+TRAIN_NORMAL_METRICS_EVERY_DEFAULT="${NORMAL_TRAIN_NORMAL_METRICS_EVERY:-100}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -76,10 +79,15 @@ if [[ "${USE_MANAGED_RUN_DIR}" == "1" ]]; then
     --batch-size "${TRAIN_BATCH_DEFAULT}"
     --val-batch-size "${VAL_BATCH_DEFAULT}"
     --num-workers "${NUM_WORKERS_DEFAULT}"
+    --token-cache-dir "${TOKEN_CACHE_DIR_DEFAULT}"
+    --train-normal-metrics-every "${TRAIN_NORMAL_METRICS_EVERY_DEFAULT}"
     --zero "${ZERO_DEFAULT}"
     --inner-shard-degree "${INNER_SHARD_DEGREE_DEFAULT}"
     "${RUN_ARGS[@]}"
   )
+  if [[ "${TOKEN_CACHE_MEMORY_DEFAULT}" == "1" ]]; then
+    RUN_ARGS+=(--token-cache-memory)
+  fi
   if [[ "${ENABLE_HYBRID_SHARD_DEFAULT}" == "1" ]]; then
     RUN_ARGS+=(--enable-hybrid-shard)
   fi

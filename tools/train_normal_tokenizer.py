@@ -8,7 +8,8 @@ import os
 import random
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -611,11 +612,70 @@ def swanlab_state_path(output_dir: Path) -> Path:
     return output_dir / "swanlab_run.json"
 
 
+def find_swanlab_local_run_dir(logdir: Path, run_id: str, state: dict[str, Any]) -> Path | None:
+    saved = str(state.get("local_run_dir", "")).strip()
+    if saved and Path(saved).is_dir():
+        return Path(saved)
+    if not run_id:
+        return None
+    matches = sorted(logdir.glob(f"run-*-{run_id}"))
+    return matches[-1] if matches else None
+
+
+@contextmanager
+def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
+    if not run_id or run_dir is None:
+        yield
+        return
+    try:
+        import swanlab.data.callbacker.local as swanlab_local
+        import swanlab.data.sdk as swanlab_sdk
+    except Exception:
+        yield
+        return
+
+    parts = run_dir.name.split("-")
+    if len(parts) < 3:
+        yield
+        return
+    try:
+        fixed_now = datetime.strptime(parts[1], "%Y%m%d_%H%M%S")
+    except ValueError:
+        yield
+        return
+
+    original_generate_run_id = swanlab_local.N.generate_run_id
+    original_datetime = swanlab_sdk.datetime
+    original_mkdir = swanlab_sdk.os.mkdir
+    target_run_dir = run_dir.resolve()
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls):
+            return fixed_now
+
+    def mkdir_existing_run(path, mode=0o777, *args, **kwargs):
+        if Path(path).resolve() == target_run_dir and target_run_dir.is_dir():
+            return None
+        return original_mkdir(path, mode, *args, **kwargs)
+
+    swanlab_local.N.generate_run_id = lambda: run_id
+    swanlab_sdk.datetime = FixedDatetime
+    swanlab_sdk.os.mkdir = mkdir_existing_run
+    try:
+        yield
+    finally:
+        swanlab_local.N.generate_run_id = original_generate_run_id
+        swanlab_sdk.datetime = original_datetime
+        swanlab_sdk.os.mkdir = original_mkdir
+
+
 def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> Any | None:
     if not enabled or args.swanlab_mode == "disabled":
         return None
 
     state_path = swanlab_state_path(output_dir)
+    state: dict[str, Any] = {}
     run_id = ""
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -637,20 +697,27 @@ def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> A
     workspace = args.swanlab_workspace.strip()
     if workspace:
         init_kwargs["workspace"] = workspace
-    if run_id:
+    if run_id and args.swanlab_mode == "cloud":
         init_kwargs["id"] = run_id
-        if args.swanlab_mode == "cloud":
-            init_kwargs["resume"] = "allow"
+        init_kwargs["resume"] = "allow"
 
-    run = swanlab.init(**init_kwargs)
+    local_run_dir = find_swanlab_local_run_dir(logdir, run_id, state) if args.swanlab_mode == "local" else None
+    with swanlab_local_resume_patch(logdir, run_id, local_run_dir):
+        run = swanlab.init(**init_kwargs)
+    run_public = getattr(run, "public", None)
+    current_run_id = str(getattr(run_public, "run_id", "")).strip()
+    current_run_dir = str(getattr(run_public, "run_dir", "")).strip()
     state_payload = {
-        "run_id": run.public.run_id,
         "project": args.swanlab_project,
         "workspace": workspace,
         "experiment_name": build_swanlab_experiment_name(args, output_dir),
         "mode": args.swanlab_mode,
         "logdir": str(logdir),
     }
+    if current_run_id:
+        state_payload["run_id"] = current_run_id
+    if args.swanlab_mode == "local" and current_run_dir:
+        state_payload["local_run_dir"] = current_run_dir
     state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return run
 
