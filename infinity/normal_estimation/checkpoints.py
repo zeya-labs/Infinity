@@ -10,8 +10,13 @@ import torch
 def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def resolve_checkpoint_resume_path(

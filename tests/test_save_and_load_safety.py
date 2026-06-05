@@ -31,6 +31,23 @@ class SaveAndLoadSafetyTest(unittest.TestCase):
         torch_save.assert_called_once_with({"step": 1}, tmp_path)
         replace.assert_called_once_with(tmp_path, target_path)
 
+    def test_atomic_torch_save_removes_temp_file_on_failure(self) -> None:
+        target_path = "/tmp/infinity-test/checkpoint.pth"
+        tmp_path = "/tmp/infinity-test/.checkpoint.pth.tmp.123"
+        with (
+            mock.patch("infinity.utils.save_and_load.os.makedirs"),
+            mock.patch("infinity.utils.save_and_load.torch.save", side_effect=RuntimeError("disk full")),
+            mock.patch("infinity.utils.save_and_load.os.path.exists", return_value=True),
+            mock.patch("infinity.utils.save_and_load.os.remove") as remove,
+            mock.patch("infinity.utils.save_and_load.os.replace") as replace,
+            mock.patch("infinity.utils.save_and_load.os.getpid", return_value=123),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                _atomic_torch_save({"step": 1}, target_path)
+
+        remove.assert_called_once_with(tmp_path)
+        replace.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

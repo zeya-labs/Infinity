@@ -43,6 +43,23 @@ class NormalCheckpointTest(unittest.TestCase):
             self.assertTrue(saved_path.name.startswith(".last.pth.tmp."))
             os_replace.assert_called_once_with(saved_path, checkpoint_path)
 
+    def test_atomic_torch_save_removes_temp_file_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoints" / "last.pth"
+            with (
+                mock.patch("infinity.normal_estimation.checkpoints.torch.save", side_effect=RuntimeError("disk full")),
+                mock.patch("infinity.normal_estimation.checkpoints.os.path.exists", return_value=True),
+                mock.patch("infinity.normal_estimation.checkpoints.os.remove") as remove,
+                mock.patch("infinity.normal_estimation.checkpoints.os.replace") as os_replace,
+                mock.patch("infinity.normal_estimation.checkpoints.os.getpid", return_value=123),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "disk full"):
+                    atomic_torch_save({"step": 1}, checkpoint_path)
+
+            tmp_path = checkpoint_path.parent / ".last.pth.tmp.123"
+            remove.assert_called_once_with(tmp_path)
+            os_replace.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
