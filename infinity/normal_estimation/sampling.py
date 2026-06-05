@@ -220,8 +220,11 @@ def parse_train_dataset_weights(value: str, dataset_names: list[str]) -> dict[st
             raise ValueError(f"Invalid --train-dataset-weights item {item!r}; expected name:weight")
         name, raw_weight = item.split(":", 1)
         name = name.strip().lower()
-        if name not in weights:
-            raise ValueError(f"Weight specified for dataset {name!r}, but --train-datasets={dataset_names}")
+        if name not in SUPPORTED_NORMAL_TRAIN_DATASETS:
+            raise ValueError(
+                f"Unsupported --train-dataset-weights entry for dataset {name!r}. "
+                f"Supported: {sorted(SUPPORTED_NORMAL_TRAIN_DATASETS)}"
+            )
         if name in seen_weights:
             raise ValueError(f"Duplicate --train-dataset-weights entry for dataset {name!r}")
         seen_weights.add(name)
@@ -233,6 +236,8 @@ def parse_train_dataset_weights(value: str, dataset_names: list[str]) -> dict[st
             ) from exc
         if weight <= 0:
             raise ValueError(f"Dataset weight must be > 0 for {name}, got {weight}")
+        if name not in weights:
+            continue
         weights[name] = weight
     return weights
 

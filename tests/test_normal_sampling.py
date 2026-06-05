@@ -45,9 +45,15 @@ class NormalSamplingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_train_dataset_names("hypersim,unknown")
         with self.assertRaises(ValueError):
+            parse_train_dataset_weights("unknown:1", names)
+        with self.assertRaises(ValueError):
             parse_train_dataset_names("hypersim,hypersim")
         with self.assertRaises(ValueError):
             parse_train_dataset_weights("hypersim:3,hypersim:2", names)
+
+    def test_parse_train_dataset_weights_ignores_supported_unselected_datasets(self) -> None:
+        names = parse_train_dataset_names("hypersim")
+        self.assertEqual(parse_train_dataset_weights("hypersim:3,vkitti2:1", names), {"hypersim": 3})
 
     def test_repeat_dataset_metadata(self) -> None:
         dataset = RepeatDataset(ToyNormalDataset("hypersim", (240, 320), 2), repeat=3)
