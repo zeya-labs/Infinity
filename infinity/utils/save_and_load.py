@@ -35,6 +35,13 @@ def glob_with_global_step(pattern, recursive=False):
     return sorted(glob.glob(pattern, recursive=recursive), key=lambda x: extract_ep_iter(os.path.basename(x)), reverse=True)
 
 
+def _atomic_torch_save(payload: dict, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.tmp.{os.getpid()}")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
 class CKPTSaver(object):
     def __init__(self, is_master: bool, eval_milestone: List[Tuple[float, float]]):
         self.is_master = is_master
@@ -69,7 +76,7 @@ class CKPTSaver(object):
 
         if self.is_master:
             stt = time.time()
-            torch.save({
+            _atomic_torch_save({
                 'args':         args.state_dict(),
                 'gpt_training': args.gpt_training,
                 'arch':         args.model if args.gpt_training else args.vv,
