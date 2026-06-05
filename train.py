@@ -441,6 +441,14 @@ def next_train_cursor(ep: int, it: int, iters_train: int) -> tuple[int, int]:
     return ep, next_it
 
 
+def train_perf_log_frequency(prof_freq: int, iters_train: int) -> int:
+    if prof_freq <= 0:
+        raise ValueError(f"prof_freq must be positive, got {prof_freq}")
+    if iters_train <= 0:
+        raise ValueError(f"iters_train must be positive, got {iters_train}")
+    return max(1, min(prof_freq, iters_train // 2 - 1))
+
+
 def train_one_ep(
     ep: int, is_first_ep: bool, start_it: int, me: misc.MetricLogger,
     saver: CKPTSaver, args: arg_util.Args, ld_or_itrt, iters_train: int,
@@ -467,7 +475,7 @@ def train_one_ep(
 
         last_t_perf = time.time()
         speed_ls: deque = g_speed_ls
-        FREQ = min(args.prof_freq, iters_train//2-1)
+        FREQ = train_perf_log_frequency(args.prof_freq, iters_train)
         NVIDIA_IT_PLUS_1 = set(FREQ*i for i in (1, 2, 3, 4, 6, 8))
         ranges = set([2 ** i for i in range(20)])
         if ep <= 1: ranges |= {1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40}
