@@ -61,6 +61,7 @@ from infinity.normal_estimation.defaults import (  # noqa: E402
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
     DEFAULT_VKITTI2_ROOT,
 )
+from infinity.normal_estimation.token_cache import token_cache_sample_key  # noqa: E402
 from infinity.utils.swanlab_utils import (  # noqa: E402
     import_swanlab,
     init_swanlab_run,
@@ -516,18 +517,6 @@ def token_cache_signature(args: argparse.Namespace, scale_schedule: list[tuple[i
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()[:16]
-
-
-def token_cache_sample_key(metadata: dict[str, Any], signature: str) -> str:
-    identity_fields = ["dataset", "partition", "index", "image_path", "normal_path", "target_size"]
-    if metadata.get("manifest_dir"):
-        identity_fields.append("manifest_dir")
-    source = "|".join(
-        str(metadata.get(key, ""))
-        for key in identity_fields
-    )
-    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:24]
-    return f"{signature}_{digest}.pt"
 
 
 def load_token_cache_batch(

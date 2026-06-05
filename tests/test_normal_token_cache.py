@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from tools.train_normal_estimation import token_cache_sample_key
+from infinity.normal_estimation.token_cache import token_cache_sample_key
 
 
 class NormalTokenCacheTest(unittest.TestCase):

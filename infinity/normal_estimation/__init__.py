@@ -29,6 +29,7 @@ _EXPORT_MODULES = {
     "normalize_normals": ".modeling",
     "normals_to_vis": ".modeling",
     "resolve_scale_schedule_from_hw": ".modeling",
+    "token_cache_sample_key": ".token_cache",
 }
 
 
