@@ -430,6 +430,17 @@ def main_train(args: arg_util.Args):
 
 
 g_speed_ls = deque(maxlen=128)
+
+
+def next_train_cursor(ep: int, it: int, iters_train: int) -> tuple[int, int]:
+    if iters_train <= 0:
+        raise ValueError(f"iters_train must be positive, got {iters_train}")
+    next_it = it + 1
+    if next_it >= iters_train:
+        return ep + 1, 0
+    return ep, next_it
+
+
 def train_one_ep(
     ep: int, is_first_ep: bool, start_it: int, me: misc.MetricLogger,
     saver: CKPTSaver, args: arg_util.Args, ld_or_itrt, iters_train: int,
@@ -483,8 +494,9 @@ def train_one_ep(
                     ndtimeline.flush()
 
             if (g_it+1) % args.save_model_iters_freq == 0:
+                next_ep, next_it = next_train_cursor(ep, it, iters_train)
                 with misc.Low_GPU_usage(files=[args.log_txt_path], sleep_secs=3, verbose=True):
-                    saver.sav(args=args, g_it=(g_it+1), next_ep=ep, next_it=it+1, trainer=trainer, acc_str=f'[todo]', eval_milestone=None, also_save_to=None, best_save_to=None)
+                    saver.sav(args=args, g_it=(g_it+1), next_ep=next_ep, next_it=next_it, trainer=trainer, acc_str=f'[todo]', eval_milestone=None, also_save_to=None, best_save_to=None)
 
             with maybe_record_function('before_train'):
                 # [get data]
