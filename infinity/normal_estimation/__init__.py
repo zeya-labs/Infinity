@@ -5,6 +5,7 @@ from typing import Any
 
 
 _EXPORT_MODULES = {
+    "atomic_torch_save": ".checkpoints",
     "resolve_checkpoint_resume_path": ".checkpoints",
     "HypersimNormalDataset": ".data",
     "NYUv2ParquetNormalDataset": ".data",

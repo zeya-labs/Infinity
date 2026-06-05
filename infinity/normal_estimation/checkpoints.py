@@ -1,7 +1,17 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
+
+import torch
+
+
+def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def resolve_checkpoint_resume_path(

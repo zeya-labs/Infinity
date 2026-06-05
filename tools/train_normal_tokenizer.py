@@ -26,6 +26,7 @@ if str(ROOT_DIR) not in sys.path:
 from infinity.models.bsq_vae.vae import vae_model
 from infinity.tokenizer_finetune.data import collate_normal_batch
 from infinity.normal_estimation import (
+    atomic_torch_save,
     HypersimNormalDataset,
     RepeatDataset,
     build_normal_dataloader,
@@ -569,9 +570,7 @@ def save_checkpoint(
         "sch_video_disc": None,
         "ema": None,
     }
-    tmp_path = ckpt_path.with_name(f".{ckpt_path.name}.tmp.{os.getpid()}")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, ckpt_path)
+    atomic_torch_save(payload, ckpt_path)
     return ckpt_path
 
 

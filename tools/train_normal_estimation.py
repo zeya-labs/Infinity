@@ -50,6 +50,7 @@ from infinity.normal_estimation import (  # noqa: E402
     load_normal_sample_from_metadata,
     load_infinity_state_dict,
     normals_to_vis,
+    atomic_torch_save,
     parse_train_dataset_names,
     parse_train_dataset_weights,
     resolve_checkpoint_resume_path,
@@ -594,9 +595,7 @@ def save_token_cache_batch(
         payload = {key: value[sample_index].clone().contiguous() for key, value in tensors.items()}
         if use_memory_cache:
             TOKEN_CACHE_MEMORY[str(path)] = payload
-        tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, path)
+        atomic_torch_save(payload, path)
 
 
 def compute_ce_loss(
@@ -859,10 +858,7 @@ def save_checkpoint(
             payload["scaler"] = scaler.state_dict() if scaler is not None else None
 
     if is_main:
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.tmp.{os.getpid()}")
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, checkpoint_path)
+        atomic_torch_save(payload, checkpoint_path)
     dist_barrier_if_initialized()
 
 
