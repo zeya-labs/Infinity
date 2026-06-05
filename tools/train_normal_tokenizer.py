@@ -532,7 +532,10 @@ def build_loader(
 
 def auto_resume_path(output_dir: Path, resume_arg: str) -> Path | None:
     if resume_arg:
-        return Path(resume_arg)
+        requested = Path(resume_arg)
+        if not requested.is_file():
+            raise FileNotFoundError(f"--resume checkpoint not found: {requested}")
+        return requested
     candidate = output_dir / "checkpoints" / "last.pth"
     return candidate if candidate.exists() else None
 
