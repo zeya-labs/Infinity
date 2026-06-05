@@ -24,6 +24,7 @@ import PIL.Image as PImage
 from torchvision.transforms.functional import to_tensor
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 from infinity.utils.text_condition import build_text_condition
+from infinity.utils.torch_io import atomic_torch_save
 
 
 def extract_key_val(text):
@@ -128,7 +129,7 @@ def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_
     if not save_file:
         save_file = osp.splitext(infinity_model_path)[0] + '-slim.pth'
     print(f'Save to {save_file}')
-    torch.save(infinity_slim, save_file)
+    atomic_torch_save(infinity_slim, save_file)
     print('[Save slim model] done')
     return save_file
 

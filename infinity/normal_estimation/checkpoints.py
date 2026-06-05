@@ -1,22 +1,9 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
-import torch
-
-
-def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    try:
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
+from infinity.utils.torch_io import atomic_torch_save
 
 
 def resolve_checkpoint_resume_path(

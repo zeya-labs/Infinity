@@ -12,6 +12,7 @@ import glob
 import shutil
 from infinity.utils import arg_util
 import infinity.utils.dist as dist
+from infinity.utils.torch_io import atomic_torch_save as _atomic_torch_save
 
 
 def glob_with_epoch_iter(pattern, recursive=False):
@@ -33,18 +34,6 @@ def glob_with_global_step(pattern, recursive=False):
             return iter_idx
         return 0
     return sorted(glob.glob(pattern, recursive=recursive), key=lambda x: extract_ep_iter(os.path.basename(x)), reverse=True)
-
-
-def _atomic_torch_save(payload: dict, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.tmp.{os.getpid()}")
-    try:
-        torch.save(payload, tmp_path)
-        os.replace(tmp_path, path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
 
 
 class CKPTSaver(object):

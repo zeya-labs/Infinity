@@ -33,8 +33,8 @@ class NormalCheckpointTest(unittest.TestCase):
             checkpoint_path = Path(tmpdir) / "checkpoints" / "last.pth"
 
             with (
-                mock.patch("infinity.normal_estimation.checkpoints.torch.save") as torch_save,
-                mock.patch("infinity.normal_estimation.checkpoints.os.replace") as os_replace,
+                mock.patch("infinity.utils.torch_io.torch.save") as torch_save,
+                mock.patch("infinity.utils.torch_io.os.replace") as os_replace,
             ):
                 atomic_torch_save({"step": 1}, checkpoint_path)
 
@@ -47,11 +47,11 @@ class NormalCheckpointTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = Path(tmpdir) / "checkpoints" / "last.pth"
             with (
-                mock.patch("infinity.normal_estimation.checkpoints.torch.save", side_effect=RuntimeError("disk full")),
-                mock.patch("infinity.normal_estimation.checkpoints.os.path.exists", return_value=True),
-                mock.patch("infinity.normal_estimation.checkpoints.os.remove") as remove,
-                mock.patch("infinity.normal_estimation.checkpoints.os.replace") as os_replace,
-                mock.patch("infinity.normal_estimation.checkpoints.os.getpid", return_value=123),
+                mock.patch("infinity.utils.torch_io.torch.save", side_effect=RuntimeError("disk full")),
+                mock.patch("infinity.utils.torch_io.os.path.exists", return_value=True),
+                mock.patch("infinity.utils.torch_io.os.remove") as remove,
+                mock.patch("infinity.utils.torch_io.os.replace") as os_replace,
+                mock.patch("infinity.utils.torch_io.os.getpid", return_value=123),
             ):
                 with self.assertRaisesRegex(RuntimeError, "disk full"):
                     atomic_torch_save({"step": 1}, checkpoint_path)
