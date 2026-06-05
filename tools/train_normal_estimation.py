@@ -72,7 +72,6 @@ from infinity.utils.swanlab_utils import (  # noqa: E402
 
 
 LOGGER = logging.getLogger("train_normal_estimation")
-TOKEN_CACHE_MEMORY: dict[str, dict[str, torch.Tensor]] = {}
 FULLSTATE_SAVE_POLICY = (
     FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     if FullStateDictConfig is not None
@@ -185,7 +184,6 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional directory for deterministic train token cache. Skips RGB/normal VAE tokenization on cache hits.",
     )
-    parser.add_argument("--token-cache-memory", action="store_true", default=False, help="Keep token cache entries in host memory after first load/write.")
     parser.add_argument(
         "--token-cache-metadata-only",
         action="store_true",
@@ -527,19 +525,13 @@ def load_token_cache_batch(
     metadata: list[dict[str, Any]],
     signature: str,
     device: torch.device,
-    use_memory_cache: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     payloads = []
     for item in metadata:
         path = cache_dir / token_cache_sample_key(item, signature)
-        path_key = str(path)
-        payload = TOKEN_CACHE_MEMORY.get(path_key) if use_memory_cache else None
-        if payload is None:
-            if not path.is_file():
-                return None
-            payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-            if use_memory_cache:
-                TOKEN_CACHE_MEMORY[path_key] = payload
+        if not path.is_file():
+            return None
+        payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
         payloads.append(payload)
     return (
         torch.stack([payload["rgb_prefix_blc"] for payload in payloads], dim=0).to(device, non_blocking=True),
@@ -579,7 +571,6 @@ def save_token_cache_batch(
     x_blc_without_prefix: torch.Tensor,
     gt_bl: torch.Tensor,
     raw_features: torch.Tensor,
-    use_memory_cache: bool,
 ) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     tensors = {
@@ -593,8 +584,6 @@ def save_token_cache_batch(
         if path.is_file():
             continue
         payload = {key: value[sample_index].clone().contiguous() for key, value in tensors.items()}
-        if use_memory_cache:
-            TOKEN_CACHE_MEMORY[str(path)] = payload
         atomic_torch_save(payload, path)
 
 
@@ -977,7 +966,7 @@ def forward_batch(
         cache_signature = token_cache_signature(args, scale_schedule) if cache_dir is not None else ""
         with timed_stage(timings, "cache_load", device):
             cached_tokens = (
-                load_token_cache_batch(cache_dir, batch["metadata"], cache_signature, device, args.token_cache_memory)
+                load_token_cache_batch(cache_dir, batch["metadata"], cache_signature, device)
                 if cache_dir is not None
                 else None
             )
@@ -1033,7 +1022,6 @@ def forward_batch(
                         cache_x_blc,
                         gt_bl,
                         raw_features,
-                        args.token_cache_memory,
                     )
 
     total_seq_len = int(sum(np.array(item).prod() for item in scale_schedule))

@@ -23,6 +23,8 @@ class NormalShellEntrypointTest(unittest.TestCase):
         self.assertNotIn(f'NORMAL_TRAIN_DATASETS:-{DEFAULT_NORMAL_TRAIN_DATASETS}', text)
         self.assertNotIn(f'NORMAL_TRAIN_DATASET_WEIGHTS:-{DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS}', text)
         self.assertNotIn(f'NORMAL_VKITTI2_ROOT:-{DEFAULT_VKITTI2_ROOT}', text)
+        self.assertNotIn("TOKEN_CACHE_" + "MEMORY", text)
+        self.assertNotIn("--token-cache-" + "memory", text)
 
     def test_train_normal_uses_python_defaults(self) -> None:
         self.assert_uses_python_defaults("scripts/train_normal.sh")

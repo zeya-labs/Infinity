@@ -27,6 +27,7 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-datasets", DEFAULT_NORMAL_TRAIN_DATASETS)
         self.assert_flag_value(cmd, "--train-dataset-weights", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS)
         self.assert_flag_value(cmd, "--vkitti2-root", DEFAULT_VKITTI2_ROOT)
+        self.assertNotIn("--token-cache-" + "memory", cmd)
 
     def test_normal_tokenizer_uses_mixed_dataset_defaults(self) -> None:
         values = task_defaults("训练法线 Tokenizer")

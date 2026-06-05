@@ -1015,8 +1015,6 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         cmd += ["--swanlab-experiment-name", values["swanlab_experiment"]]
     if values["save_optimizer_state"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--save-optimizer-state")
-    if values["token_cache_memory"].lower() in {"1", "yes", "true", "y"}:
-        cmd.append("--token-cache-memory")
     if values["token_cache_metadata_only"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--token-cache-metadata-only")
     if values["token_cache_require_hit"].lower() in {"1", "yes", "true", "y"}:
@@ -1233,7 +1231,6 @@ TASKS: list[Task] = [
             Field("weight_decay", "Weight decay", "1e-4"),
             Field("train_normal_metrics_every", "Train normal metrics every", "10"),
             Field("token_cache_dir", "Token cache dir", "outputs/normal_token_cache"),
-            Field("token_cache_memory", "Memory token cache", "1", choices=("0", "1")),
             Field("token_cache_metadata_only", "Metadata-only cache", "1", choices=("0", "1")),
             Field("token_cache_require_hit", "Require cache hit", "0", choices=("0", "1")),
             Field("token_cache_filter_missing", "Filter cache misses", "0", choices=("0", "1")),
