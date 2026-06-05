@@ -567,7 +567,9 @@ def save_checkpoint(
         "sch_video_disc": None,
         "ema": None,
     }
-    torch.save(payload, ckpt_path)
+    tmp_path = ckpt_path.with_name(f".{ckpt_path.name}.tmp.{os.getpid()}")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, ckpt_path)
     return ckpt_path
 
 
