@@ -75,7 +75,7 @@ class CiConfigTest(unittest.TestCase):
             self.assertEqual("weekly", updates[ecosystem]["schedule"]["interval"])
             self.assertEqual(5, updates[ecosystem]["open-pull-requests-limit"])
         self.assertEqual(
-            ["numpy", "pyyaml", "tomli", "textual"],
+            ["numpy", "pyyaml", "ruff", "tomli", "textual"],
             updates["pip"]["groups"]["lightweight-checks"]["patterns"],
         )
 
@@ -193,6 +193,7 @@ class CiConfigTest(unittest.TestCase):
         self.assertIn('PYTHON_BIN="${PYTHON_BIN:-python}"', check_script)
         self.assertIn('"${PYTHON_BIN}" scripts/check_repo.py', check_script)
         self.assertIn('"${PYTHON_BIN}" -m unittest discover -s tests', check_script)
+        self.assertIn('"${PYTHON_BIN}" -m ruff check --select F821 .', check_script)
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", check_script)
         self.assertIn("git diff --check", check_script)
         self.assertIn("tomllib.load", check_repo)

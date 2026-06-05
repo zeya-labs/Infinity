@@ -423,7 +423,7 @@ def main_train(args: arg_util.Args):
     print(f'  [*] [PT finished]  Total Time: {total_time},   Lm: {min_L_mean:.3f} ({L_mean}),   Lt: {min_L_tail:.3f} ({L_tail})')
     print('\n\n')
 
-    del stats, iters_train, ld_train, visualizer
+    del stats, iters_train, ld_train
     time.sleep(3), gc.collect(), torch.cuda.empty_cache(), time.sleep(3)
     return
 
@@ -443,6 +443,9 @@ def train_one_ep(
     header = f'[Ep]: [{ep:4d}/{args.ep}]'
 
     with misc.Low_GPU_usage(files=[args.log_txt_path], sleep_secs=20, verbose=True) as telling_dont_kill:
+        if enable_timeline_sdk:
+            import ndtimeline
+
         last_touch = time.time()
         g_it, max_it = ep * iters_train, args.ep * iters_train
 

@@ -58,6 +58,26 @@ def is_pow2n(x):
     return x > 0 and (x & (x - 1) == 0)
 
 
+@torch.no_grad()
+def get_param_for_log(model_name: str, named_parameters) -> dict[str, list[float]]:
+    """Return compact parameter statistics for logging without retaining tensors."""
+
+    stats: dict[str, list[float]] = {}
+    for name, param in named_parameters:
+        if param is None or not getattr(param, "requires_grad", False):
+            continue
+        data = param.detach()
+        if data.numel() == 0:
+            continue
+        key = f"{model_name}/{name}"
+        data_float = data.float()
+        stats[key] = [
+            float(data_float.mean().item()),
+            float(data_float.std(unbiased=False).item()) if data_float.numel() > 1 else 0.0,
+        ]
+    return stats
+
+
 def time_str(fmt='[%m-%d %H:%M:%S]'):
     return datetime.datetime.now(tz=pytz.timezone('Asia/Shanghai')).strftime(fmt)
 

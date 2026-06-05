@@ -42,6 +42,8 @@ from PIL import Image
 from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
 
+from tools.inception import InceptionV3
+
 try:
     from tqdm import tqdm
 except ImportError:

@@ -33,7 +33,7 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
             patch_size = 16
             encoder_ch_mult=[1, 2, 4, 4, 4]
             decoder_ch_mult=[1, 2, 4, 4, 4]
-        vae_local = vae_model(vae_st, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size, 
+        vae_local = vae_model(vae_st, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size,
                               encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True).to(args.device)
         if args.fake_vae_input:
             vae_local.encoder = None
@@ -68,10 +68,10 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
     )
     if args.dp >= 0: gpt_kw['drop_path_rate'] = args.dp
     if args.hd > 0: gpt_kw['num_heads'] = args.hd
-    
+
     print(f'[create gpt_wo_ddp] constructor kw={gpt_kw}\n')
     gpt_kw['vae_local'] = vae_local
-    
+
     model_str = args.model.replace('vgpt', 'infinity')   # legacy
     print(f"{model_str=}")
     if model_str.rsplit('c', maxsplit=1)[-1].isdecimal():
@@ -80,7 +80,7 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
     else:
         block_chunks = 1
     gpt_kw['block_chunks'] = block_chunks
-    
+
     from infinity.models import Infinity
     from timm.models import create_model
     gpt_wo_ddp: Infinity = create_model(model_str, **gpt_kw)
@@ -92,9 +92,9 @@ def build_vae_gpt(args: arg_util.Args, vae_st: dict, skip_gpt: bool, force_flash
 
     assert all(not p.requires_grad for p in vae_local.parameters())
     assert all(p.requires_grad for n, p in gpt_wo_ddp.named_parameters())
-    
+
     return vae_local, gpt_wo_ddp, gpt_wo_ddp_ema
 
 
 if __name__ == '__main__':
-    ld(sys.argv[1])
+    misc.ld(sys.argv[1])

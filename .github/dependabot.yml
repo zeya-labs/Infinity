@@ -16,5 +16,6 @@ updates:
         patterns:
           - numpy
           - pyyaml
+          - ruff
           - tomli
           - textual

@@ -14,6 +14,8 @@ git diff --check
 
 "${PYTHON_BIN}" -m unittest discover -s tests
 
+"${PYTHON_BIN}" -m ruff check --select F821 .
+
 while IFS= read -r script; do
   bash -n "${script}"
 done < <(find scripts -path 'scripts/download-data' -prune -o -type f -name '*.sh' -print | sort)

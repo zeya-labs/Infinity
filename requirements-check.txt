@@ -2,5 +2,6 @@
 # CI installs CPU torch separately before this file.
 numpy
 pyyaml
+ruff
 tomli; python_version < "3.11"
 textual
