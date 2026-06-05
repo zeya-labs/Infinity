@@ -413,7 +413,7 @@ def reduce_timing_dict(timings: dict[str, float], distributed: bool, device: tor
     keys = sorted(timings)
     values = torch.tensor([timings[key] for key in keys], dtype=torch.float64, device=device)
     dist.all_reduce(values, op=dist.ReduceOp.MAX)
-    return {key: float(value) for key, value in zip(keys, values.tolist())}
+    return {key: float(value) for key, value in zip(keys, values.tolist(), strict=True)}
 
 
 def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace, total_steps: int) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:

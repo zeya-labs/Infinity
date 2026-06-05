@@ -63,7 +63,7 @@ def vae_encode_decode_norm(vae, image_path, tgt_h, tgt_w, device, augmentations)
 
 def inference_eval(rank, world_size, args, vae, return_dict, val_txt, tgt_h, tgt_w, augmentations):
     # Don't remove this setup!!! dist.init_process_group is important for building loader (data.distributed.DistributedSampler)
-    setup(rank, world_size) 
+    setup(rank, world_size)
 
     device = torch.device(f"cuda:{rank}")
 
@@ -99,7 +99,7 @@ def inference_eval(rank, world_size, args, vae, return_dict, val_txt, tgt_h, tgt
 
     # PSNR score related
     psnr_value = 0.0
-    
+
     # num_images = len(loader)
     assert len(val_txt) % world_size == 0
     num_images = len(val_txt) // world_size
@@ -117,19 +117,19 @@ def inference_eval(rank, world_size, args, vae, return_dict, val_txt, tgt_h, tgt
             # x_recons = x_recons.cpu()
             x, x_recons = vae_encode_decode_norm(vae, image_path, tgt_h, tgt_w, device, augmentations)
             x_recons = x_recons.cpu()
-        
+
         # paths = batch["path"]
         # assert len(paths) == x.shape[0]
         paths = [rel_path]
 
-        for p, input_, recon_ in zip(paths, x, x_recons):
+        for p, input_, recon_ in zip(paths, x, x_recons, strict=True):
             if os.path.isabs(p):
                 p = "/".join(p.split("/")[6:])
             assert not os.path.isabs(p), f"{p} should not be abspath"
             path = os.path.join(save_dir, "input_recon", os.path.basename(p))
             os.makedirs(os.path.split(path)[0], exist_ok=True)
             input_ = ((input_ + 1) / 2).unsqueeze(0).to(device) # [-1, 1] -> [0, 1]
-            
+
             pred_x = inception_model(input_)[0]
             pred_x = pred_x.squeeze(3).squeeze(2).cpu().numpy()
 
@@ -171,7 +171,7 @@ def inference_eval(rank, world_size, args, vae, return_dict, val_txt, tgt_h, tgt
             ssim_value += ssim_temp / B
             psnr_value += psnr_temp / B
             num_iter += 1
-        
+
     pred_xs = np.concatenate(pred_xs, axis=0)
     pred_recs = np.concatenate(pred_recs, axis=0)
     temp_dict = {
@@ -194,7 +194,7 @@ def image_eval(pred_xs, pred_recs, lpips_alex, lpips_vgg, ssim_value, psnr_value
     sigma_x = np.cov(pred_xs, rowvar=False)
     mu_rec = np.mean(pred_recs, axis=0)
     sigma_rec = np.cov(pred_recs, rowvar=False)
-    
+
     fid_value = calculate_frechet_distance(mu_x, sigma_x, mu_rec, sigma_rec)
     lpips_alex_value = lpips_alex / num_iter
     lpips_vgg_value = lpips_vgg / num_iter
@@ -232,7 +232,7 @@ def cleanup():
 
 if __name__ == '__main__':
     args = get_args()
-    
+
     # load bsq vae
     vqgan_ckpt = args.vqgan_ckpt
     schedule_mode = "dynamic"
@@ -248,7 +248,7 @@ if __name__ == '__main__':
     else: # test on benchmark
         val_txt_path = "data/labels/imagenet/val.txt"
         val_txt = open(val_txt_path, 'r').readlines()
-        val_txt = [x.split("\t")[0] for x in val_txt if x.strip()] 
+        val_txt = [x.split("\t")[0] for x in val_txt if x.strip()]
         world_size = torch.cuda.device_count()
 
     tgt_h, tgt_w = args.tgt_size, args.tgt_size

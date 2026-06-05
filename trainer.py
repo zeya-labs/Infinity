@@ -270,7 +270,9 @@ class InfinityTrainer(object):
             acc_tail = acc_bit_list[-1] if args.use_bit_label else acc_token_list[-1]
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm_t)    # todo: Accm, Acct
             wandb_log_dict = {"Overall/L_mean": Lmean, 'Overall/Acc_bit_mean': acc_bit_mean, 'Overall/Acc_token_mean': acc_token_mean, 'Overall/grad_norm_t': grad_norm_t}
-            for si, (loss_si, acc_bit_si, acc_token_si) in enumerate(zip(L_list, acc_bit_list, acc_token_list)):
+            for si, (loss_si, acc_bit_si, acc_token_si) in enumerate(
+                zip(L_list, acc_bit_list, acc_token_list, strict=True)
+            ):
                 wandb_log_dict[f'Detail/L_s{si+1:02d}'] = loss_si
                 wandb_log_dict[f'Detail/Acc_bit_s{si+1:02d}'] = acc_bit_si
                 wandb_log_dict[f'Detail/Acc_token_s{si+1:02d}'] = acc_token_si

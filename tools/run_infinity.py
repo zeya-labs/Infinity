@@ -48,16 +48,16 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
     text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
     lens: List[int] = mask.sum(dim=-1).tolist()
     cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-    Ltext = max(lens)    
+    Ltext = max(lens)
     kv_compact = []
-    for len_i, feat_i in zip(lens, text_features.unbind(0)):
+    for len_i, feat_i in zip(lens, text_features.unbind(0), strict=True):
         kv_compact.append(feat_i[:len_i])
     kv_compact = torch.cat(kv_compact, dim=0)
     text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
     return text_cond_tuple
 
 def aug_with_positive_prompt(prompt):
-    for key in ['man', 'woman', 'men', 'women', 'boy', 'girl', 'child', 'person', 'human', 'adult', 'teenager', 'employee', 
+    for key in ['man', 'woman', 'men', 'women', 'boy', 'girl', 'child', 'person', 'human', 'adult', 'teenager', 'employee',
                 'employer', 'worker', 'mother', 'father', 'sister', 'brother', 'grandmother', 'grandfather', 'son', 'daughter']:
         if key in prompt:
             prompt = prompt + '. very smooth faces, good looking faces, face to the camera, perfect facial features'
@@ -75,11 +75,11 @@ def enhance_image(image):
     return color_image
 
 def gen_one_img(
-    infinity_test, 
-    vae, 
+    infinity_test,
+    vae,
     text_tokenizer,
     text_encoder,
-    prompt, 
+    prompt,
     cfg_list=[],
     tau_list=[],
     negative_prompt='',
@@ -157,16 +157,16 @@ def load_tokenizer(t5_path =''):
     return text_tokenizer, text_encoder
 
 def load_infinity(
-    rope2d_each_sa_layer, 
-    rope2d_normalized_by_hw, 
-    use_scale_schedule_embedding, 
-    pn, 
-    use_bit_label, 
-    add_lvl_embeding_only_first_block, 
-    model_path='', 
-    scale_schedule=None, 
-    vae=None, 
-    device='cuda', 
+    rope2d_each_sa_layer,
+    rope2d_normalized_by_hw,
+    use_scale_schedule_embedding,
+    pn,
+    use_bit_label,
+    add_lvl_embeding_only_first_block,
+    model_path='',
+    scale_schedule=None,
+    vae=None,
+    device='cuda',
     model_kwargs=None,
     text_channels=2048,
     apply_spatial_patchify=0,
@@ -270,7 +270,7 @@ def load_visual_tokenizer(args):
             patch_size = 16
             encoder_ch_mult=[1, 2, 4, 4, 4]
             decoder_ch_mult=[1, 2, 4, 4, 4]
-        vae = vae_model(args.vae_path, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size, 
+        vae = vae_model(args.vae_path, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size,
                         encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True).to(device)
     else:
         raise ValueError(f'vae_type={args.vae_type} not supported')
@@ -279,7 +279,7 @@ def load_visual_tokenizer(args):
 def load_transformer(vae, args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_path = args.model_path
-    if args.checkpoint_type == 'torch': 
+    if args.checkpoint_type == 'torch':
         # copy large model to local; save slim to local; and copy slim to nas; load local slim model
         if osp.exists(args.cache_dir):
             local_model_path = osp.join(args.cache_dir, 'tmp', model_path.replace('/', '_'))
@@ -329,16 +329,16 @@ def load_transformer(vae, args):
     elif args.model_type == 'infinity_layer48':
         kwargs_model = dict(depth=48, embed_dim=3360, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
     infinity = load_infinity(
-        rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
+        rope2d_each_sa_layer=args.rope2d_each_sa_layer,
         rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
         use_scale_schedule_embedding=args.use_scale_schedule_embedding,
         pn=args.pn,
-        use_bit_label=args.use_bit_label, 
-        add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block, 
-        model_path=slim_model_path, 
-        scale_schedule=None, 
-        vae=vae, 
-        device=device, 
+        use_bit_label=args.use_bit_label,
+        add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
+        model_path=slim_model_path,
+        scale_schedule=None,
+        vae=vae,
+        device=device,
         model_kwargs=kwargs_model,
         text_channels=args.text_channels,
         apply_spatial_patchify=args.apply_spatial_patchify,
@@ -374,7 +374,7 @@ def add_common_arguments(parser):
     parser.add_argument('--checkpoint_type', type=str, default='torch')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
-    
+
 
 
 if __name__ == '__main__':
@@ -388,14 +388,14 @@ if __name__ == '__main__':
     args.cfg = list(map(float, args.cfg.split(',')))
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
-    
+
     # load text encoder
     text_tokenizer, text_encoder = load_tokenizer(t5_path =args.text_encoder_ckpt)
     # load vae
     vae = load_visual_tokenizer(args)
     # load infinity
     infinity = load_transformer(vae, args)
-    
+
     scale_schedule = dynamic_resolution_h_w[args.h_div_w_template][args.pn]['scales']
     scale_schedule = [ (1, h, w) for (_, h, w) in scale_schedule]
 

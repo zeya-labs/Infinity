@@ -498,7 +498,7 @@ def train_one_ep(
                 Ltext = max(lens)
 
                 kv_compact = []
-                for len_i, feat_i in zip(lens, text_features.unbind(0)):
+                for len_i, feat_i in zip(lens, text_features.unbind(0), strict=True):
                     kv_compact.append(feat_i[:len_i])
                 kv_compact = torch.cat(kv_compact, dim=0)
                 text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)

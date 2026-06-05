@@ -184,7 +184,7 @@ def allgather_diff_shape(t: torch.Tensor, cat=True) -> Union[List[torch.Tensor],
         ls_padded = [torch.empty_like(t) for _ in range(__world_size)]
         tdist.all_gather(ls_padded, t)
         ls = []
-        for t, size in zip(ls_padded, ls_size):
+        for t, size in zip(ls_padded, ls_size, strict=True):
             ls.append(t[:size[0].item()])
     else:
         ls = [t]

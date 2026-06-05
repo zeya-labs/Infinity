@@ -27,7 +27,7 @@ def main() -> None:
         )
 
     final_dict = {}
-    for key1, key2 in zip(keys1_list, keys2_list):
+    for key1, key2 in zip(keys1_list, keys2_list, strict=True):
         final_dict[key1] = false_key_dict[key2]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

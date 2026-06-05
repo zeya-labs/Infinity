@@ -129,7 +129,14 @@ def get_latent2scale_schedule(T: int, H: int, W: int, mode="original"):
     if len(predefined_T_Scales) < len(patch_THW_shape_per_scale):
         # print("warning: the length of predefined_T_Scales is less than the length of patch_THW_shape_per_scale!")
         predefined_T_Scales += [predefined_T_Scales[-1]] * (len(patch_THW_shape_per_scale) - len(predefined_T_Scales))
-    patch_THW_shape_per_scale = [(min(T, t), h, w ) for (h, w), t in zip(patch_THW_shape_per_scale, predefined_T_Scales[:len(patch_THW_shape_per_scale)])]
+    patch_THW_shape_per_scale = [
+        (min(T, t), h, w)
+        for (h, w), t in zip(
+            patch_THW_shape_per_scale,
+            predefined_T_Scales[:len(patch_THW_shape_per_scale)],
+            strict=True,
+        )
+    ]
     return patch_THW_shape_per_scale
 
 class LayerNorm(nn.Module):

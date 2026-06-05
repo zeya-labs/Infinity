@@ -42,7 +42,7 @@ if __name__ == '__main__':
     parser.add_argument('--debug_bsc', type=int, default=0, choices=[0,1])
     parser.add_argument('--log_freq', type=int, default=10)
     args = parser.parse_args()
-    
+
     # load text encoder
     text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
     # load vae
@@ -51,17 +51,17 @@ if __name__ == '__main__':
     infinity = load_transformer(vae, args)
 
     bitwise_self_correction = BitwiseSelfCorrection(vae, args)
-    
+
     device = torch.device('cuda')
     dataset = T2IIterableDataset(
-        args=None, 
+        args=None,
         meta_folder=args.meta_folder,
-        data_load_reso=None, 
-        max_caption_len=512, 
-        short_prob=0.0, 
+        data_load_reso=None,
+        max_caption_len=512,
+        short_prob=0.0,
         load_vae_instead_of_image=False,
         buffersize=100,
-        seed=0, 
+        seed=0,
         online_t5=True,
         pn=args.pn,
         batch_size=args.batch_size,
@@ -92,7 +92,7 @@ if __name__ == '__main__':
         cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
         Ltext = max(lens)
         kv_compact = []
-        for len_i, feat_i in zip(lens, text_features.unbind(0)):
+        for len_i, feat_i in zip(lens, text_features.unbind(0), strict=True):
             kv_compact.append(feat_i[:len_i])
         kv_compact = torch.cat(kv_compact, dim=0)
         text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)
@@ -103,11 +103,11 @@ if __name__ == '__main__':
         scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
         scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
         raw_last_l = np.array(scale_schedule[-1]).prod()
-        
+
         # [prepare]
         B = inp_B3HW.shape[0] if isinstance(inp_B3HW, torch.Tensor) else inp_B3HW[0].shape[0]
         V = vae.vocab_size
-        
+
         # [forward]
         with torch.amp.autocast('cuda', enabled=False):
             with torch.no_grad():
@@ -116,14 +116,14 @@ if __name__ == '__main__':
                 else:
                     vae_scale_schedule = scale_schedule
                 raw_features, _, _ = vae.encode_for_raw_features(inp_B3HW.to(device), scale_schedule=vae_scale_schedule)
-            
+
             x_BLC_wo_prefix, gt_ms_idx_Bl = bitwise_self_correction.flip_requant(vae_scale_schedule, inp_B3HW, raw_features, device)
             training_seq_len = np.array(scale_schedule).prod(axis=1).sum()
             x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 
             with torch.no_grad():
                 logits_BLV = infinity(text_cond_tuple, x_BLC_wo_prefix, scale_schedule=scale_schedule) # [bs, 1*1+...+64*64, vocab_size or log2(vocab_size)*2]
-            
+
             if args.vis_model_flop_param:
                 from torchinfo import summary
                 res = summary(infinity, input_data=(text_cond_tuple, x_BLC_wo_prefix, scale_schedule))
@@ -131,7 +131,7 @@ if __name__ == '__main__':
 
             batch_size, seq_len = logits_BLV.shape[:2]
             seq_len_each = [idx_Bl.shape[1] for idx_Bl in gt_ms_idx_Bl]
-            
+
             gt_BL = torch.cat(gt_ms_idx_Bl, dim=1)[:,:training_seq_len].contiguous().type(torch.long) # [bs, 1*1+...+64*64, 16] or [bs, 1*1+...+64*64]
             tmp_bs, tmp_seq_len, tmp_channel = logits_BLV.shape
             assert tmp_channel == vae.codebook_dim * 2
@@ -169,7 +169,7 @@ if __name__ == '__main__':
             accumulate_res['loss_by_scale'].append(L_list)
             accumulate_res['acc_bit_list_by_scale'].append(acc_bit_list)
             accumulate_res['acc_token_list_by_scale'].append(acc_token_list)
-    
+
     for k, v in accumulate_res.items():
         if len(np.array(v).shape) == 1:
             v = np.array(v).mean(0)
@@ -177,7 +177,7 @@ if __name__ == '__main__':
             v = np.array(v).mean(0).tolist()
         accumulate_res[k] = v
         print(f'{k}: {v}')
-    
+
     save_file = osp.join(args.save_dir, 'val_res.json')
     os.makedirs(osp.dirname(save_file), exist_ok=True)
     with open(save_file, 'w') as f:

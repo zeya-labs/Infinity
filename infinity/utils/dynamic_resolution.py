@@ -36,9 +36,9 @@ for ratio in full_ratio2hws:
             total_pixels = '0.60M'
         else:
             total_pixels = '1M'
-        
+
         scales = full_ratio2hws[ratio][:leng]
-        scales = [ (t, h, w) for t, (h, w) in zip(predefined_t, scales) ]
+        scales = [(t, h, w) for t, (h, w) in zip(predefined_t[:leng], scales, strict=True)]
         dynamic_resolution_h_w[ratio][total_pixels] = {
             'pixel': pixel,
             'scales': scales
@@ -53,7 +53,7 @@ def get_h_div_w_template2indices(h_div_w_list, h_div_w_templates):
     indices = list(range(len(h_div_w_list)))
     h_div_w_template2indices = {}
     pbar = tqdm.tqdm(total=len(indices), desc='get_h_div_w_template2indices...')
-    for h_div_w, index in zip(h_div_w_list, indices):
+    for h_div_w, index in zip(h_div_w_list, indices, strict=True):
         pbar.update(1)
         nearest_h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w-h_div_w_templates))]
         if nearest_h_div_w_template_ not in h_div_w_template2indices:
