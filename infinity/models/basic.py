@@ -678,7 +678,6 @@ def main():
     kv_compact = torch.cat([kv[i, :Li[i]] for i in range(B)], dim=0)
 
     ca = CrossAttention(for_attn_pool=False, embed_dim=Cq, kv_dim=Ckv, num_heads=H)
-    CrossAttention.forward
     ca(q, (kv_compact, cu_seqlens_k, max(Li))).mean().backward()
 
 

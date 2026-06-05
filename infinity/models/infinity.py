@@ -465,7 +465,6 @@ class Infinity(nn.Module):
             attn_fn = None
 
         # [2. block loop]
-        SelfAttnBlock.forward, CrossAttnBlock.forward
         checkpointing_full_block = self.checkpointing == 'full-block' and self.training
         if self.num_block_chunks == 1:
             for i, b in enumerate(self.blocks):

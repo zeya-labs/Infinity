@@ -14,7 +14,7 @@ git diff --check
 
 "${PYTHON_BIN}" -m unittest discover -s tests
 
-"${PYTHON_BIN}" -m ruff check --select F821 .
+"${PYTHON_BIN}" -m ruff check --select F821,B018 .
 
 while IFS= read -r script; do
   bash -n "${script}"

@@ -132,7 +132,6 @@ class InfinityTrainer(object):
             gt_ms_idx_Bl: List[Ten] = self.vae_local.get_GPT_ground_truth(inp)
 
             gt_BL = torch.cat(gt_ms_idx_Bl, dim=1)
-            self.gpt_wo_ddp.forward
             logits_BLV = self.gpt_wo_ddp(label_B, self.quantize_local.fuse_multiscale_idx_as_gpt_inp_BL(gt_ms_idx_Bl))
 
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
@@ -183,7 +182,6 @@ class InfinityTrainer(object):
             training_seq_len = np.array(scale_schedule)[:training_scales].prod(axis=1).sum()
             x_BLC_wo_prefix = x_BLC_wo_prefix[:, :(training_seq_len-np.array(scale_schedule[0]).prod()), :]
 
-            self.gpt_wo_ddp.forward
             logits_BLV = self.gpt(text_cond_tuple, x_BLC_wo_prefix, scale_schedule=scale_schedule[:training_scales]) # [bs, 1*1+...+64*64, vocab_size or log2(vocab_size)*2]
             self.batch_size, self.seq_len = logits_BLV.shape[:2]
 
