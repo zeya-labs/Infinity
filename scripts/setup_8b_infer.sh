@@ -16,6 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 WEIGHTS_DIR="${WEIGHTS_DIR:-$REPO_ROOT/weights}"
 HF_HOME="${HF_HOME:-$WEIGHTS_DIR/.cache/huggingface}"
 
@@ -26,7 +27,7 @@ export HF_HOME
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 
-python - <<'PY'
+"$PYTHON_BIN" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 

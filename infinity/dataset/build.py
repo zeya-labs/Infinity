@@ -3,6 +3,7 @@ import os
 import os.path as osp
 import random
 import subprocess
+import tempfile
 from functools import partial
 from typing import Optional
 import time
@@ -14,8 +15,9 @@ from infinity.dataset.dataset_t2i_iterable import T2IIterableDataset
 try:
     from grp import getgrgid
     from pwd import getpwuid
-except:
-    pass
+except ImportError:
+    getgrgid = None
+    getpwuid = None
 import PIL.Image as PImage
 from PIL import ImageFile
 import numpy as np
@@ -51,12 +53,12 @@ def center_crop_arr(pil_image, image_size):
         pil_image = pil_image.resize(
             tuple(x // 2 for x in pil_image.size), resample=PImage.BOX
         )
-    
+
     scale = image_size / min(*pil_image.size)
     pil_image = pil_image.resize(
         tuple(round(x * scale) for x in pil_image.size), resample=PImage.LANCZOS
     )
-    
+
     arr = np.array(pil_image)
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
@@ -68,10 +70,10 @@ class RandomResize:
         ub = max(round((mid_reso + (mid_reso-final_reso) / 8) / 4) * 4, mid_reso)
         self.reso_lb, self.reso_ub = final_reso, ub
         self.interpolation = interpolation
-    
+
     def __call__(self, img):
         return resize(img, size=random.randint(self.reso_lb, self.reso_ub), interpolation=self.interpolation)
-    
+
     def __repr__(self):
         return f'RandomResize(reso=({self.reso_lb}, {self.reso_ub}), interpolation={self.interpolation})'
 
@@ -97,7 +99,7 @@ def load_save(reso=512):
         dst_d, dst_f = os.path.split(fname)
         dst = os.path.join(dst_d, f'crop{dst_f.replace(".jpg", ".png")}')
         img.save(dst)
-    
+
     W, H = imgs[0].size
     WW = W * len(imgs)
     new_im = PImage.new('RGB', (WW, H))
@@ -129,10 +131,10 @@ def build_t2i_dataset(
 ):
     if args.use_streaming_dataset:
         return T2IIterableDataset(
-            data_path, 
-            max_caption_len=max_caption_len, 
-            short_prob=short_prob, 
-            load_vae_instead_of_image=load_vae_instead_of_image, 
+            data_path,
+            max_caption_len=max_caption_len,
+            short_prob=short_prob,
+            load_vae_instead_of_image=load_vae_instead_of_image,
             buffersize=args.iterable_data_buffersize,
             pn=args.pn,
             online_t5=args.online_t5,
@@ -163,19 +165,40 @@ def pil_load(path: str, proposal_size):
     return img
 
 
+def _user_name(uid: int) -> str:
+    if getpwuid is None:
+        return str(uid)
+    return getpwuid(uid).pw_name
+
+
+def _group_name(gid: int) -> str:
+    if getgrgid is None:
+        return str(gid)
+    return getgrgid(gid).gr_name
+
+
 def rewrite(im: PImage, file: str, info: str):
     kw = dict(quality=100)
     if file.lower().endswith('.tif') or file.lower().endswith('.tiff'):
         kw['compression'] = 'none'
     elif file.lower().endswith('.webp'):
         kw['lossless'] = True
-    
+
     st = os.stat(file)
-    uname = getpwuid(st.st_uid).pw_name
-    gname = getgrgid(st.st_gid).gr_name
+    uname = _user_name(st.st_uid)
+    gname = _group_name(st.st_gid)
     mode = oct(st.st_mode)[-3:]
-    
-    local_file = osp.basename(file)
-    im.save(local_file, **kw)
-    print(f'************* <REWRITE: {info}> *************  @  {file}')
-    subprocess.call(f'sudo mv {local_file} {file}; sudo chown {uname}:{gname} {file}; sudo chmod {mode} {file}', shell=True)
+
+    tmp_file = None
+    try:
+        fd, tmp_file = tempfile.mkstemp(prefix=f".{osp.basename(file)}.", suffix=".rewrite", dir=".")
+        os.close(fd)
+        im.save(tmp_file, **kw)
+        print(f'************* <REWRITE: {info}> *************  @  {file}')
+        subprocess.run(["sudo", "mv", tmp_file, file], check=True)
+        tmp_file = None
+        subprocess.run(["sudo", "chown", f"{uname}:{gname}", file], check=True)
+        subprocess.run(["sudo", "chmod", mode, file], check=True)
+    finally:
+        if tmp_file and osp.exists(tmp_file):
+            os.unlink(tmp_file)

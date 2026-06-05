@@ -38,7 +38,7 @@ if __name__ == '__main__':
     args.cfg = list(map(float, args.cfg.split(',')))
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
-    
+
     with open(args.metadata_file) as fp:
         metadatas = json.load(fp)
 
@@ -81,7 +81,7 @@ if __name__ == '__main__':
         if args.rewrite_prompt:
             from tools.prompt_rewriter import PromptRewriter
             prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
-    
+
     save_metadatas = []
     for index, metadata in enumerate(metadatas):
         seed_everything(args.seed)
@@ -98,7 +98,7 @@ if __name__ == '__main__':
             input_key_val = extract_key_val(refined_prompt)
             prompt = input_key_val['prompt']
             print(f'prompt: {prompt}, refined_prompt: {refined_prompt}')
-        
+
         images = []
         for _ in range(args.n_samples):
             t1 = time.time()
@@ -156,7 +156,7 @@ if __name__ == '__main__':
             t2 = time.time()
             print(f'{args.model_type} infer one image takes {t2-t1:.2f}s')
             images.append(image)
-        
+
         os.makedirs(sample_path, exist_ok=True)
         metadata['gen_image_paths'] = []
         for i, image in enumerate(images):

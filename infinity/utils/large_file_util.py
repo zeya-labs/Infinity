@@ -50,10 +50,16 @@ def split_large_txt_files(filepath, chunk_id2save_files):
                 chunk = []
                 chunk_id += 1
         if len(chunk):
-            import ipdb; ipdb.set_trace()
-        assert not len(chunk)
+            remaining_lines = len(chunk)
+        else:
+            remaining_lines = 0
         for thread in thread_list:
             thread.join()
+        if remaining_lines:
+            raise ValueError(
+                f"{filepath} has {remaining_lines} lines left after splitting; "
+                "check the expected total line count encoded in the filename"
+            )
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

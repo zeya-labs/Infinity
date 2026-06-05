@@ -1,14 +1,14 @@
 import datetime
-import functools
 import math
 import os
 import random
+import shlex
 import subprocess
 import sys
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Iterator, List, Tuple
+from typing import Iterator, List, Sequence, Tuple, Union
 
 import numpy as np
 import pytz
@@ -18,16 +18,35 @@ import torch.nn.functional as F
 
 import infinity.utils.dist as dist
 
-os_system = functools.partial(subprocess.call, shell=True)
+
+Command = Union[str, Sequence[str]]
+
+
+def _normalize_command(cmd: Command) -> list[str]:
+    return shlex.split(cmd) if isinstance(cmd, str) else [str(part) for part in cmd]
+
+
+def os_system(cmd: Command):
+    return subprocess.call(_normalize_command(cmd))
+
+
 def echo(info):
-    os_system(f'echo "[$(date "+%m-%d-%H:%M:%S")] ({os.path.basename(sys._getframe().f_back.f_code.co_filename)}, line{sys._getframe().f_back.f_lineno})=> {info}"')
+    print(
+        f'{time_str()} ({os.path.basename(sys._getframe().f_back.f_code.co_filename)}, '
+        f'line{sys._getframe().f_back.f_lineno})=> {info}',
+        flush=True,
+    )
+
+
 def os_system_get_stdout(cmd):
-    return subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode('utf-8')
+    return subprocess.run(_normalize_command(cmd), stdout=subprocess.PIPE).stdout.decode('utf-8')
+
+
 def os_system_get_stdout_stderr(cmd):
     cnt = 0
     while True:
         try:
-            sp = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            sp = subprocess.run(_normalize_command(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         except subprocess.TimeoutExpired:
             cnt += 1
             print(f'[fetch free_port file] timeout cnt={cnt}')
@@ -46,31 +65,33 @@ def time_str(fmt='[%m-%d %H:%M:%S]'):
 class DistLogger(object):
     def __init__(self, lg):
         self._lg = lg
-    
+
     @staticmethod
     def do_nothing(*args, **kwargs):
         pass
-    
+
     def __getattr__(self, attr: str):
         return getattr(self._lg, attr) if self._lg is not None else DistLogger.do_nothing
 
 class TensorboardLogger(object):
     def __init__(self, log_dir, filename_suffix):
-        try: import tensorflow_io as tfio
-        except: pass
+        try:
+            import tensorflow_io as tfio
+        except ImportError:
+            tfio = None
         from torch.utils.tensorboard import SummaryWriter
         self.writer = SummaryWriter(log_dir=log_dir, filename_suffix=filename_suffix)
         self.step = 0
-    
+
     def set_step(self, step=None):
         if step is not None:
             self.step = step
         else:
             self.step += 1
-    
+
     def loggable(self):
         return self.step == 0 or (self.step + 1) % 500 == 0
-    
+
     def update(self, head='scalar', step=None, **kwargs):
         if step is None:
             step = self.step
@@ -79,7 +100,7 @@ class TensorboardLogger(object):
             if v is None: continue
             if hasattr(v, 'item'): v = v.item()
             self.writer.add_scalar(f'{head}/{k}', v, step)
-    
+
     def log_tensor_as_distri(self, tag, tensor1d, step=None):
         if step is None:
             step = self.step
@@ -88,16 +109,16 @@ class TensorboardLogger(object):
             self.writer.add_histogram(tag=tag, values=tensor1d, global_step=step)
         except Exception as e:
             print(f'[log_tensor_as_distri writer.add_histogram failed]: {e}')
-    
+
     def log_image(self, tag, img_chw, step=None):
         if step is None:
             step = self.step
             if not self.loggable(): return
         self.writer.add_image(tag, img_chw, step, dataformats='CHW')
-    
+
     def flush(self):
         self.writer.flush()
-    
+
     def close(self):
         self.writer.close()
 
@@ -122,30 +143,35 @@ class TouchingDaemonDontForgetToStartMe(threading.Thread):
         self.sleep_secs = sleep_secs
         self.is_finished = False
         self.verbose = verbose
-        
+
         f_back = sys._getframe().f_back
         file_desc = f'{f_back.f_code.co_filename:24s}'[-24:]
         self.print_prefix = f' ({file_desc}, line{f_back.f_lineno:-4d}) @daemon@ '
-    
+
     def finishing(self):
         self.is_finished = True
-    
+
     def run(self) -> None:
         kw = {}
         if tdist.is_initialized(): kw['clean'] = True
-        
+
         stt = time.time()
         if self.verbose: print(f'{time_str()}{self.print_prefix}[TouchingDaemon tid={threading.get_native_id()}] start touching {self.files} per {self.sleep_secs}s ...', **kw)
+        last_touch_error = None
         while not self.is_finished:
             for f in self.files:
                 if os.path.exists(f):
                     try:
                         os.utime(f)
-                        fp = open(f, 'a')
-                        fp.close()
-                    except: pass
+                        with open(f, 'a'):
+                            pass
+                    except OSError as exc:
+                        message = f'{f}: {type(exc).__name__}: {exc}'
+                        if message != last_touch_error:
+                            print(f'{time_str()}{self.print_prefix}[TouchingDaemon] failed to touch {message}', **kw)
+                            last_touch_error = message
             time.sleep(self.sleep_secs)
-        
+
         if self.verbose: print(f'{time_str()}{self.print_prefix}[TouchingDaemon tid={threading.get_native_id()}] finish touching after {time.time()-stt:.1f} secs {self.files} per {self.sleep_secs}s. ', **kw)
 
 
@@ -153,7 +179,7 @@ class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
     """
-    
+
     def __init__(self, window_size=30, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
@@ -161,12 +187,12 @@ class SmoothedValue(object):
         self.total = 0.0
         self.count = 0
         self.fmt = fmt
-    
+
     def update(self, value, n=1):
         self.deque.append(value)
         self.count += n
         self.total += value * n
-    
+
     def synchronize_between_processes(self):
         """
         Warning: does not synchronize the deque!
@@ -177,31 +203,31 @@ class SmoothedValue(object):
         t = t.tolist()
         self.count = int(t[0])
         self.total = t[1]
-    
+
     @property
     def median(self):
         return np.median(self.deque) if len(self.deque) else 0
-    
+
     @property
     def avg(self):
         return sum(self.deque) / (len(self.deque) or 1)
-    
+
     @property
     def global_avg(self):
         return self.total / (self.count or 1)
-    
+
     @property
     def max(self):
         return max(self.deque) if len(self.deque) else 0
-    
+
     @property
     def value(self):
         return self.deque[-1] if len(self.deque) else 0
-    
+
     def time_preds(self, counts) -> Tuple[float, str, str]:
         remain_secs = counts * self.median
         return remain_secs, str(datetime.timedelta(seconds=round(remain_secs))), time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + remain_secs))
-    
+
     def __str__(self):
         return self.fmt.format(median=self.median, avg=self.avg, global_avg=self.global_avg, max=self.max, value=self.value)
 
@@ -212,7 +238,7 @@ class MetricLogger(object):
         self.iter_end_t = time.time()
         self.log_iters = set()
         self.log_every_iter = False
-    
+
     def update(self, **kwargs):
         # if it != 0 and it not in self.log_iters: return
         for k, v in kwargs.items():
@@ -220,7 +246,7 @@ class MetricLogger(object):
             if hasattr(v, 'item'): v = v.item()
             # assert isinstance(v, (float, int)), type(v)
             self.meters[k].update(v)
-    
+
     def __getattr__(self, attr):
         if attr in self.meters:
             return self.meters[attr]
@@ -228,7 +254,7 @@ class MetricLogger(object):
             return self.__dict__[attr]
         raise AttributeError("'{}' object has no attribute '{}'".format(
             type(self).__name__, attr))
-    
+
     def __str__(self):
         loss_str = []
         for name, meter in self.meters.items():
@@ -237,14 +263,14 @@ class MetricLogger(object):
                     "{}: {}".format(name, str(meter))
                 )
         return '  '.join(loss_str)
-    
+
     def synchronize_between_processes(self):
         for meter in self.meters.values():
             meter.synchronize_between_processes()
-    
+
     def add_meter(self, name, meter):
         self.meters[name] = meter
-    
+
     def log_every(self, start_it, max_iters, itrt, log_freq, log_every_iter=False, header=''):    # also solve logging & skipping iterations before start_it
         start_it = start_it % max_iters
         self.log_iters = set(range(start_it, max_iters, log_freq))
@@ -256,7 +282,7 @@ class MetricLogger(object):
         self.iter_time = SmoothedValue(fmt='{value:.4f}')
         self.data_time = SmoothedValue(fmt='{value:.3f}')
         header_fmt = header + ':  [{0:' + str(len(str(max_iters))) + 'd}/{1}]'
-        
+
         start_time = time.time()
         if isinstance(itrt, Iterator) and not hasattr(itrt, 'preload') and not hasattr(itrt, 'set_epoch'):
             for it in range(start_it, max_iters):
@@ -292,7 +318,7 @@ class NullDDP(torch.nn.Module):
         super(NullDDP, self).__init__()
         self.module = module
         self.require_backward_grad_sync = False
-    
+
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
@@ -311,7 +337,7 @@ def build_2d_sincos_position_embedding(h, w, embed_dim, temperature=10000., sc=0
         scale = 1 / w
     grid_w = scale * grid_w.reshape(h*w, 1) # scale * [0, 0, 0, 1, 1, 1, 2, 2, 2]
     grid_h = scale * grid_h.reshape(h*w, 1) # scale * [0, 1, 2, 0, 1, 2, 0, 1, 2]
-    
+
     assert embed_dim % 4 == 0, f'Embed dimension ({embed_dim}) must be divisible by 4 for 2D sin-cos position embedding!'
     pos_dim = embed_dim // 4
     omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
@@ -328,7 +354,7 @@ if __name__ == '__main__':
     import seaborn as sns
     import matplotlib.pyplot as plt
     cmap_div = sns.color_palette('icefire', as_cmap=True)
-    
+
     scs = [0, 1, 2]
     temps = [20, 50, 100, 1000]
     reso = 3.0
@@ -340,7 +366,7 @@ if __name__ == '__main__':
             hw, C = 16, 512
             N = hw*hw
             pe = build_2d_sincos_position_embedding(hw, C, temperature=temp, sc=sc, verbose=False)[0] # N, C = 64, 16
-            
+
             hw2 = 16
             N2 = hw2*hw2
             pe2 = build_2d_sincos_position_embedding(hw2, C, temperature=temp, sc=sc, verbose=False)[0] # N, C = 64, 16
@@ -370,7 +396,7 @@ if __name__ == '__main__':
             [   sc=2, T=10000    ] dis: ['0.000', '0.000', '0.000', '0.000', '0.000']
             Process finished with exit code 0
             """
-            
+
             pe = torch.from_numpy(cmap_div(pe.T.numpy())[:, :, :3])      # C, N, 3
             tar_h, tar_w = 1024, 1024
             pe = pe.repeat_interleave(tar_w//pe.shape[0], dim=0).repeat_interleave(tar_h//pe.shape[1], dim=1)

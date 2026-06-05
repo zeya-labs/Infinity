@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +17,10 @@ except ImportError:
 # http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
 FID_WEIGHTS_URL = 'https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth'
 
-FID_WEIGHTS_PATH = "/mnt/bn/foundation-vision/binyan.master/checkpoints/pt_inception-2015-12-05-6726825d.pth" # path on maliva
+FID_WEIGHTS_PATH = os.environ.get(
+    "FID_WEIGHTS_PATH",
+    str(Path(__file__).resolve().parents[1] / "weights" / "pt_inception-2015-12-05-6726825d.pth"),
+)
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     """Numpy implementation of the Frechet Distance.

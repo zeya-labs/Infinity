@@ -14,6 +14,19 @@ import torch.multiprocessing as mp
 __rank, __local_rank, __world_size, __device = 0, 0, 1, 'cpu'
 __rank_str_zfill = '0'
 __initialized = False
+DEFAULT_RUN_TRIAL_DIR = os.environ.get("INFINITY_RUN_TRIAL_DIR", os.path.join("/opt", "tiger", "run_trial"))
+
+
+def _link_run_trial_log(fname: str, run_trial_dir: str = DEFAULT_RUN_TRIAL_DIR) -> None:
+    if not os.path.isdir(run_trial_dir):
+        return
+    link_name = os.path.join(run_trial_dir, os.path.basename(fname))
+    try:
+        os.symlink(fname, link_name)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        print(f"[BackupStreamToFile] failed to link log into {run_trial_dir}: {exc}", file=sys.stderr)
 
 
 def initialized():
@@ -34,7 +47,7 @@ def __initialize(fork=False, backend='nccl', gpu_id_if_not_distibuted=0, timeout
     global_rank, num_gpus = int(os.environ['RANK']), torch.cuda.device_count()
     local_rank = global_rank % num_gpus
     torch.cuda.set_device(local_rank)
-    
+
     # ref: https://github.com/open-mmlab/mmcv/blob/master/mmcv/runner/dist_utils.py#L29
     """
     if mp.get_start_method(allow_none=True) is None:
@@ -43,14 +56,14 @@ def __initialize(fork=False, backend='nccl', gpu_id_if_not_distibuted=0, timeout
         mp.set_start_method(method)
     """
     tdist.init_process_group(backend=backend, timeout=datetime.timedelta(seconds=timeout_minutes * 60))
-    
+
     global __rank, __local_rank, __world_size, __initialized, __rank_str_zfill
     __local_rank = local_rank
     __rank, __world_size = tdist.get_rank(), tdist.get_world_size()
     __rank_str_zfill = str(__rank).zfill(len(str(__world_size)))
     __device = torch.device(local_rank)
     __initialized = True
-    
+
     assert tdist.is_initialized(), 'torch.distributed is not initialized!'
     print(f'[lrk={get_local_rank()}, rk={get_rank()}]')
 
@@ -157,17 +170,17 @@ def allgather_diff_shape(t: torch.Tensor, cat=True) -> Union[List[torch.Tensor],
     if __initialized:
         if not t.is_cuda:
             t = t.cuda()
-        
+
         t_size = torch.tensor(t.size(), device=t.device)
         ls_size = [torch.empty_like(t_size) for _ in range(__world_size)]
         tdist.all_gather(ls_size, t_size)
-        
+
         max_B = max(size[0].item() for size in ls_size)
         pad = max_B - t_size[0].item()
         if pad:
             pad_size = (pad, *t.size()[1:])
             t = torch.cat((t, t.new_empty(pad_size)), dim=0)
-        
+
         ls_padded = [torch.empty_like(t) for _ in range(__world_size)]
         tdist.all_gather(ls_padded, t)
         ls = []
@@ -193,7 +206,7 @@ def broadcast(t: torch.Tensor, src_rank) -> None:
 def dist_fmt_vals(val: float, fmt: Union[str, None] = '%.2f') -> Union[torch.Tensor, List]:
     if not initialized():
         return torch.tensor([val]) if fmt is None else [fmt % val]
-    
+
     ts = torch.zeros(__world_size)
     ts[__rank] = val
     allreduce(ts)
@@ -252,7 +265,7 @@ def init_distributed_mode(local_out_path, fork=False, only_sync_master=False, ti
     except RuntimeError as e:
         print(f'{"!"*80}   dist init error (NCCL Error?), stopping training!   {"!"*80}', flush=True)
         raise e
-    
+
     if local_out_path is not None: os.makedirs(local_out_path, exist_ok=True)
     _change_builtin_print(is_local_master())
     if (is_master() if only_sync_master else is_local_master()) and local_out_path is not None and len(local_out_path):
@@ -261,11 +274,11 @@ def init_distributed_mode(local_out_path, fork=False, only_sync_master=False, ti
 
 def _change_builtin_print(is_master):
     import builtins as __builtin__
-    
+
     builtin_print = __builtin__.print
     if type(builtin_print) != type(open):
         return
-    
+
     def prt(*args, **kwargs):
         force = kwargs.pop('force', False)
         clean = kwargs.pop('clean', False)
@@ -280,7 +293,7 @@ def _change_builtin_print(is_master):
                 builtin_print(f'{time_str} ({file_desc}, line{f_back.f_lineno:-4d})=>', *args, **kwargs)
             else:
                 builtin_print(*args, **kwargs)
-    
+
     __builtin__.print = prt
 
 
@@ -295,20 +308,20 @@ class BackupStreamToFile(object):
             time_str = datetime.datetime.now(tz=pytz.timezone('Asia/Shanghai')).strftime('[%m-%d %H:%M:%S]')
             self.file_stream.write('\n'*7 + '='*55 + f'   RESTART {time_str}   ' + '='*55 + '\n')
         self.file_stream.flush()
-        os.system(f'ln -s {fname} /opt/tiger/run_trial/ >/dev/null 2>&1')
+        _link_run_trial_log(fname)
         self.enabled = True
-    
+
     def write(self, message):
         self.terminal_stream.write(message)
         self.file_stream.write(message)
-    
+
     def flush(self):
         self.terminal_stream.flush()
         self.file_stream.flush()
-    
+
     def isatty(self):
         return True
-    
+
     def close(self):
         if not self.enabled:
             return
@@ -321,6 +334,6 @@ class BackupStreamToFile(object):
         else:
             sys.stderr = self.terminal_stream
             sys.stderr.flush()
-    
+
     def __del__(self):
         self.close()

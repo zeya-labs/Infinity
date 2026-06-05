@@ -3,8 +3,8 @@
 infer_eval_image_reward() {
     ${pip_ext} install image-reward pytorch_lightning
     ${pip_ext} install -U timm diffusers
-    ${pip_ext} install openai==1.34.0 
-    ${pip_ext} install httpx==0.20.0 
+    ${pip_ext} install openai==1.34.0
+    ${pip_ext} install httpx==0.20.0
 
     # step 1, infer images
     ${python_ext} evaluation/image_reward/infer4eval.py \
@@ -38,10 +38,21 @@ infer_eval_image_reward() {
 
 infer_eval_hpsv21() {
     ${pip_ext} install hpsv2
-    ${pip_ext}install -U diffusers
+    ${pip_ext} install -U diffusers
     sudo apt install python3-tk
     wget https://dl.fbaipublicfiles.com/mmf/clip/bpe_simple_vocab_16e6.txt.gz
-    mv bpe_simple_vocab_16e6.txt.gz /home/tiger/.local/lib/python3.9/site-packages/hpsv2/src/open_clip
+    hpsv2_open_clip_dir="${HPSV2_OPEN_CLIP_DIR:-$(${python_ext} - <<'PY'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("hpsv2")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("hpsv2 is not importable after installation")
+print(Path(next(iter(spec.submodule_search_locations))) / "src" / "open_clip")
+PY
+)}"
+    mkdir -p "${hpsv2_open_clip_dir}"
+    mv bpe_simple_vocab_16e6.txt.gz "${hpsv2_open_clip_dir}"
 
     mkdir -p ${out_dir}
     ${python_ext} evaluation/hpsv2/eval_hpsv2.py \
@@ -177,8 +188,8 @@ test_val_loss() {
 }
 
 
-python_ext=python3
-pip_ext=pip3
+python_ext="${PYTHON_BIN:-python3}"
+pip_ext="${PIP_BIN:-pip3}"
 
 # set arguments for inference
 pn=1M

@@ -39,10 +39,10 @@ if __name__ == '__main__':
     args.cfg = list(map(float, args.cfg.split(',')))
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
-    
+
     with open(args.metadata_file) as fp:
         metadatas = [json.loads(line) for line in fp]
-    
+
     prompt_rewrite_cache_file = osp.join('evaluation/gen_eval', 'prompt_rewrite_cache.json')
     if osp.exists(prompt_rewrite_cache_file):
         with open(prompt_rewrite_cache_file, 'r') as f:
@@ -91,7 +91,7 @@ if __name__ == '__main__':
                 prompt = input_key_val['prompt']
                 prompt_rewrite_cache[prompt] = prompt
             print(f'old_prompt: {old_prompt}, refined_prompt: {prompt}')
-            
+
         images = []
         for sample_j in range(args.n_samples):
             print(f"Generating {sample_j+1} of {args.n_samples}, prompt={prompt}")
@@ -135,6 +135,6 @@ if __name__ == '__main__':
                 cv2.imwrite(save_file, image.cpu().numpy())
             else:
                 image.save(save_file)
-    
+
         with open(prompt_rewrite_cache_file, 'w') as f:
             json.dump(prompt_rewrite_cache, f, indent=2)

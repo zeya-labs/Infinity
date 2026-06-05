@@ -18,6 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 WEIGHTS_DIR="${WEIGHTS_DIR:-$REPO_ROOT/weights}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/output}"
 
@@ -33,7 +34,7 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 
 mkdir -p "$OUTPUT_DIR"
 
-python "$REPO_ROOT/tools/run_infinity.py" \
+"$PYTHON_BIN" "$REPO_ROOT/tools/run_infinity.py" \
   --pn "$PN" \
   --model_type infinity_8b \
   --checkpoint_type torch_shard \

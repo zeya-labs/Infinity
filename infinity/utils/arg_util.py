@@ -1,7 +1,10 @@
+import ast
+import glob
 import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +16,53 @@ import torch
 from tap import Tap
 
 import infinity.utils.dist as dist
+
+
+def _git_output(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL).decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _default_git_ref() -> str:
+    return _git_output(["git", "symbolic-ref", "--short", "HEAD"]) or _git_output(["git", "rev-parse", "HEAD"]) or "[unknown]"
+
+
+def _parse_legacy_state_dict(text: str) -> dict:
+    filtered = "\n".join(line for line in text.splitlines() if "<bound" not in line and "device(" not in line)
+    try:
+        parsed = json.loads(filtered)
+    except json.JSONDecodeError:
+        expr = ast.parse(filtered, mode="eval").body
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name) and expr.func.id == "OrderedDict":
+            if len(expr.args) != 1 or expr.keywords:
+                raise ValueError("unsupported OrderedDict state format")
+            parsed = OrderedDict(ast.literal_eval(expr.args[0]))
+        else:
+            parsed = ast.literal_eval(expr)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"state dict must be a mapping, got {type(parsed).__name__}")
+    return parsed
+
+
+def _remove_ready_node_markers(*directories: str) -> None:
+    for directory in directories:
+        if not directory:
+            continue
+        for path in glob.glob(os.path.join(directory, "ready-node*")):
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except FileNotFoundError:
+                pass
+
+
+def _ensure_directory(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
 
 
 class Args(Tap):
@@ -155,7 +205,7 @@ class Args(Tap):
     model_init_device: str = 'cuda'     # model_init_device
     prefetch_factor: int = 2            # prefetch_factor for dataset
     apply_spatial_patchify: int = 0     # apply apply_spatial_patchify or not
-    debug_bsc: int = 0                  # save figs and set breakpoint for debug bsc and check input
+    debug_bsc: int = 0                  # save debug figures for bitwise self-correction inputs
     task_type: str = 't2i'              # take type to t2i or t2v
 
 
@@ -165,9 +215,9 @@ class Args(Tap):
 
 
     # would be automatically set in runtime
-    branch: str = subprocess.check_output(f'git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]' # [automatically set; don't specify this]
-    commit_id: str = '' # subprocess.check_output(f'git rev-parse HEAD', shell=True).decode('utf-8').strip() or '[unknown]'  # [automatically set; don't specify this]
-    commit_msg: str = ''# (subprocess.check_output(f'git log -1', shell=True).decode('utf-8').strip().splitlines() or ['[unknown]'])[-1].strip()    # [automatically set; don't specify this]
+    branch: str = _default_git_ref()    # [automatically set; don't specify this]
+    commit_id: str = ''                # [automatically set; don't specify this]
+    commit_msg: str = ''               # [automatically set; don't specify this]
     cmd: str = ' '.join(a.replace('--exp_name=', '').replace('--exp_name ', '') for a in sys.argv[7:])  # [automatically set; don't specify this]
     tag: str = 'UK'                     # [automatically set; don't specify this]
     acc_all: float = None               # [automatically set; don't specify this]
@@ -206,7 +256,7 @@ class Args(Tap):
         if self.dbg_ks:
             if self.dbg_ks_last is None:
                 self.dbg_ks_last = deque(maxlen=6)
-            
+
             from utils.misc import time_str
             self.dbg_ks_fp.seek(0)
             f_back = sys._getframe().f_back
@@ -214,11 +264,11 @@ class Args(Tap):
             info = f'{time_str()} ({file_desc}, line{f_back.f_lineno:-4d})'
             if g_it is not None:
                 info += f'  [g_it: {g_it}]'
-            
+
             self.dbg_ks_last.append(info)
             self.dbg_ks_fp.write('\n'.join(self.dbg_ks_last) + '\n')
             self.dbg_ks_fp.flush()
-    
+
     dbg: bool = 'KEVIN_LOCAL' in os.environ       # only used when debug about unused param in DDP
     ks: bool = False
     nodata: bool = False    # if True, will set nova=True as well
@@ -239,7 +289,7 @@ class Args(Tap):
     # ==================================================================================================================
     # ======================== ignore these parts above since they are only for debug use ==============================
     # ==================================================================================================================
-    
+
     @property
     def gpt_training(self):
         return len(self.model) > 0
@@ -259,7 +309,7 @@ class Args(Tap):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
-    
+
     def get_different_generator_for_each_rank(self) -> Optional[torch.Generator]:   # for random augmentation
         if self.seed is None:
             return None
@@ -275,7 +325,7 @@ class Args(Tap):
             2: 'max-autotune',
             3: 'default',
         }[fast]) if hasattr(torch, 'compile') else m
-    
+
     def dump_log(self):
         if not dist.is_local_master():
             return
@@ -288,7 +338,7 @@ class Args(Tap):
             'acc': self.acc_all, 'acc_r': self.acc_real, 'acc_f': self.acc_fake,
             'weiG': self.last_wei_g if (self.last_wei_g is None or math.isfinite(self.last_wei_g)) else -23333,
             'grad': self.grad_boom,
-            
+
             'cur': self.cur_phase, 'cur_ep': self.cur_ep, 'cur_it': self.cur_it,
             'rema': self.remain_time, 'fini': self.finish_time, 'last_upd': time.strftime("%Y-%m-%d %H:%M", time.localtime()),
             'bsep': f'{self.glb_batch_size}/{self.ep}',
@@ -304,13 +354,13 @@ class Args(Tap):
             nd[k] = v
         if r_trial == trial:
             nd.pop('trial', None)
-        
+
         with open(self.log_txt_path, 'w') as fp:
             json.dump(nd, fp, indent=2)
-    
+
     def touch_log(self):    # listener will kill me if log_txt_path is not updated for 120s
         os.utime(self.log_txt_path) # about 2e-6 sec
-    
+
     def state_dict(self, key_ordered=True) -> Union[OrderedDict, dict]:
         d = (OrderedDict if key_ordered else dict)()
         # self.as_dict() would contain methods, but we only need variables
@@ -318,10 +368,10 @@ class Args(Tap):
             if k not in {'device', 'dbg_ks_fp'}:     # these are not serializable
                 d[k] = getattr(self, k)
         return d
-    
+
     def load_state_dict(self, d: Union[OrderedDict, dict, str]):
         if isinstance(d, str):  # for compatibility with old version
-            d: dict = eval('\n'.join([l for l in d.splitlines() if '<bound' not in l and 'device(' not in l]))
+            d = _parse_legacy_state_dict(d)
         for k in d.keys():
             if k in {'is_large_model', 'gpt_training'}:
                 continue
@@ -330,7 +380,7 @@ class Args(Tap):
             except Exception as e:
                 print(f'k={k}, v={d[k]}')
                 raise e
-    
+
     @staticmethod
     def set_tf32(tf32: bool):
         if torch.cuda.is_available():
@@ -341,7 +391,7 @@ class Args(Tap):
                 print(f'[tf32] [precis] torch.get_float32_matmul_precision(): {torch.get_float32_matmul_precision()}')
             print(f'[tf32] [ conv ] torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}')
             print(f'[tf32] [matmul] torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}')
-    
+
     def __str__(self):
         s = []
         for k in self.class_variables.keys():
@@ -358,40 +408,38 @@ def init_dist_and_get_args():
             break
     args = Args(explicit_bool=True).parse_args(known_only=True)
     args.chunk_nodes = int(os.environ.get('CK', '') or '0')
-    
+
     if len(args.extra_args) > 0 and args.is_master_node == 0:
         print(f'======================================================================================')
         print(f'=========================== WARNING: UNEXPECTED EXTRA ARGS ===========================\n{args.extra_args}')
         print(f'=========================== WARNING: UNEXPECTED EXTRA ARGS ===========================')
         print(f'======================================================================================\n\n')
-    
+
     args.set_tf32(args.tf32)
     if args.dbg:
         torch.autograd.set_detect_anomaly(True)
-    
-    try: os.makedirs(args.bed, exist_ok=True)
-    except: pass
-    try: os.makedirs(args.local_out_path, exist_ok=True)
-    except: pass
-    
+
+    _ensure_directory(args.bed)
+    _ensure_directory(args.local_out_path)
+
     day3 = 60*24*3
     dist.init_distributed_mode(local_out_path=args.local_out_path, fork=False, timeout_minutes=day3 if int(os.environ.get('LONG_DBG', '0') or '0') > 0 else 30)
-    
+
     args.tlen = max(args.tlen, args.nodata_tlen)
     if args.zero and args.tema != 0:
         args.tema = 0
         print(f'======================================================================================')
         print(f'======================== WARNING: args.tema:=0, due to zero={args.zero} ========================')
         print(f'======================================================================================\n\n')
-    
+
     if args.nodata:
         args.nova = True
-    
+
     if not args.tos_profiler_file_prefix.endswith('/'): args.tos_profiler_file_prefix += '/'
-    
+
     if args.alng < 0:
         args.alng = args.aln
-    
+
     args.device = dist.get_device()
     args.r_accu = 1 / args.ac   # gradient accumulation
     args.data_load_reso = None
@@ -399,18 +447,18 @@ def init_dist_and_get_args():
     args.sche = args.sche or ('lin0' if args.gpt_training else 'cos')
     if args.wp == 0:
         args.wp = args.ep * 1/100
-    
+
     di = {
         'b': 'bilinear', 'c': 'bicubic', 'n': 'nearest', 'a': 'area', 'aa': 'area+area',
         'at': 'auto', 'auto': 'auto',
         'v': 'vae',
         'x': 'pix', 'xg': 'pix_glu', 'gx': 'pix_glu', 'g': 'pix_glu'
     }
-    
+
     args.ada = args.ada or ('0.9_0.96' if args.gpt_training else '0.5_0.9')
     args.dada = args.dada or args.ada
     args.opt = args.opt.lower().strip()
-    
+
     if args.lbs:
         bs_per_gpu = args.lbs / args.ac
     else:
@@ -426,13 +474,13 @@ def init_dist_and_get_args():
     args.gwde = args.gwde or args.gwd
     args.dwde = args.dwde or args.dwd
     args.twde = args.twde or args.twd
-    
+
     if args.dbg_modified:
         torch.autograd.set_detect_anomaly(True)
     args.dbg_ks &= dist.is_local_master()
     if args.dbg_ks:
         args.dbg_ks_fp = open(os.path.join(args.local_out_path, 'dbg_ks.txt'), 'w')
-    
+
     # gpt args
     if args.gpt_training:
         assert args.vae_ckpt, 'VAE ckpt must be specified when training GPT'
@@ -443,12 +491,12 @@ def init_dist_and_get_args():
         else:
             args.model_alias = args.model
             args.model = f'infinity_{args.model}'
-    
+
     args.task_id = '123'
     args.trial_id = '123'
     args.robust_run_id = '0'
     args.log_txt_path = os.path.join(args.local_out_path, 'log.txt')
-    
+
     ls = '[]'
     if 'AUTO_RESUME' in os.environ:
         ls.append(int(os.environ['AUTO_RESUME']))
@@ -456,27 +504,27 @@ def init_dist_and_get_args():
     ls = [str(i) for i in ls]
     args.ckpt_trials = ls
     args.real_trial_id = args.trial_id if len(ls) == 0 else str(ls[-1])
-    
+
     args.enable_checkpointing = None if args.enable_checkpointing in [False, 0, "0"] else args.enable_checkpointing
     args.enable_checkpointing = "full-block" if args.enable_checkpointing in [True, 1, "1"] else args.enable_checkpointing
     assert args.enable_checkpointing in [None, "full-block", "full-attn", "self-attn"], \
         f"only support no-checkpointing or full-block/full-attn checkpointing, but got {args.enable_checkpointing}."
-    
+
     if len(args.exp_name) == 0:
         args.exp_name = os.path.basename(args.bed) or 'test_exp'
-    
+
     if '-' in args.exp_name:
         args.tag, args.exp_name = args.exp_name.split('-', maxsplit=1)
     else:
         args.tag = 'UK'
-    
+
     if dist.is_master():
-        os.system(f'rm -rf {os.path.join(args.bed, "ready-node*")} {os.path.join(args.local_out_path, "ready-node*")}')
-    
+        _remove_ready_node_markers(args.bed, args.local_out_path)
+
     if args.sdpa_mem:
         from torch.backends.cuda import enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
         enable_flash_sdp(True)
         enable_mem_efficient_sdp(True)
         enable_math_sdp(False)
-    
+
     return args

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
 # set arguments for inference
 pn=1M
 model_type=infinity_2b
@@ -19,7 +21,7 @@ text_channels=2048
 apply_spatial_patchify=0
 
 # run inference
-python3 tools/run_infinity.py \
+"${PYTHON_BIN}" tools/run_infinity.py \
 --cfg ${cfg} \
 --tau ${tau} \
 --pn ${pn} \
