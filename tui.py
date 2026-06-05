@@ -21,6 +21,16 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import DataTable, Input, Label, ListItem, ListView, SelectionList, Static
 
+from infinity.normal_estimation.defaults import (
+    DEFAULT_HYPERSIM_ROOT,
+    DEFAULT_NORMAL_ESTIMATION_CKPT,
+    DEFAULT_NORMAL_TOKENIZER_CKPT,
+    DEFAULT_NORMAL_TRAIN_DATASETS,
+    DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_VKITTI2_ROOT,
+    LEGACY_NORMAL_TOKENIZER_CKPT,
+)
+
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = str(ROOT / ".venv" / "bin" / "python") if (ROOT / ".venv" / "bin" / "python").exists() else sys.executable
@@ -39,7 +49,7 @@ VOLC_DEFAULT_FLAVOR = os.environ.get("INFINITY_VOLC_FLAVOR", "ml.pni2.28xlarge")
 VOLC_DEFAULT_GPUS = os.environ.get("INFINITY_VOLC_GPUS", "8")
 VOLC_DEFAULT_FRAMEWORK = os.environ.get("INFINITY_VOLC_FRAMEWORK", "Custom")
 VOLC_DEFAULT_REMOTE_ROOT = os.environ.get("INFINITY_VOLC_REMOTE_ROOT", str(ROOT))
-VOLC_LOCAL_VEPFS_ROOT = Path(os.environ.get("INFINITY_VOLC_LOCAL_VEPFS_ROOT", "/root/vepfs"))
+VOLC_LOCAL_VEPFS_ROOT = Path(os.environ.get("INFINITY_VOLC_LOCAL_VEPFS_ROOT", str(ROOT.parent)))
 VOLC_DEFAULT_VEPFS_MOUNT = os.environ.get("INFINITY_VOLC_VEPFS_MOUNT", str(VOLC_LOCAL_VEPFS_ROOT))
 VOLC_DEFAULT_ACTIVE_DEADLINE = os.environ.get("INFINITY_VOLC_ACTIVE_DEADLINE_SECONDS", "432000")
 VOLC_DEFAULT_PREEMPTIBLE = os.environ.get("INFINITY_VOLC_PREEMPTIBLE", "true")
@@ -1189,18 +1199,18 @@ TASKS: list[Task] = [
             Field("gpus", "GPU 数", "8"),
             Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
-            Field("train_datasets", "训练数据集", "hypersim,vkitti2", help="逗号分隔：hypersim,vkitti2"),
-            Field("train_dataset_weights", "数据集采样权重", "hypersim:3,vkitti2:1", help="逗号分隔：hypersim:3,vkitti2:1"),
-            Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
-            Field("vkitti2_root", "VKITTI2 数据目录", "/root/vepfs/Infinity/data/VKITTI2"),
+            Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
+            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:3,vkitti2:1"),
+            Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
+            Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
             Field(
                 "normal_vae",
                 "Normal VAE",
-                "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth",
+                DEFAULT_NORMAL_TOKENIZER_CKPT,
                 choices=(
-                    "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth",
+                    DEFAULT_NORMAL_TOKENIZER_CKPT,
                     "weights/infinity_vae_d32reg.pth",
-                    "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-05-31/15-08-43/checkpoints/best_angle_6.7867.pth",
+                    LEGACY_NORMAL_TOKENIZER_CKPT,
                 ),
             ),
             Field("rgb_vae", "RGB VAE", "weights/infinity_vae_d32reg.pth"),
@@ -1284,10 +1294,10 @@ TASKS: list[Task] = [
                 "",
             ),
             Field("resume_weights_only", "只加载权重", "0", choices=("0", "1")),
-            Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
-            Field("train_datasets", "训练数据集", "hypersim,vkitti2", help="逗号分隔：hypersim,vkitti2"),
-            Field("train_dataset_weights", "数据集采样权重", "hypersim:3,vkitti2:1", help="逗号分隔：hypersim:3,vkitti2:1"),
-            Field("vkitti2_root", "VKITTI2 数据目录", "/root/vepfs/Infinity/data/VKITTI2"),
+            Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
+            Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
+            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:3,vkitti2:1"),
+            Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("train_partition", "Train split", "train"),
             Field("val_partition", "Val split", "val"),
@@ -1366,12 +1376,12 @@ TASKS: list[Task] = [
             Field(
                 "ours_checkpoint",
                 "Ours checkpoint",
-                "/root/vepfs/Infinity/outputs/normal_estimation/2026-06-01/09-27-05/checkpoints/best_angle_18.5532.pth",
+                DEFAULT_NORMAL_ESTIMATION_CKPT,
             ),
             Field(
                 "normal_tokenizer_ckpt",
                 "Normal tokenizer",
-                "/root/vepfs/Infinity/outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth",
+                DEFAULT_NORMAL_TOKENIZER_CKPT,
             ),
             Field("normal_vae_type", "Normal VAE type", "32"),
             Field("ours_seed", "Ours seed", "0"),

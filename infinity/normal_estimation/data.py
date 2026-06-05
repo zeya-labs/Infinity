@@ -203,6 +203,30 @@ def load_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[
     raise ValueError(f"Unsupported normal dataset in metadata: {dataset_name}")
 
 
+def _load_jsonl_manifest(manifest_path: Path, required_fields: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {manifest_path} at line {line_number}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"Manifest record in {manifest_path} at line {line_number} must be a JSON object")
+            missing = [field for field in required_fields if field not in record]
+            if missing:
+                raise ValueError(
+                    f"Manifest record in {manifest_path} at line {line_number} "
+                    f"missing required fields: {missing}"
+                )
+            records.append(record)
+    if not records:
+        raise ValueError(f"Manifest is empty: {manifest_path}")
+    return records
+
+
 class HypersimNormalDataset(Dataset):
     """Read raw Hypersim jpg+hdf5 samples for RGB-to-normal estimation."""
 
@@ -271,21 +295,7 @@ class HypersimNormalDataset(Dataset):
         }
 
     def _metadata_only_sample(self, index: int) -> dict[str, Any]:
-        record = self.records[index]
-        source_index = int(record.get("__original_index", index))
-        image_path = self.root / record["images"]
-        depth_path = self.root / record["depth"]
-        normal_path = self.root / record["normal"]
-        target_hw = _resolve_target_size(768, 1024, self.pn)[:2]
-        metadata = self._metadata_for_record(
-            source_index,
-            record,
-            image_path,
-            depth_path,
-            normal_path,
-            target_hw,
-            original_hw=(768, 1024),
-        )
+        metadata = self.get_metadata(index)
         return {
             "image": torch.empty(0),
             "target": torch.empty(0),
@@ -293,13 +303,13 @@ class HypersimNormalDataset(Dataset):
             "metadata": metadata,
         }
 
-    def load_full_sample(self, index: int) -> dict[str, Any]:
+    def get_metadata(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         source_index = int(record.get("__original_index", index))
         image_path = self.root / record["images"]
         depth_path = self.root / record["depth"]
         normal_path = self.root / record["normal"]
-        metadata = self._metadata_for_record(
+        return self._metadata_for_record(
             source_index,
             record,
             image_path,
@@ -308,6 +318,9 @@ class HypersimNormalDataset(Dataset):
             _resolve_target_size(768, 1024, self.pn)[:2],
             original_hw=(768, 1024),
         )
+
+    def load_full_sample(self, index: int) -> dict[str, Any]:
+        metadata = self.get_metadata(index)
         return load_hypersim_normal_sample_from_metadata(metadata, self.pn)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -337,8 +350,7 @@ class VKITTI2NormalDataset(Dataset):
         self.metadata_only = metadata_only
         self.manifest_path = self._resolve_manifest_path(self.root)
         self.manifest_dir = self.manifest_path.parent
-        with self.manifest_path.open("r", encoding="utf-8") as handle:
-            self.records = [json.loads(line) for line in handle if line.strip()]
+        self.records = _load_jsonl_manifest(self.manifest_path, required_fields=("rgb_path", "normal_path", "mask_path"))
         if max_samples > 0:
             self.records = self.records[:max_samples]
         self.original_hw = self._infer_original_hw()
@@ -387,7 +399,7 @@ class VKITTI2NormalDataset(Dataset):
         return metadata
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        metadata = self._metadata_for_record(index, self.records[index])
+        metadata = self.get_metadata(index)
         if self.metadata_only:
             return {
                 "image": torch.empty(0),
@@ -396,6 +408,9 @@ class VKITTI2NormalDataset(Dataset):
                 "metadata": metadata,
             }
         return load_vkitti2_normal_sample_from_metadata(metadata, self.pn)
+
+    def get_metadata(self, index: int) -> dict[str, Any]:
+        return self._metadata_for_record(index, self.records[index])
 
 
 class NYUv2ParquetNormalDataset(Dataset):

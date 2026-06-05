@@ -1,69 +1,45 @@
-from .modeling import (
-    build_bsq_vae,
-    build_infinity_normal_model,
-    build_multiscale_var_inputs,
-    build_prefix_tokens_from_image,
-    compute_normal_metrics,
-    decode_logits_to_normal,
-    load_infinity_state_dict,
-    normalize_normals,
-    normals_to_vis,
-    resolve_scale_schedule_from_hw,
-)
+from __future__ import annotations
 
-_DATA_EXPORTS = {
-    "HypersimNormalDataset",
-    "NYUv2ParquetNormalDataset",
-    "VKITTI2NormalDataset",
-    "collate_normal_estimation_batch",
-    "load_hypersim_normal_sample_from_metadata",
-    "load_normal_sample_from_metadata",
-    "load_vkitti2_normal_sample_from_metadata",
+from importlib import import_module
+from typing import Any
+
+
+_EXPORT_MODULES = {
+    "HypersimNormalDataset": ".data",
+    "NYUv2ParquetNormalDataset": ".data",
+    "VKITTI2NormalDataset": ".data",
+    "collate_normal_estimation_batch": ".data",
+    "load_hypersim_normal_sample_from_metadata": ".data",
+    "load_normal_sample_from_metadata": ".data",
+    "load_vkitti2_normal_sample_from_metadata": ".data",
+    "GroupedTargetSizeBatchSampler": ".sampling",
+    "RepeatDataset": ".sampling",
+    "build_normal_dataloader": ".sampling",
+    "build_normal_train_dataset": ".sampling",
+    "dataset_metadata_at": ".sampling",
+    "parse_train_dataset_names": ".sampling",
+    "parse_train_dataset_weights": ".sampling",
+    "build_bsq_vae": ".modeling",
+    "build_infinity_normal_model": ".modeling",
+    "build_multiscale_var_inputs": ".modeling",
+    "build_prefix_tokens_from_image": ".modeling",
+    "compute_normal_metrics": ".modeling",
+    "decode_logits_to_normal": ".modeling",
+    "load_infinity_state_dict": ".modeling",
+    "normalize_normals": ".modeling",
+    "normals_to_vis": ".modeling",
+    "resolve_scale_schedule_from_hw": ".modeling",
 }
 
 
-def __getattr__(name: str):
-    if name in _DATA_EXPORTS:
-        from .data import (
-            HypersimNormalDataset,
-            NYUv2ParquetNormalDataset,
-            VKITTI2NormalDataset,
-            collate_normal_estimation_batch,
-            load_hypersim_normal_sample_from_metadata,
-            load_normal_sample_from_metadata,
-            load_vkitti2_normal_sample_from_metadata,
-        )
-
-        exports = {
-            "HypersimNormalDataset": HypersimNormalDataset,
-            "NYUv2ParquetNormalDataset": NYUv2ParquetNormalDataset,
-            "VKITTI2NormalDataset": VKITTI2NormalDataset,
-            "collate_normal_estimation_batch": collate_normal_estimation_batch,
-            "load_hypersim_normal_sample_from_metadata": load_hypersim_normal_sample_from_metadata,
-            "load_normal_sample_from_metadata": load_normal_sample_from_metadata,
-            "load_vkitti2_normal_sample_from_metadata": load_vkitti2_normal_sample_from_metadata,
-        }
-        globals().update(exports)
-        return exports[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def __getattr__(name: str) -> Any:
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(module_name, __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
 
 
-__all__ = [
-    "HypersimNormalDataset",
-    "NYUv2ParquetNormalDataset",
-    "VKITTI2NormalDataset",
-    "build_bsq_vae",
-    "build_infinity_normal_model",
-    "build_multiscale_var_inputs",
-    "build_prefix_tokens_from_image",
-    "collate_normal_estimation_batch",
-    "load_hypersim_normal_sample_from_metadata",
-    "load_normal_sample_from_metadata",
-    "load_vkitti2_normal_sample_from_metadata",
-    "compute_normal_metrics",
-    "decode_logits_to_normal",
-    "load_infinity_state_dict",
-    "normalize_normals",
-    "normals_to_vis",
-    "resolve_scale_schedule_from_hw",
-]
+__all__ = sorted(_EXPORT_MODULES)

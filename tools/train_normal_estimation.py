@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 import hashlib
-import importlib.util
 import json
 import logging
 import math
@@ -12,15 +10,10 @@ import random
 import sys
 import time
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-try:
-    import swanlab
-except ImportError:
-    swanlab = None
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -35,8 +28,7 @@ except ImportError:
     StateDictType = None
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, Subset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision.utils import make_grid, save_image
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -45,7 +37,8 @@ if str(ROOT_DIR) not in sys.path:
 
 from infinity.normal_estimation import (  # noqa: E402
     HypersimNormalDataset,
-    VKITTI2NormalDataset,
+    build_normal_dataloader,
+    build_normal_train_dataset,
     build_bsq_vae,
     build_prefix_tokens_from_image,
     build_infinity_normal_model,
@@ -53,12 +46,25 @@ from infinity.normal_estimation import (  # noqa: E402
     collate_normal_estimation_batch,
     compute_normal_metrics,
     decode_logits_to_normal,
+    dataset_metadata_at,
     load_normal_sample_from_metadata,
     load_infinity_state_dict,
     normals_to_vis,
+    parse_train_dataset_names,
+    parse_train_dataset_weights,
     resolve_scale_schedule_from_hw,
 )
 from infinity.models.infinity import MultipleLayers  # noqa: E402
+from infinity.normal_estimation.defaults import (  # noqa: E402
+    DEFAULT_HYPERSIM_ROOT,
+    DEFAULT_NORMAL_TRAIN_DATASETS,
+    DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_VKITTI2_ROOT,
+)
+from infinity.utils.swanlab_utils import (  # noqa: E402
+    import_swanlab,
+    init_swanlab_run,
+)
 
 
 LOGGER = logging.getLogger("train_normal_estimation")
@@ -68,108 +74,6 @@ FULLSTATE_SAVE_POLICY = (
     if FullStateDictConfig is not None
     else None
 )
-
-
-class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
-    def __init__(
-        self,
-        dataset: Dataset,
-        *,
-        batch_size: int,
-        shuffle: bool,
-        drop_last: bool,
-        distributed: bool,
-        seed: int,
-        rank: int,
-        world_size: int,
-        dataset_weights: dict[str, float] | None = None,
-    ) -> None:
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self.distributed = distributed
-        self.seed = seed
-        self.rank = rank
-        self.world_size = world_size
-        self.dataset_weights = dataset_weights or {}
-        self.epoch = 0
-        self.groups = self._build_groups()
-
-    def _build_groups(self) -> dict[tuple[str, int, int], list[int]]:
-        groups: dict[tuple[str, int, int], list[int]] = {}
-        for index in range(len(self.dataset)):
-            metadata = dataset_metadata_at(self.dataset, index)
-            target_height, target_width = (int(item) for item in metadata["target_size"])
-            key = (str(metadata.get("dataset", "unknown")).lower(), target_height, target_width)
-            groups.setdefault(key, []).append(index)
-        return groups
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
-
-    def _group_batches(self) -> dict[tuple[str, int, int], list[list[int]]]:
-        rng = random.Random(self.seed + self.epoch)
-        group_batches: dict[tuple[str, int, int], list[list[int]]] = {}
-        for key in sorted(self.groups):
-            indices = list(self.groups[key])
-            if self.shuffle:
-                rng.shuffle(indices)
-            batches = []
-            for offset in range(0, len(indices), self.batch_size):
-                batch = indices[offset : offset + self.batch_size]
-                if len(batch) == self.batch_size or (batch and not self.drop_last):
-                    batches.append(batch)
-            if self.shuffle:
-                rng.shuffle(batches)
-            group_batches[key] = batches
-        return group_batches
-
-    def _weighted_group_pattern(self, keys: list[tuple[str, int, int]]) -> list[tuple[str, int, int]]:
-        if not self.dataset_weights:
-            return keys
-        pattern: list[tuple[str, int, int]] = []
-        for key in keys:
-            dataset_name = key[0]
-            weight = self.dataset_weights.get(dataset_name, 1.0)
-            repeats = max(1, int(round(weight)))
-            pattern.extend([key] * repeats)
-        return pattern or keys
-
-    def _all_batches(self) -> list[list[int]]:
-        group_batches = self._group_batches()
-        keys = [key for key in sorted(group_batches) if group_batches[key]]
-        pattern = self._weighted_group_pattern(keys)
-        if not pattern:
-            return []
-
-        batches: list[list[int]] = []
-        cursor = 0
-        empty_rounds = 0
-        while keys and empty_rounds < len(pattern):
-            key = pattern[cursor % len(pattern)]
-            cursor += 1
-            available = group_batches.get(key, [])
-            needed = self.world_size if self.distributed else 1
-            if len(available) < needed:
-                empty_rounds += 1
-                continue
-            empty_rounds = 0
-            for _ in range(needed):
-                batches.append(available.pop())
-        return batches
-
-    def __iter__(self):
-        batches = self._all_batches()
-        if self.distributed:
-            batches = batches[self.rank :: self.world_size]
-        return iter(batches)
-
-    def __len__(self) -> int:
-        batches = self._all_batches()
-        if self.distributed:
-            return len(batches[self.rank :: self.world_size])
-        return len(batches)
 FULLOPTSTATE_SAVE_POLICY = (
     FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
     if FullOptimStateDictConfig is not None
@@ -179,20 +83,20 @@ FULLOPTSTATE_SAVE_POLICY = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Infinity for RGB-to-normal estimation on raw Hypersim.")
-    parser.add_argument("--data-root", type=str, default="/root/vepfs/Infinity/data/hypersim/processed/hypersim")
+    parser.add_argument("--data-root", type=str, default=DEFAULT_HYPERSIM_ROOT)
     parser.add_argument(
         "--train-datasets",
         type=str,
-        default="hypersim",
+        default=DEFAULT_NORMAL_TRAIN_DATASETS,
         help="Comma-separated train datasets. Supported: hypersim,vkitti2.",
     )
     parser.add_argument(
         "--train-dataset-weights",
         type=str,
-        default="",
+        default=DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
         help="Comma-separated dataset sampling weights, e.g. hypersim:3,vkitti2:1. Empty uses 1 for each train dataset.",
     )
-    parser.add_argument("--vkitti2-root", type=str, default="/root/vepfs/Infinity/data/VKITTI2")
+    parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--init-model", type=str, default="")
@@ -510,137 +414,6 @@ def reduce_timing_dict(timings: dict[str, float], distributed: bool, device: tor
     values = torch.tensor([timings[key] for key in keys], dtype=torch.float64, device=device)
     dist.all_reduce(values, op=dist.ReduceOp.MAX)
     return {key: float(value) for key, value in zip(keys, values.tolist())}
-
-
-def make_dataloader(
-    dataset: Dataset,
-    *,
-    batch_size: int,
-    num_workers: int,
-    prefetch_factor: int,
-    distributed: bool,
-    rank: int = 0,
-    world_size: int = 1,
-    shuffle: bool,
-    drop_last: bool,
-    group_by_target_size: bool = False,
-    dataset_weights: dict[str, float] | None = None,
-) -> tuple[DataLoader, Sampler | None]:
-    if group_by_target_size:
-        batch_sampler = GroupedTargetSizeBatchSampler(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            drop_last=drop_last,
-            distributed=distributed,
-            seed=0,
-            rank=rank,
-            world_size=world_size,
-            dataset_weights=dataset_weights,
-        )
-        kwargs: dict[str, Any] = {
-            "dataset": dataset,
-            "batch_sampler": batch_sampler,
-            "num_workers": num_workers,
-            "pin_memory": torch.cuda.is_available(),
-            "collate_fn": collate_normal_estimation_batch,
-        }
-        if num_workers > 0:
-            kwargs["persistent_workers"] = True
-            kwargs["prefetch_factor"] = prefetch_factor
-        return DataLoader(**kwargs), batch_sampler
-
-    sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last) if distributed else None
-    kwargs: dict[str, Any] = {
-        "dataset": dataset,
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "pin_memory": torch.cuda.is_available(),
-        "drop_last": drop_last,
-        "collate_fn": collate_normal_estimation_batch,
-        "sampler": sampler,
-        "shuffle": False if sampler is not None else shuffle,
-    }
-    if num_workers > 0:
-        kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = prefetch_factor
-    return DataLoader(**kwargs), sampler
-
-
-def dataset_metadata_at(dataset: Dataset, index: int) -> dict[str, Any]:
-    if isinstance(dataset, Subset):
-        return dataset_metadata_at(dataset.dataset, int(dataset.indices[index]))
-    if isinstance(dataset, ConcatDataset):
-        dataset_index = bisect.bisect_right(dataset.cumulative_sizes, index)
-        sample_index = index if dataset_index == 0 else index - dataset.cumulative_sizes[dataset_index - 1]
-        return dataset_metadata_at(dataset.datasets[dataset_index], sample_index)
-    if isinstance(dataset, HypersimNormalDataset):
-        return dataset._metadata_only_sample(index)["metadata"]
-    if isinstance(dataset, VKITTI2NormalDataset):
-        return dataset._metadata_for_record(index, dataset.records[index])
-    sample = dataset[index]
-    return sample["metadata"]
-
-
-def parse_train_dataset_names(value: str) -> list[str]:
-    names = [item.strip().lower() for item in value.replace(";", ",").split(",") if item.strip()]
-    if not names:
-        raise ValueError("--train-datasets must include at least one dataset")
-    supported = {"hypersim", "vkitti2"}
-    unknown = sorted(set(names) - supported)
-    if unknown:
-        raise ValueError(f"Unsupported --train-datasets entries: {unknown}. Supported: {sorted(supported)}")
-    return names
-
-
-def parse_train_dataset_weights(value: str, dataset_names: list[str]) -> dict[str, float]:
-    weights = {name: 1.0 for name in dataset_names}
-    if not value.strip():
-        return weights
-    for item in value.replace(";", ",").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if ":" not in item:
-            raise ValueError(f"Invalid --train-dataset-weights item {item!r}; expected name:weight")
-        name, raw_weight = item.split(":", 1)
-        name = name.strip().lower()
-        if name not in weights:
-            raise ValueError(f"Weight specified for dataset {name!r}, but --train-datasets={dataset_names}")
-        weight = float(raw_weight)
-        if weight <= 0:
-            raise ValueError(f"Dataset weight must be > 0 for {name}, got {weight}")
-        weights[name] = weight
-    return weights
-
-
-def build_train_dataset(args: argparse.Namespace) -> Dataset:
-    metadata_only = args.token_cache_metadata_only and token_cache_enabled(args)
-    datasets: list[Dataset] = []
-    for name in parse_train_dataset_names(args.train_datasets):
-        if name == "hypersim":
-            datasets.append(
-                HypersimNormalDataset(
-                    root=args.data_root,
-                    partition=args.train_partition,
-                    pn=args.pn,
-                    max_samples=args.max_train_samples,
-                    metadata_only=metadata_only,
-                )
-            )
-        elif name == "vkitti2":
-            datasets.append(
-                VKITTI2NormalDataset(
-                    root=args.vkitti2_root,
-                    partition=args.train_partition,
-                    pn=args.pn,
-                    max_samples=args.max_train_samples,
-                    metadata_only=metadata_only,
-                )
-            )
-    if len(datasets) == 1:
-        return datasets[0]
-    return ConcatDataset(datasets)
 
 
 def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace, total_steps: int) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
@@ -981,135 +754,21 @@ def clip_grad_norm(model: torch.nn.Module, max_norm: float) -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
 
-def build_swanlab_experiment_name(args: argparse.Namespace, output_dir: Path) -> str:
-    if args.swanlab_experiment_name:
-        return args.swanlab_experiment_name
-    if output_dir.parent.name and output_dir.parent.name != output_dir.anchor:
-        return f"{args.swanlab_job_type}_{output_dir.parent.name}_{output_dir.name}"
-    return f"{args.swanlab_job_type}_{output_dir.name}"
-
-
-def swanlab_state_path(output_dir: Path) -> Path:
-    return output_dir / "swanlab_run.json"
-
-
-def find_swanlab_local_run_dir(logdir: Path, run_id: str, state: dict[str, Any]) -> Path | None:
-    saved = str(state.get("local_run_dir", "")).strip()
-    if saved and Path(saved).is_dir():
-        return Path(saved)
-    if not run_id:
-        return None
-    matches = sorted(logdir.glob(f"run-*-{run_id}"))
-    return matches[-1] if matches else None
-
-
-@contextmanager
-def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
-    if not run_id or run_dir is None:
-        yield
-        return
-    try:
-        import swanlab.data.callbacker.local as swanlab_local
-        import swanlab.data.sdk as swanlab_sdk
-    except Exception:
-        yield
-        return
-
-    parts = run_dir.name.split("-")
-    if len(parts) < 3:
-        yield
-        return
-    try:
-        fixed_now = datetime.strptime(parts[1], "%Y%m%d_%H%M%S")
-    except ValueError:
-        yield
-        return
-
-    original_generate_run_id = swanlab_local.N.generate_run_id
-    original_datetime = swanlab_sdk.datetime
-    original_mkdir = swanlab_sdk.os.mkdir
-    target_run_dir = run_dir.resolve()
-
-    class FixedDatetime:
-        @classmethod
-        def now(cls):
-            return fixed_now
-
-    def mkdir_existing_run(path, mode=0o777, *args, **kwargs):
-        if Path(path).resolve() == target_run_dir and target_run_dir.is_dir():
-            return None
-        return original_mkdir(path, mode, *args, **kwargs)
-
-    swanlab_local.N.generate_run_id = lambda: run_id
-    swanlab_sdk.datetime = FixedDatetime
-    swanlab_sdk.os.mkdir = mkdir_existing_run
-    try:
-        yield
-    finally:
-        swanlab_local.N.generate_run_id = original_generate_run_id
-        swanlab_sdk.datetime = original_datetime
-        swanlab_sdk.os.mkdir = original_mkdir
-
-
 def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> Any | None:
-    if not enabled or args.swanlab_mode == "disabled":
-        return None
-    if args.swanlab_mode == "local" and importlib.util.find_spec("swanboard") is None:
-        LOGGER.warning("Disabled SwanLab local mode because swanboard is not installed.")
-        return None
-    if swanlab is None:
-        raise ImportError("swanlab is not installed, but SwanLab logging is enabled.")
-
-    state_path = swanlab_state_path(output_dir)
-    state: dict[str, Any] = {}
-    run_id = ""
-    if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        run_id = str(state.get("run_id", "")).strip()
-
-    logdir = Path(args.swanlab_logdir) if args.swanlab_logdir else output_dir / "swanlab"
-    logdir.mkdir(parents=True, exist_ok=True)
-
-    init_kwargs: dict[str, Any] = {
-        "project": args.swanlab_project,
-        "experiment_name": build_swanlab_experiment_name(args, output_dir),
-        "job_type": args.swanlab_job_type,
-        "tags": list(args.swanlab_tags),
-        "config": vars(args),
-        "logdir": str(logdir),
-        "mode": args.swanlab_mode,
-        "reinit": True,
-    }
-    workspace = args.swanlab_workspace.strip()
-    if workspace:
-        init_kwargs["workspace"] = workspace
-    if run_id and args.swanlab_mode == "cloud":
-        init_kwargs["id"] = run_id
-        init_kwargs["resume"] = "allow"
-
-    local_run_dir = find_swanlab_local_run_dir(logdir, run_id, state) if args.swanlab_mode == "local" else None
-    with swanlab_local_resume_patch(logdir, run_id, local_run_dir):
-        try:
-            run = swanlab.init(**init_kwargs)
-        except Exception:
-            LOGGER.exception("SwanLab init failed mode=%s logdir=%s", args.swanlab_mode, logdir)
-            raise
-    run_public = getattr(run, "public", None)
-    current_run_id = str(getattr(run_public, "run_id", "")).strip()
-    current_run_dir = str(getattr(run_public, "run_dir", "")).strip()
-    state_payload = {
-        "project": args.swanlab_project,
-        "workspace": workspace,
-        "experiment_name": build_swanlab_experiment_name(args, output_dir),
-        "mode": args.swanlab_mode,
-        "logdir": str(logdir),
-    }
-    if current_run_id:
-        state_payload["run_id"] = current_run_id
-    if args.swanlab_mode == "local" and current_run_dir:
-        state_payload["local_run_dir"] = current_run_dir
-    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return run
+    return init_swanlab_run(
+        output_dir=output_dir,
+        enabled=enabled,
+        mode=args.swanlab_mode,
+        project=args.swanlab_project,
+        workspace=args.swanlab_workspace,
+        experiment_name=args.swanlab_experiment_name,
+        job_type=args.swanlab_job_type,
+        tags=list(args.swanlab_tags),
+        config=vars(args),
+        logdir=args.swanlab_logdir,
+        require_swanboard_for_local=True,
+        logger=LOGGER,
+    )
 
 
 def save_visuals(
@@ -1152,13 +811,14 @@ def save_visuals(
     save_image(angle_grid, image_dir / f"{stage}_normal_angle_step_{step:07d}.png")
     save_image(compare, image_dir / f"{stage}_compare_step_{step:07d}.png")
     if swanlab_run is not None:
+        swanlab_module = import_swanlab()
         swanlab_run.log(
             {
-                f"{stage}/rgb": swanlab.Image(image_grid),
-                f"{stage}/normal_gt": swanlab.Image(target_grid),
-                f"{stage}/normal_pred": swanlab.Image(prediction_grid),
-                f"{stage}/normal_angle": swanlab.Image(angle_grid),
-                f"{stage}/compare": swanlab.Image(compare),
+                f"{stage}/rgb": swanlab_module.Image(image_grid),
+                f"{stage}/normal_gt": swanlab_module.Image(target_grid),
+                f"{stage}/normal_pred": swanlab_module.Image(prediction_grid),
+                f"{stage}/normal_angle": swanlab_module.Image(angle_grid),
+                f"{stage}/compare": swanlab_module.Image(compare),
             },
             step=step,
         )
@@ -1631,7 +1291,15 @@ def main() -> int:
         with timed_stage(init_timings if args.profile_timings else None, "dataset_loader", device):
             train_dataset_names = parse_train_dataset_names(args.train_datasets)
             train_dataset_weights = parse_train_dataset_weights(args.train_dataset_weights, train_dataset_names)
-            train_dataset = build_train_dataset(args)
+            train_dataset = build_normal_train_dataset(
+                train_datasets=args.train_datasets,
+                hypersim_root=args.data_root,
+                vkitti2_root=args.vkitti2_root,
+                partition=args.train_partition,
+                pn=args.pn,
+                max_samples=args.max_train_samples,
+                metadata_only=args.token_cache_metadata_only and token_cache_enabled(args),
+            )
             if rank == 0:
                 LOGGER.info(
                     "train_datasets=%s train_dataset_weights=%s",
@@ -1665,7 +1333,7 @@ def main() -> int:
             train_shuffle = not args.token_cache_filter_missing
             if rank == 0 and not train_shuffle:
                 LOGGER.info("Disabled train shuffle because --token-cache-filter-missing is enabled.")
-            train_loader, train_sampler = make_dataloader(
+            train_loader, train_sampler = build_normal_dataloader(
                 train_dataset,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
@@ -1675,10 +1343,12 @@ def main() -> int:
                 world_size=world_size,
                 shuffle=train_shuffle,
                 drop_last=True,
+                collate_fn=collate_normal_estimation_batch,
+                pin_memory=torch.cuda.is_available(),
                 group_by_target_size=True,
                 dataset_weights=train_dataset_weights,
             )
-            val_loader, _ = make_dataloader(
+            val_loader, _ = build_normal_dataloader(
                 val_dataset,
                 batch_size=args.val_batch_size,
                 num_workers=args.num_workers,
@@ -1688,10 +1358,12 @@ def main() -> int:
                 world_size=world_size,
                 shuffle=False,
                 drop_last=False,
+                collate_fn=collate_normal_estimation_batch,
+                pin_memory=torch.cuda.is_available(),
             )
             ar_val_loader = None
             if ar_val_dataset is not None:
-                ar_val_loader, _ = make_dataloader(
+                ar_val_loader, _ = build_normal_dataloader(
                     ar_val_dataset,
                     batch_size=args.val_batch_size,
                     num_workers=args.num_workers,
@@ -1701,6 +1373,8 @@ def main() -> int:
                     world_size=world_size,
                     shuffle=False,
                     drop_last=False,
+                    collate_fn=collate_normal_estimation_batch,
+                    pin_memory=torch.cuda.is_available(),
                 )
 
         with timed_stage(init_timings if args.profile_timings else None, "vae_load", device):
