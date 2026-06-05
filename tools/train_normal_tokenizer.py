@@ -32,6 +32,7 @@ from infinity.normal_estimation import (
     build_normal_train_dataset,
     parse_train_dataset_names,
     parse_train_dataset_weights,
+    resolve_checkpoint_resume_path,
     require_positive_steps_per_epoch,
 )
 from infinity.normal_estimation.defaults import (  # noqa: E402
@@ -531,13 +532,11 @@ def build_loader(
 
 
 def auto_resume_path(output_dir: Path, resume_arg: str) -> Path | None:
-    if resume_arg:
-        requested = Path(resume_arg)
-        if not requested.is_file():
-            raise FileNotFoundError(f"--resume checkpoint not found: {requested}")
-        return requested
-    candidate = output_dir / "checkpoints" / "last.pth"
-    return candidate if candidate.exists() else None
+    return resolve_checkpoint_resume_path(
+        output_dir=output_dir,
+        resume_arg=resume_arg,
+        auto_checkpoint_names=("last.pth",),
+    )
 
 
 def save_checkpoint(

@@ -8,18 +8,29 @@ from unittest import mock
 
 import torch
 
-from tools.train_normal_tokenizer import auto_resume_path, save_checkpoint
+from infinity.normal_estimation.checkpoints import resolve_checkpoint_resume_path
+from tools.train_normal_tokenizer import save_checkpoint
 
 
 class NormalTokenizerCheckpointTest(unittest.TestCase):
     def test_explicit_missing_resume_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaisesRegex(FileNotFoundError, "--resume checkpoint not found"):
-                auto_resume_path(Path(tmpdir), str(Path(tmpdir) / "missing.pth"))
+                resolve_checkpoint_resume_path(
+                    output_dir=Path(tmpdir),
+                    resume_arg=str(Path(tmpdir) / "missing.pth"),
+                    auto_checkpoint_names=("last.pth",),
+                )
 
     def test_auto_resume_missing_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            self.assertIsNone(auto_resume_path(Path(tmpdir), ""))
+            self.assertIsNone(
+                resolve_checkpoint_resume_path(
+                    output_dir=Path(tmpdir),
+                    resume_arg="",
+                    auto_checkpoint_names=("last.pth",),
+                )
+            )
 
     def test_save_checkpoint_uses_atomic_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -5,6 +5,7 @@ from typing import Any
 
 
 _EXPORT_MODULES = {
+    "resolve_checkpoint_resume_path": ".checkpoints",
     "HypersimNormalDataset": ".data",
     "NYUv2ParquetNormalDataset": ".data",
     "VKITTI2NormalDataset": ".data",

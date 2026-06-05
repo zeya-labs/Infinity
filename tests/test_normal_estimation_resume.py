@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.train_normal_estimation import resolve_resume_path
+from infinity.normal_estimation.checkpoints import resolve_checkpoint_resume_path
 
 
 class NormalEstimationResumeTest(unittest.TestCase):
@@ -18,22 +17,36 @@ class NormalEstimationResumeTest(unittest.TestCase):
             last.write_bytes(b"last")
             last_step.write_bytes(b"last-step")
 
-            args = argparse.Namespace(output_dir=tmpdir, resume=str(last))
-
-            self.assertEqual(resolve_resume_path(args), last_step)
+            self.assertEqual(
+                resolve_checkpoint_resume_path(
+                    output_dir=Path(tmpdir),
+                    resume_arg=str(last),
+                    auto_checkpoint_names=("last_step.pth", "last.pth"),
+                    prefer_step_checkpoint_for_last=True,
+                ),
+                last_step,
+            )
 
     def test_explicit_missing_resume_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            args = argparse.Namespace(output_dir=tmpdir, resume=str(Path(tmpdir) / "missing.pth"))
-
             with self.assertRaisesRegex(FileNotFoundError, "--resume checkpoint not found"):
-                resolve_resume_path(args)
+                resolve_checkpoint_resume_path(
+                    output_dir=Path(tmpdir),
+                    resume_arg=str(Path(tmpdir) / "missing.pth"),
+                    auto_checkpoint_names=("last_step.pth", "last.pth"),
+                    prefer_step_checkpoint_for_last=True,
+                )
 
     def test_auto_resume_missing_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            args = argparse.Namespace(output_dir=tmpdir, resume="")
-
-            self.assertIsNone(resolve_resume_path(args))
+            self.assertIsNone(
+                resolve_checkpoint_resume_path(
+                    output_dir=Path(tmpdir),
+                    resume_arg="",
+                    auto_checkpoint_names=("last_step.pth", "last.pth"),
+                    prefer_step_checkpoint_for_last=True,
+                )
+            )
 
 
 if __name__ == "__main__":

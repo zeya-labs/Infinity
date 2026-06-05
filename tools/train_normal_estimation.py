@@ -52,6 +52,7 @@ from infinity.normal_estimation import (  # noqa: E402
     normals_to_vis,
     parse_train_dataset_names,
     parse_train_dataset_weights,
+    resolve_checkpoint_resume_path,
     require_positive_steps_per_epoch,
     resolve_scale_schedule_from_hw,
 )
@@ -866,21 +867,12 @@ def save_checkpoint(
 
 
 def resolve_resume_path(args: argparse.Namespace) -> Path | None:
-    checkpoint_dir = Path(args.output_dir) / "checkpoints"
-    if args.resume:
-        requested = Path(args.resume)
-        if requested.name == "last.pth":
-            step_checkpoint = requested.with_name("last_step.pth")
-            if step_checkpoint.is_file():
-                return step_checkpoint
-        if requested.is_file():
-            return requested
-        raise FileNotFoundError(f"--resume checkpoint not found: {requested}")
-
-    for candidate in (checkpoint_dir / "last_step.pth", checkpoint_dir / "last.pth"):
-        if candidate.is_file():
-            return candidate
-    return None
+    return resolve_checkpoint_resume_path(
+        output_dir=Path(args.output_dir),
+        resume_arg=args.resume,
+        auto_checkpoint_names=("last_step.pth", "last.pth"),
+        prefer_step_checkpoint_for_last=True,
+    )
 
 
 def maybe_resume(
