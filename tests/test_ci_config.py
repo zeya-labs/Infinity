@@ -193,7 +193,7 @@ class CiConfigTest(unittest.TestCase):
         self.assertIn('PYTHON_BIN="${PYTHON_BIN:-python}"', check_script)
         self.assertIn('"${PYTHON_BIN}" scripts/check_repo.py', check_script)
         self.assertIn('"${PYTHON_BIN}" -m unittest discover -s tests', check_script)
-        self.assertIn('"${PYTHON_BIN}" -m ruff check --select F821,B018,B905 .', check_script)
+        self.assertIn('"${PYTHON_BIN}" -m ruff check --select F821,B018,B905,SIM910 .', check_script)
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", check_script)
         self.assertIn("git diff --check", check_script)
         self.assertIn("tomllib.load", check_repo)

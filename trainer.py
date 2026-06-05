@@ -400,13 +400,13 @@ class InfinityTrainer(object):
                     print(f'[VGPTTr.load_state_dict] gpt_ema_for_vis: key NOT FOUND in state!!')
 
         config: dict = state.pop('config', None)
-        self.prog_it = config.get('prog_it', 0)
-        self.last_prog_si = config.get('last_prog_si', -1)
-        self.first_prog = config.get('first_prog', True)
         if config is not None:
+            self.prog_it = config.get('prog_it', 0)
+            self.last_prog_si = config.get('last_prog_si', -1)
+            self.first_prog = config.get('first_prog', True)
             for k, v in self.get_config().items():
-                if config.get(k, None) != v:
-                    err = f'[VGPT.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
+                if config.get(k) != v:
+                    err = f'[VGPT.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k)})'
                     if strict:
                         raise AttributeError(err)
                     else:
