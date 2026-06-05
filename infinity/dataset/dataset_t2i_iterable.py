@@ -37,7 +37,7 @@ def center_crop_to_tensor_pm1(pil_image, mid_reso: int, final_reso: int):
         pil_image = pil_image.resize(
             tuple(x // 2 for x in pil_image.size), resample=PImage.BOX
         )
-    
+
     if mid_reso == final_reso == pil_image.size[0] == pil_image.size[1]:
         im = to_tensor(pil_image)
     else:
@@ -46,14 +46,14 @@ def center_crop_to_tensor_pm1(pil_image, mid_reso: int, final_reso: int):
         pil_image = pil_image.resize(
             tuple(round(x * scale) for x in pil_image.size), resample=PImage.LANCZOS
         )
-        
+
         # crop the center out
         arr = np.array(pil_image)
         crop_y = (arr.shape[0] - final_reso) // 2
         crop_x = (arr.shape[1] - final_reso) // 2
         # return PImage.fromarray(arr[crop_y: crop_y + final_reso, crop_x: crop_x + final_reso])
         im = to_tensor(arr[crop_y: crop_y + final_reso, crop_x: crop_x + final_reso])
-    
+
     return im.add(im).add_(-1)
 
 def transform(pil_img, tgt_h, tgt_w):
@@ -83,13 +83,13 @@ def process_short_text(short_text):
 
 class T2IIterableDataset(IterableDataset):
     def __init__(
-        self, 
-        meta_folder: str, 
-        max_caption_len=512, 
-        short_prob=0.2, 
+        self,
+        meta_folder: str,
+        max_caption_len=512,
+        short_prob=0.2,
         load_vae_instead_of_image=False,
         buffersize: int = 10000,
-        seed: int = 0, 
+        seed: int = 0,
         pn: str = '',
         online_t5: bool = True,
         batch_size: int = 2,
@@ -159,17 +159,23 @@ class T2IIterableDataset(IterableDataset):
         def split_and_sleep(generator_info):
             missing, chunk_id2save_files = get_part_jsonls(generator_info['filepath'], generator_info['num_of_samples'], parts=self.num_replicas)
             if missing:
-                tdist.barrier()
+                self._barrier_if_distributed()
                 if self.rank == 0:
                     split_large_txt_files(generator_info['filepath'], chunk_id2save_files)
+                elif not self._distributed_ready():
+                    raise RuntimeError(
+                        "missing split meta files require rank0 preprocessing, "
+                        f"but distributed is not initialized for rank {self.rank}"
+                    )
                 else:
                     sleep_time = int(generator_info['num_of_samples'] / 30000000 * 10)
                     print(f'[data preprocess] sleep {sleep_time} minutes awaiting rank0 split_meta_files...')
                     time.sleep(sleep_time*60)
-                tdist.barrier()
+                self._barrier_if_distributed()
             generator_info['part_filepaths'] = sorted(list(chunk_id2save_files.values()))
             return generator_info
 
+        failures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()) as executor:
             futures = {executor.submit(split_and_sleep, generator_info): h_div_w_template for h_div_w_template, generator_info in self.h_div_w_template2generator.items()}
             for future in concurrent.futures.as_completed(futures):
@@ -177,9 +183,23 @@ class T2IIterableDataset(IterableDataset):
                 try:
                     self.h_div_w_template2generator[h_div_w_template] = future.result()
                 except Exception as exc:
-                    print(f'[data preprocess] h_div_w_template {h_div_w_template} generated an exception: {exc}')
+                    failures.append((h_div_w_template, exc))
+
+        if failures:
+            message = "; ".join(
+                f"h_div_w_template {h_div_w_template}: {exc}" for h_div_w_template, exc in failures
+            )
+            raise RuntimeError(f"[data preprocess] split_meta_files failed: {message}") from failures[0][1]
 
         print('[data preprocess] split_meta_files done')
+
+    @staticmethod
+    def _distributed_ready():
+        return tdist.is_available() and tdist.is_initialized()
+
+    def _barrier_if_distributed(self):
+        if self._distributed_ready():
+            tdist.barrier()
 
     def set_global_worker_id(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -193,15 +213,15 @@ class T2IIterableDataset(IterableDataset):
         self.worker_id = worker_id
         self.global_worker_id = self.rank * self.dataloader_workers + worker_id
         # print(f'Set worker_id to {self.worker_id}, global_worker_id to {self.global_worker_id}')
-    
+
     def set_epoch(self, epoch):
         self.epoch = epoch
         self.set_generator()
-    
+
     def set_generator(self, ):
         self.epoch_worker_generator = np.random.default_rng(self.seed + self.epoch + self.worker_id)
         self.epoch_global_worker_generator = np.random.default_rng(self.seed + self.epoch + self.global_worker_id)
-    
+
     def get_h_div_w_template_2_unlearned_batches(self,):
         h_div_w_template_2_unlearned_batches = {}
         total_unlearned_batches = 0
@@ -232,7 +252,7 @@ class T2IIterableDataset(IterableDataset):
     def __iter__(self):
         self.set_global_worker_id()
         self.set_generator()
-        
+
         for h_div_w_template, generator_info in self.h_div_w_template2generator.items():
             proportion = generator_info['num_of_batches'] / self.samples_div_gpus_workers_batchsize_2batches
             h_div_w_buffer_size = int(self.buffer_size * proportion)
@@ -243,7 +263,7 @@ class T2IIterableDataset(IterableDataset):
             for _ in range(h_div_w_buffer_size):
                 mem_buffer.append(self.infinite_next(generator_info))
             generator_info['mem_buffer'] = mem_buffer
-        
+
         next_h_div_w_template_iter = self._next_h_div_w_template()
         # while True:
         for _ in range(self.samples_div_gpus_workers_batchsize_2batches):
@@ -272,7 +292,7 @@ class T2IIterableDataset(IterableDataset):
             del batch_data
             del images
             del captions
-    
+
     def infinite_next(self, generator_info):
         try:
             if 'sub_iterator' not in generator_info:
@@ -292,7 +312,7 @@ class T2IIterableDataset(IterableDataset):
 
     def __len__(self):
         return self.samples_div_gpus_workers_batchsize_2batches * self.dataloader_workers
-    
+
     def total_samples(self):
         return self.samples_div_gpus_workers_batchsize_2batches * self.dataloader_workers * self.num_replicas * self.batch_size
 
@@ -369,14 +389,14 @@ if __name__ == '__main__':
     batch_size = 2
     dataloader_workers = 12
     dataset = T2IIterableDataset(
-        args=None, 
+        args=None,
         meta_folder='data/train_splits/xxx_pretrain/jsonl_files_filter_duplicate_captions',
-        data_load_reso=None, 
-        max_caption_len=512, 
-        short_prob=1.0, 
+        data_load_reso=None,
+        max_caption_len=512,
+        short_prob=1.0,
         load_vae_instead_of_image=False,
         buffersize=100000,
-        seed=0, 
+        seed=0,
         online_t5=True,
         pn='0.06M',
         batch_size=batch_size,
