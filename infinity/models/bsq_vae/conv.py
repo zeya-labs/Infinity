@@ -9,7 +9,7 @@ class Conv(nn.Module):
         super().__init__()
         self.cnn_type = cnn_type
         self.slice_seq_len = 17
-        
+
         if cnn_type == "2d":
             self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
         if cnn_type == "3d":
@@ -28,7 +28,7 @@ class Conv(nn.Module):
         self.causal_offset = causal_offset
         self.stride = stride
         self.kernel_size = kernel_size
-        
+
     def forward(self, x):
         if self.cnn_type == "2d":
             if x.ndim == 5:
@@ -62,7 +62,7 @@ class Conv(nn.Module):
                 xs.append(_x)
             try:
                 x = torch.cat(xs, dim=2)
-            except:
+            except RuntimeError:
                 device = x.device
                 del x
                 xs = [_x.cpu().pin_memory() for _x in xs]

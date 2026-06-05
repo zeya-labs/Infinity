@@ -24,7 +24,7 @@ class Normalize(nn.Module):
         if norm_type == 'group':
             if in_channels % 32 == 0:
                 self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-            elif in_channels % 24 == 0: 
+            elif in_channels % 24 == 0:
                 self.norm = nn.GroupNorm(num_groups=24, num_channels=in_channels, eps=1e-6, affine=True)
             else:
                 raise NotImplementedError
@@ -32,7 +32,7 @@ class Normalize(nn.Module):
             self.norm = nn.SyncBatchNorm(in_channels, track_running_stats=False) # Runtime Error: grad inplace if set track_running_stats to True
         elif norm_type == 'no':
             self.norm = nn.Identity()
-    
+
     def forward(self, x):
         if self.norm_axis == "spatial":
             if x.ndim == 4:
@@ -51,7 +51,7 @@ class Normalize(nn.Module):
 def swish(x: Tensor) -> Tensor:
     try:
         return x * torch.sigmoid(x)
-    except:
+    except RuntimeError:
         device = x.device
         x = x.cpu().pin_memory()
         return (x*torch.sigmoid(x)).to(device=device)
@@ -132,7 +132,7 @@ class Downsample(nn.Module):
         if cnn_type == "2d":
             self.pad = (0,1,0,1)
         if cnn_type == "3d":
-            self.pad = (0,1,0,1,0,0) # add padding to the right for h-axis and w-axis. No padding for t-axis 
+            self.pad = (0,1,0,1,0,0) # add padding to the right for h-axis and w-axis. No padding for t-axis
         # no asymmetric padding in torch conv, must do it ourselves
         self.conv = Conv(in_channels, in_channels, kernel_size=3, stride=2, padding=0, cnn_type=cnn_type, temporal_down=temporal_down)
 
@@ -170,7 +170,7 @@ class Upsample(nn.Module):
         else:
             try:
                 x = F.interpolate(x, scale_factor=self.scale_factor, mode="nearest")
-            except:
+            except RuntimeError:
                 # shard across channel
                 _xs = []
                 for i in range(x.shape[1]):
@@ -189,7 +189,7 @@ class Encoder(nn.Module):
         num_res_blocks: int,
         z_channels: int,
         in_channels = 3,
-        patch_size=8, temporal_patch_size=4, 
+        patch_size=8, temporal_patch_size=4,
         norm_type='group', cnn_param=None,
         use_checkpoint=False,
         use_vae=True,
@@ -292,8 +292,8 @@ class Decoder(nn.Module):
         ch_mult: list[int],
         num_res_blocks: int,
         z_channels: int,
-        out_ch = 3, 
-        patch_size=8, temporal_patch_size=4, 
+        out_ch = 3,
+        patch_size=8, temporal_patch_size=4,
         norm_type="group", cnn_param=None,
         use_checkpoint=False,
         use_freq_dec=False, # use frequency features for decoder
@@ -443,11 +443,11 @@ class AutoEncoder(nn.Module):
         self.cycle_gan_weight = args.cycle_gan_weight
 
         self.flux_image_encoder = None
-        
+
         if not args.use_vae:
             if args.quantizer_type == 'MultiScaleBSQ':
                 self.quantizer = MultiScaleBSQ(
-                    dim = args.codebook_dim,                        # this is the input feature dimension, defaults to log2(codebook_size) if not defined  
+                    dim = args.codebook_dim,                        # this is the input feature dimension, defaults to log2(codebook_size) if not defined
                     codebook_size = args.codebook_size,             # codebook size, must be a power of 2
                     entropy_loss_weight = args.entropy_loss_weight, # how much weight to place on entropy loss
                     diversity_gamma = args.diversity_gamma,         # within entropy loss, how much weight to give to diversity of codes, taken from https://arxiv.org/abs/1911.05894
@@ -497,12 +497,12 @@ class AutoEncoder(nn.Module):
         hs_mid = [_h.detach() for _h in hs_mid]
         h = h.to(dtype=torch.float32)
         # print(z.shape)
-        # Multiscale LFQ            
+        # Multiscale LFQ
         z, all_indices, all_bit_indices, _, all_loss, _ = self.quantizer(h)
         x_recon = self.decoder(z)
         vq_output = {
             "commitment_loss": torch.mean(all_loss) * self.lfq_weight, # here commitment loss is sum of commitment loss and entropy penalty
-            "encodings": all_indices, 
+            "encodings": all_indices,
             "bit_indices": all_bit_indices,
         }
         return x_recon, vq_output
@@ -523,7 +523,7 @@ class AutoEncoder(nn.Module):
         hs_mid = [_h.detach() for _h in hs_mid]
         h = h.to(dtype=torch.float32)
         return h, hs, hs_mid
-    
+
     def encode(self, x, scale_schedule, return_residual_norm_per_scale=False):
         h, hs, hs_mid = self.encode_for_raw_features(x, scale_schedule, return_residual_norm_per_scale)
         # Multiscale LFQ
@@ -534,7 +534,7 @@ class AutoEncoder(nn.Module):
         x_recon = self.decoder(z)
         x_recon = torch.clamp(x_recon, min=-1, max=1)
         return x_recon
-    
+
     def decode_from_indices(self, all_indices, scale_schedule, label_type):
         summed_codes = 0
         for idx_Bl in all_indices:

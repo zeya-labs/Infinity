@@ -6,15 +6,15 @@ import torch.nn.functional as F
 import numpy as np
 
 
-def labels2image(all_indices, label_type='int_label', scale_schedule=None):
-    summed_codes, recons_imgs = self.vae.decode_from_indices(all_indices, scale_schedule, label_type)
+def labels2image(vae, all_indices, label_type='int_label', scale_schedule=None):
+    summed_codes, recons_imgs = vae.decode_from_indices(all_indices, scale_schedule, label_type)
     recons_img = recons_imgs[0]
     recons_img = (recons_img + 1) / 2
     recons_img = recons_img.permute(1, 2, 0).mul_(255).cpu().numpy().astype(np.uint8)[:,:,::-1]
     return recons_img
 
-def features2image(raw_features):
-    recons_imgs = self.vae.decode(raw_features.squeeze(-3))
+def features2image(vae, raw_features):
+    recons_imgs = vae.decode(raw_features.squeeze(-3))
     recons_img = recons_imgs[0]
     recons_img = (recons_img + 1) / 2
     recons_img = recons_img.permute(1, 2, 0).mul_(255).cpu().numpy().astype(np.uint8)[:,:,::-1]
@@ -80,18 +80,22 @@ class BitwiseSelfCorrection(object):
 
             if self.debug_bsc:
                 self.visualize(vae_scale_schedule, inp_B3HW, gt_all_bit_indices, pred_all_bit_indices)
-        
+
         return x_BLC_wo_prefix, gt_ms_idx_Bl
-    
+
     def visualize(self, vae_scale_schedule, inp_B3HW, gt_all_bit_indices, pred_all_bit_indices):
+        import cv2
+
         gt_img = (inp_B3HW.squeeze(-3) + 1) / 2 * 255
         gt_img = gt_img[0].permute(1,2,0).cpu().numpy().astype(np.uint8)[:,:,::-1]
-        recons_img_2 = labels2image(gt_all_bit_indices, label_type='bit_label', scale_schedule=vae_scale_schedule)
-        recons_img_3 = labels2image(pred_all_bit_indices, label_type='bit_label', scale_schedule=vae_scale_schedule)
+        recons_img_2 = labels2image(
+            self.vae, gt_all_bit_indices, label_type='bit_label', scale_schedule=vae_scale_schedule
+        )
+        recons_img_3 = labels2image(
+            self.vae, pred_all_bit_indices, label_type='bit_label', scale_schedule=vae_scale_schedule
+        )
         cat_image = np.concatenate([gt_img, recons_img_2, recons_img_3], axis=1)
         save_path = osp.abspath('non_teacher_force.jpg')
         cv2.imwrite(save_path, cat_image)
         print(f'Save to {save_path}')
-        import pdb; pdb.set_trace()
         print(cat_image.shape)
-        

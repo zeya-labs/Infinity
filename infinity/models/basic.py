@@ -41,7 +41,7 @@ try:
 except ImportError:
     dropout_add_layer_norm = dropout_add_rms_norm = fused_mlp_func = None
     flash_fused_op_installed = False
-    
+
     def rms_norm_impl(x, weight, epsilon):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
 
@@ -147,11 +147,11 @@ class FastRMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.ones(C))
         else:
             self.register_buffer('weight', torch.ones(C))
-    
+
     def forward(self, x):
         src_type = x.dtype
         return rms_norm_impl(x.float(), self.weight, epsilon=self.eps).to(src_type)
-    
+
     def extra_repr(self) -> str:
         return f'C={self.C}, eps={self.eps:g}, elementwise_affine={self.elementwise_affine}'
 
@@ -171,7 +171,7 @@ class FFN(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = get_dropout_layer(drop)
         self.heuristic = -1
-    
+
     def forward(self, x):
         if self.fused_mlp_func is not None:
             return self.drop(self.fused_mlp_func(
@@ -189,7 +189,7 @@ class FFN(nn.Module):
             ))
         else:
             return self.drop(self.fc2( self.act(self.fc1(x)) ))
-    
+
     def extra_repr(self) -> str:
         return f'fused_mlp={self.fused_mlp_func is not None}'
 
@@ -199,16 +199,16 @@ class FFNSwiGLU(nn.Module):
         super().__init__()
         self.fused_mlp_func = None
         hidden_features = round(2 * hidden_features / 3 / 256) * 256
-        
+
         out_features = out_features or in_features
         self.fcg = nn.Linear(in_features, hidden_features, bias=False)
         self.fc1 = nn.Linear(in_features, hidden_features, bias=False)
         self.fc2 = nn.Linear(hidden_features, out_features, bias=False)
         self.drop = get_dropout_layer(drop)
-    
+
     def forward(self, x):
         return self.drop(self.fc2( F.silu(self.fcg(x), inplace=True).mul_(self.fc1(x)) ))
-    
+
     def extra_repr(self) -> str:
         return f'fused_mlp={self.fused_mlp_func is not None}'
 
@@ -216,7 +216,7 @@ class FFNSwiGLU(nn.Module):
 class SelfAttention(nn.Module):
     def __init__(
         self, embed_dim=768, num_heads=12,
-        proj_drop=0., tau=1, cos_attn=False, customized_flash_attn=True, use_flex_attn=False, 
+        proj_drop=0., tau=1, cos_attn=False, customized_flash_attn=True, use_flex_attn=False,
         batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0, bf16_activations=False,
     ):
         """
@@ -230,7 +230,7 @@ class SelfAttention(nn.Module):
         super().__init__()
         assert embed_dim % num_heads == 0
         self.using_flash = customized_flash_attn
-        
+
         self.num_heads, self.head_dim = num_heads, embed_dim // num_heads
         self.tau, self.cos_attn = tau, cos_attn
         if self.cos_attn:
@@ -241,14 +241,14 @@ class SelfAttention(nn.Module):
             self.max_scale_mul = torch.log(torch.tensor(100)).item()
         else:
             self.scale = 1 / math.sqrt(self.head_dim) / self.tau
-        
+
         self.mat_qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
         self.q_bias, self.v_bias = nn.Parameter(torch.zeros(embed_dim)), nn.Parameter(torch.zeros(embed_dim))
         self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
-        
+
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = get_dropout_layer(proj_drop)
-        
+
         self.caching = False    # kv caching: only used during inference
         self.cached_k = None    # kv caching: only used during inference
         self.cached_v = None    # kv caching: only used during inference
@@ -260,12 +260,12 @@ class SelfAttention(nn.Module):
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
-    
+
     def kv_caching(self, enable: bool): # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
-    
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
         """
@@ -294,7 +294,7 @@ class SelfAttention(nn.Module):
         """
         # x: fp32
         B, L, C = x.shape
-        
+
         # qkv: amp, bf16
         flash_layout_attn = attn_fn is not None and getattr(attn_fn, "expects_blhc", False)
         if flash_layout_attn:
@@ -311,7 +311,7 @@ class SelfAttention(nn.Module):
             qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
             if self.using_flash: q, k, v = qkv.unbind(dim=2); L_dim = 1           # q or k or v: all are shaped in (B:batch_size, L:seq_len, H:heads, c:head_dim)
             else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); L_dim = 2   # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
-        
+
         if self.cos_attn:   # always True
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp() # 11H1 (flash), or 1H11 (not flash)
             if flash_layout_attn:
@@ -341,7 +341,7 @@ class SelfAttention(nn.Module):
         if self.caching:    # kv caching: only used during inference
             if self.cached_k is None: self.cached_k = k; self.cached_v = v
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
-        
+
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
@@ -359,9 +359,9 @@ class SelfAttention(nn.Module):
             else:
                 oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C)
             # oup: bf16
-        
+
         return self.proj_drop(self.proj(oup))
-    
+
     def extra_repr(self) -> str:
         tail = ''
         return f'using_flash={self.using_flash}, tau={self.tau}, cos_attn={self.cos_attn}{tail}'
@@ -380,7 +380,8 @@ class CrossAttention(nn.Module):
         :param proj_drop: proj drop out
         :param cos_attn: during attention, q and k will be L2-normalized and scaled by a head-wise learnable parameter self.scale_mul_1H11
         """
-        cos_attn = False    # TODO: never use cos attn in cross attention with T5 kv
+        # Cross-attention over T5 key/value states uses scaled dot-product attention only.
+        cos_attn = False
         super().__init__()
         self.for_attn_pool = for_attn_pool
         self.embed_dim = embed_dim
@@ -394,7 +395,7 @@ class CrossAttention(nn.Module):
             self.max_scale_mul = torch.log(torch.tensor(100)).item()
         else:
             self.scale = 1 / math.sqrt(self.head_dim)
-        
+
         if for_attn_pool:
             q = torch.empty(1, self.num_heads, self.head_dim)
             nn.init.trunc_normal_(q, mean=0, std=math.sqrt(1 / embed_dim / 3))
@@ -404,10 +405,10 @@ class CrossAttention(nn.Module):
         self.mat_kv = nn.Linear(kv_dim, embed_dim*2, bias=False)
         self.v_bias = nn.Parameter(torch.zeros(embed_dim))
         self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
-        
+
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = get_dropout_layer(proj_drop)
-    
+
     def forward(self, q, ca_kv):
         """
         :param q: shaped as (batch, seq_len, Q_dim)
@@ -416,15 +417,15 @@ class CrossAttention(nn.Module):
             - cu_seqlens_k: cumulated sum of lens
             - max_seqlen_k: int, max(lens)
         NOTE: seq_len (num of Qs) can reach 10k;  but len_i (num of KVs) must <= 256
-        
+
         :return: shaped as (batch, seq_len, Q_dim)
         """
         kv_compact, cu_seqlens_k, max_seqlen_k = ca_kv
         N = kv_compact.shape[0]
-        
+
         kv_compact = F.linear(kv_compact, weight=self.mat_kv.weight, bias=torch.cat((self.zero_k_bias, self.v_bias))).view(N, 2, self.num_heads, self.head_dim) # NC => N2Hc
         # attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens
-        
+
         if not self.for_attn_pool:
             B, Lq = q.shape[:2]
             q_compact = self.mat_q(q).view(-1, self.num_heads, self.head_dim)
@@ -432,17 +433,17 @@ class CrossAttention(nn.Module):
             B = cu_seqlens_k.shape[0] - 1
             Lq = 1
             q_compact = self.mat_q.repeat(B, 1, 1).to(dtype=kv_compact.dtype)
-        
+
         if self.cos_attn:   # always False
             scale_mul = self.scale_mul_1H1.clamp_max(self.max_scale_mul).exp()
             k, v = kv_compact.unbind(dim=1)
             q_compact = F.normalize(q_compact, dim=-1).mul(scale_mul)
             k = F.normalize(k, dim=-1)
             kv_compact = torch.stack((k, v), dim=1)
-        
+
         q_compact = q_compact.contiguous()
         kv_compact = kv_compact.contiguous()
-        
+
         cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
         if not flash_attn_installed:
             q_view = q_compact.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
@@ -462,9 +463,9 @@ class CrossAttention(nn.Module):
             oup = oup.float()
         else:
             oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
-        
+
         return self.proj_drop(self.proj(oup))
-    
+
     def extra_repr(self) -> str:
         return f'Cq={self.embed_dim}, Ckv={self.kv_dim}, cos_attn={self.cos_attn}'
 
@@ -484,18 +485,18 @@ class SelfAttnBlock(nn.Module):
         )
         self.using_swiglu = swiglu
         self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
-        
+
         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
         self.fused_norm_func = fused_norm_func
         self.norm_eps = norm_layer.keywords.get('eps', 1e-6)
-        
+
         self.shared_aln = shared_aln
         if self.shared_aln:
             self.ada_gss = nn.Parameter(torch.randn(1, 1, 6, embed_dim) / embed_dim**0.5)
         else:
             lin = nn.Linear(cond_dim, 6*embed_dim)
             self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin) if act else nn.Sequential(lin)
-        
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector):  # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
         with torch.cuda.amp.autocast(enabled=False):
@@ -503,7 +504,7 @@ class SelfAttnBlock(nn.Module):
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
-        
+
         if self.fused_ada_norm is None:
             x = x + self.drop_path(self.attn( self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1), attn_bias_or_two_vector=attn_bias_or_two_vector ).mul_(gamma1))
             x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
@@ -511,7 +512,7 @@ class SelfAttnBlock(nn.Module):
             x = x + self.drop_path(self.attn(self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1), attn_bias_or_two_vector=attn_bias_or_two_vector).mul_(gamma1))
             x = x + self.drop_path(self.ffn(self.fused_ada_norm(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         return x
-    
+
     def extra_repr(self) -> str:
         return f'shared_aln={self.shared_aln}, fused_norm={self.fused_norm_func is not None}'
 
@@ -537,27 +538,27 @@ class CrossAttnBlock(nn.Module):
         self.ca = CrossAttention(embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn)
         self.using_swiglu = swiglu
         self.ffn = (FFNSwiGLU if swiglu else FFN)(in_features=embed_dim, hidden_features=round(embed_dim * mlp_ratio / 256) * 256, drop=drop, fused_mlp=fused_mlp)
-        
+
         self.ln_wo_grad = norm_layer(embed_dim, elementwise_affine=False)
         self.fused_norm_func = fused_norm_func
         self.norm_eps = norm_layer.keywords.get('eps', 1e-6)
         self.ca_norm = norm_layer(embed_dim, elementwise_affine=True)
-        
+
         self.shared_aln = shared_aln
         if self.shared_aln: # always True
             self.ada_gss = nn.Parameter(torch.randn(1, 1, 6, embed_dim) / embed_dim**0.5)
         else:
             lin = nn.Linear(cond_dim, 6*embed_dim)
             self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin) if act else nn.Sequential(lin)
-        
+
         if cross_attn_layer_scale >= 0:
             self.ca_gamma = nn.Parameter(cross_attn_layer_scale * torch.ones(embed_dim), requires_grad=True)
         else:
             self.ca_gamma = 1
-        
+
         self.checkpointing_sa_only = checkpointing_sa_only
         self.bf16_activations = bf16_activations
-    
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
         with torch.cuda.amp.autocast(enabled=False):    # disable half precision
@@ -565,7 +566,7 @@ class CrossAttnBlock(nn.Module):
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = self.ada_lin(cond_BD).view(-1, 1, 6, self.C).unbind(2)
-        
+
         if self.fused_norm_func is None:
             if self.bf16_activations:
                 x_sa = self.ln_wo_grad(x.float()).mul(scale1.add(1)).add_(shift1).to(x.dtype)
@@ -627,7 +628,7 @@ class CrossAttnBlock(nn.Module):
                 ffn_in = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2_for_x, shift=shift2_for_x)
             x = x + self.drop_path(self.ffn(ffn_in).mul(gamma2_for_x)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
         return x
-    
+
     def extra_repr(self) -> str:
         return f'shared_aln={self.shared_aln}, fused_norm={self.fused_norm_func is not None}, ca_gamma={"<learnable>" if isinstance(self.ca_gamma, nn.Parameter) else self.ca_gamma}'
 
@@ -641,7 +642,7 @@ class AdaLNBeforeHead(nn.Module):
         self.norm_eps = norm_layer.keywords.get('eps', 1e-6)
         lin = nn.Linear(D, 2*C)
         self.ada_lin = nn.Sequential(nn.SiLU(inplace=False), lin) if act else nn.Sequential(lin)
-    
+
     def forward(self, x_BLC: torch.Tensor, cond_BD: Optional[torch.Tensor]):
         scale, shift = self.ada_lin(cond_BD).view(-1, 1, 2, self.C).unbind(2)
         if self.fused_norm_func is None:
@@ -658,24 +659,24 @@ def main():
     B, H, cq, ckv = 4, 8, 64, 96
     Cq = H*cq
     Ckv = H*ckv
-    
+
     Li = [5, 4, 7, 6]
     Lq = 10
     L = max(Li)
     attn_bias = torch.zeros(B, 1, Lq, L, device=dev)
     for i, x in enumerate(Li):
         attn_bias[i, 0, :, x:] = -torch.inf
-    
+
     q = torch.randn(B, Lq, H, cq, generator=rng, device=dev)
     k = torch.randn(B, L, H, ckv, generator=rng, device=dev)
     v = torch.randn(B, L, H, ckv, generator=rng, device=dev)
     tq, tk, tv = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)    # BHLc
-    
+
     seqlen_k = torch.tensor(Li, dtype=torch.int32, device=dev)
     cu_seqlens_k = F.pad(torch.cumsum(seqlen_k, dim=0, dtype=torch.torch.int32), (1, 0))
     kv = torch.stack([k, v], dim=2)
     kv_compact = torch.cat([kv[i, :Li[i]] for i in range(B)], dim=0)
-    
+
     ca = CrossAttention(for_attn_pool=False, embed_dim=Cq, kv_dim=Ckv, num_heads=H)
     CrossAttention.forward
     ca(q, (kv_compact, cu_seqlens_k, max(Li))).mean().backward()

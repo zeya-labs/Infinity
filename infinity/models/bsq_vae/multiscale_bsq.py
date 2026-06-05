@@ -133,9 +133,9 @@ def get_latent2scale_schedule(T: int, H: int, W: int, mode="original"):
     return patch_THW_shape_per_scale
 
 class LayerNorm(nn.Module):
-    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
-    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
-    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
+    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
+    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
+    shape (batch_size, height, width, channels) while channels_first corresponds to inputs
     with shape (batch_size, channels, height, width).
     normalized_shape: int
     """
@@ -149,9 +149,9 @@ class LayerNorm(nn.Module):
         self.eps = eps
         self.data_format = data_format
         if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError 
+            raise NotImplementedError
         self.normalized_shape = (normalized_shape, )
-    
+
     def forward(self, x):
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
@@ -233,7 +233,7 @@ class MultiScaleBSQ(Module):
 
         self.z_interplote_up = 'trilinear'
         self.z_interplote_down = 'area'
-        
+
         self.use_decay_factor = use_decay_factor
         self.schedule_mode = schedule_mode
         self.keep_first_quant = keep_first_quant
@@ -278,7 +278,7 @@ class MultiScaleBSQ(Module):
     ):
         if x.ndim == 4:
             x = x.unsqueeze(2)
-        B, C, T, H, W = x.size()    
+        B, C, T, H, W = x.size()
 
         if scale_schedule is None:
             if self.schedule_mode.startswith("same"):
@@ -292,7 +292,7 @@ class MultiScaleBSQ(Module):
         # x = self.project_in(x)
         x = x.permute(0, 2, 3, 4, 1).contiguous() # (b, c, t, h, w) => (b, t, h, w, c)
         x = self.project_in(x)
-        x = x.permute(0, 4, 1, 2, 3).contiguous() # (b, t, h, w, c) => (b, c, t, h, w) 
+        x = x.permute(0, 4, 1, 2, 3).contiguous() # (b, t, h, w, c) => (b, c, t, h, w)
         x = self.layernorm(x)
 
         quantized_out = 0.
@@ -303,7 +303,7 @@ class MultiScaleBSQ(Module):
         all_bit_indices = []
         var_inputs = []
         residual_norm_per_scale = []
-        
+
         # go through the layers
         out_fact = init_out_fact = 1.0
         # residual_list = []
@@ -333,7 +333,7 @@ class MultiScaleBSQ(Module):
                     else:
                         quantized = torch.zeros_like(interpolate_residual)
                 elif self.drop_when_test and drop_lvl_start <= si < drop_lvl_end:
-                    continue                     
+                    continue
                 else:
                     # residual_norm = torch.norm(interpolate_residual.detach(), dim=1) # (b, t, h, w)
                     # print(si, residual_norm.min(), residual_norm.max(), residual_norm.mean())
@@ -347,7 +347,7 @@ class MultiScaleBSQ(Module):
                 # quantized_list.append(torch.norm(quantized.detach(), dim=1).mean())
                 if (pt, ph, pw) != (T, H, W):
                     quantized = F.interpolate(quantized, size=(T, H, W), mode=self.z_interplote_up).contiguous()
-                
+
                 if self.remove_residual_detach:
                     residual = residual - quantized
                 else:
@@ -358,13 +358,12 @@ class MultiScaleBSQ(Module):
                 all_losses.append(loss)
                 if si != scale_num - 1:
                     var_inputs.append(F.interpolate(quantized_out, size=scale_schedule[si+1], mode=self.z_interplote_down).contiguous())
-                
+
                 if self.use_decay_factor:
                     out_fact -= 0.1
         # print("residual_list:", residual_list)
         # print("interpolate_residual_list:", interpolate_residual_list)
         # print("quantized_list:", quantized_list)
-        # import ipdb; ipdb.set_trace()
         # project out, if needed
         quantized_out = quantized_out.permute(0, 2, 3, 4, 1).contiguous() # (b, c, t, h, w) => (b, t, h, w, c)
         quantized_out = self.project_out(quantized_out)
@@ -579,16 +578,16 @@ class BSQ(Module):
     def quantize(self, z):
         assert z.shape[-1] == self.codebook_dims, f"Expected {self.codebook_dims} dimensions, got {z.shape[-1]}"
 
-        zhat = torch.where(z > 0, 
-                           torch.tensor(1, dtype=z.dtype, device=z.device), 
+        zhat = torch.where(z > 0,
+                           torch.tensor(1, dtype=z.dtype, device=z.device),
                            torch.tensor(-1, dtype=z.dtype, device=z.device))
         return z + (zhat - z).detach()
 
     def quantize_new(self, z):
         assert z.shape[-1] == self.codebook_dims, f"Expected {self.codebook_dims} dimensions, got {z.shape[-1]}"
 
-        zhat = torch.where(z > 0, 
-                           torch.tensor(1, dtype=z.dtype, device=z.device), 
+        zhat = torch.where(z > 0,
+                           torch.tensor(1, dtype=z.dtype, device=z.device),
                            torch.tensor(-1, dtype=z.dtype, device=z.device))
 
         q_scale = 1. / (self.codebook_dims ** 0.5)
@@ -668,7 +667,7 @@ class BSQ(Module):
             if force_f32:
                 orig_dtype = x.dtype
                 x = x.float()
-            
+
             # use straight-through gradients (optionally with custom activation fn) if training
             if self.new_quant:
                 quantized = self.quantize_new(x)
