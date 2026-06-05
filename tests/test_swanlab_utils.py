@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
+import tempfile
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
-from infinity.utils.swanlab_utils import build_swanlab_experiment_name, init_swanlab_run
+from infinity.utils.swanlab_utils import build_swanlab_experiment_name, init_swanlab_run, swanlab_local_resume_patch
 
 
 class SwanLabUtilsTest(unittest.TestCase):
@@ -66,6 +66,31 @@ class SwanLabUtilsTest(unittest.TestCase):
             self.assertIs(run, fake_run)
             logger.warning.assert_called_once()
             self.assertIn('"run_id": "new-run"', state_path.read_text(encoding="utf-8"))
+
+    def test_local_resume_patch_skips_unsupported_new_swanlab_run_id_api(self) -> None:
+        try:
+            import swanlab.data.callbacker.local as swanlab_local  # noqa: F401
+            import swanlab.data.run.main as swanlab_run_main
+            import swankit.core.settings as swankit_settings
+        except Exception as exc:
+            raise unittest.SkipTest(f"swanlab local mode unavailable: {exc}") from exc
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logdir = Path(tmpdir) / "swanlab"
+            run_dir = logdir / "run-20260605_030746-a3b1799d"
+            run_dir.mkdir(parents=True)
+            original_randint = swanlab_run_main.random.randint
+            original_datetime = swankit_settings.datetime
+            original_mkdir = swankit_settings.os.mkdir
+
+            with swanlab_local_resume_patch(logdir, "a3b1799d", run_dir):
+                self.assertIs(swanlab_run_main.random.randint, original_randint)
+                self.assertIs(swankit_settings.datetime, original_datetime)
+                self.assertIs(swankit_settings.os.mkdir, original_mkdir)
+
+            self.assertIs(swanlab_run_main.random.randint, original_randint)
+            self.assertIs(swankit_settings.datetime, original_datetime)
+            self.assertIs(swankit_settings.os.mkdir, original_mkdir)
 
 
 if __name__ == "__main__":

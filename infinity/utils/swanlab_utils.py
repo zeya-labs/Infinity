@@ -61,7 +61,9 @@ def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
         return
     try:
         import swanlab.data.callbacker.local as swanlab_local
+        import swanlab.data.run.main as swanlab_run_main
         import swanlab.data.sdk as swanlab_sdk
+        import swankit.core.settings as swankit_settings
     except Exception:
         yield
         return
@@ -76,9 +78,17 @@ def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
         yield
         return
 
-    original_generate_run_id = swanlab_local.N.generate_run_id
-    original_datetime = swanlab_sdk.datetime
-    original_mkdir = swanlab_sdk.os.mkdir
+    original_generate_run_id = getattr(getattr(swanlab_local, "N", None), "generate_run_id", None)
+    if original_generate_run_id is None:
+        yield
+        return
+
+    fixed_run_id_int = int(run_id, 16)
+    original_randint = swanlab_run_main.random.randint
+    original_datetime = getattr(swanlab_sdk, "datetime", None)
+    original_settings_datetime = swankit_settings.datetime
+    original_mkdir = getattr(getattr(swanlab_sdk, "os", None), "mkdir", None)
+    original_settings_mkdir = swankit_settings.os.mkdir
     target_run_dir = run_dir.resolve()
 
     class FixedDatetime:
@@ -91,15 +101,32 @@ def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
             return None
         return original_mkdir(path, mode, *args, **kwargs)
 
-    swanlab_local.N.generate_run_id = lambda: run_id
-    swanlab_sdk.datetime = FixedDatetime
-    swanlab_sdk.os.mkdir = mkdir_existing_run
+    def mkdir_existing_settings_run(path, mode=0o777, *args, **kwargs):
+        if Path(path).resolve() == target_run_dir and target_run_dir.is_dir():
+            return None
+        return original_settings_mkdir(path, mode, *args, **kwargs)
+
+    if original_generate_run_id is not None:
+        swanlab_local.N.generate_run_id = lambda: run_id
+    swanlab_run_main.random.randint = lambda _a, _b: fixed_run_id_int
+    if original_datetime is not None:
+        swanlab_sdk.datetime = FixedDatetime
+    swankit_settings.datetime = FixedDatetime
+    if original_mkdir is not None:
+        swanlab_sdk.os.mkdir = mkdir_existing_run
+    swankit_settings.os.mkdir = mkdir_existing_settings_run
     try:
         yield
     finally:
-        swanlab_local.N.generate_run_id = original_generate_run_id
-        swanlab_sdk.datetime = original_datetime
-        swanlab_sdk.os.mkdir = original_mkdir
+        if original_generate_run_id is not None:
+            swanlab_local.N.generate_run_id = original_generate_run_id
+        swanlab_run_main.random.randint = original_randint
+        if original_datetime is not None:
+            swanlab_sdk.datetime = original_datetime
+        swankit_settings.datetime = original_settings_datetime
+        if original_mkdir is not None:
+            swanlab_sdk.os.mkdir = original_mkdir
+        swankit_settings.os.mkdir = original_settings_mkdir
 
 
 def init_swanlab_run(
