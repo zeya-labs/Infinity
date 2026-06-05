@@ -71,14 +71,14 @@ def build_everything_from_args(args: arg_util.Args, saver):
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
     args.dump_log()
-    if start_ep == args.ep:
+    start_ep, start_it = normalize_train_cursor(start_ep, start_it, iters_train)
+    if start_ep >= args.ep:
         args.dump_log()
         print(f'[vgpt] AR finished ({acc_str}), skipping ...\n\n')
         return None
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
 
-    start_it = start_it % iters_train
     print(f"{start_it=}, {iters_train=}")
 
     del vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim
@@ -439,6 +439,17 @@ def next_train_cursor(ep: int, it: int, iters_train: int) -> tuple[int, int]:
     if next_it >= iters_train:
         return ep + 1, 0
     return ep, next_it
+
+
+def normalize_train_cursor(ep: int, it: int, iters_train: int) -> tuple[int, int]:
+    if ep < 0:
+        raise ValueError(f"ep must be non-negative, got {ep}")
+    if it < 0:
+        raise ValueError(f"it must be non-negative, got {it}")
+    if iters_train <= 0:
+        raise ValueError(f"iters_train must be positive, got {iters_train}")
+    extra_ep, normalized_it = divmod(it, iters_train)
+    return ep + extra_ep, normalized_it
 
 
 def train_perf_log_frequency(prof_freq: int, iters_train: int) -> int:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from train import next_train_cursor, train_perf_log_frequency
+from train import next_train_cursor, normalize_train_cursor, train_perf_log_frequency
 
 
 class TrainCursorTest(unittest.TestCase):
@@ -15,6 +15,20 @@ class TrainCursorTest(unittest.TestCase):
     def test_rejects_empty_epoch(self) -> None:
         with self.assertRaisesRegex(ValueError, "iters_train must be positive"):
             next_train_cursor(ep=0, it=0, iters_train=0)
+
+    def test_normalizes_legacy_end_epoch_checkpoint_cursor(self) -> None:
+        self.assertEqual(normalize_train_cursor(ep=3, it=10, iters_train=10), (4, 0))
+
+    def test_normalizes_cursor_across_multiple_epochs(self) -> None:
+        self.assertEqual(normalize_train_cursor(ep=3, it=25, iters_train=10), (5, 5))
+
+    def test_normalize_cursor_rejects_invalid_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ep must be non-negative"):
+            normalize_train_cursor(ep=-1, it=0, iters_train=10)
+        with self.assertRaisesRegex(ValueError, "it must be non-negative"):
+            normalize_train_cursor(ep=0, it=-1, iters_train=10)
+        with self.assertRaisesRegex(ValueError, "iters_train must be positive"):
+            normalize_train_cursor(ep=0, it=0, iters_train=0)
 
     def test_perf_log_frequency_matches_existing_large_epoch_behavior(self) -> None:
         self.assertEqual(train_perf_log_frequency(prof_freq=100, iters_train=1000), 100)
