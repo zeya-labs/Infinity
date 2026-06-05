@@ -1,10 +1,15 @@
 external/
+.venv/
 .tui/
 scripts/download-data/
 
 *.swp
+*.py[cod]
 **/__pycache__/**
 **/.ipynb_checkpoints/**
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 .idea/*
 llava/
 _vis_cached/
@@ -24,6 +29,7 @@ stable-diffusion-v1-4/
 *.ckpt
 *.log
 *.txt
+!requirements-check.txt
 *.ipynb
 toscli
 *.hydra
@@ -48,5 +54,6 @@ debug/
 weights
 checkpoints
 ref.py
+prompt.md
 wandb
 .DS_Store

@@ -1,0 +1,6 @@
+# Lightweight dependencies for scripts/check.sh.
+# CI installs CPU torch separately before this file.
+numpy
+pyyaml
+tomli; python_version < "3.11"
+textual

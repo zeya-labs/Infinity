@@ -1,0 +1,46 @@
+# Default ownership for review routing.
+* @XyeaOvO
+
+# Normal training, tokenizer fine-tuning, and local launch surfaces.
+/infinity/normal_estimation/ @XyeaOvO
+/tools/train_normal_estimation.py @XyeaOvO
+/tools/train_normal_tokenizer.py @XyeaOvO
+/scripts/train_normal.sh @XyeaOvO
+/scripts/train_normal_tokenizer.sh @XyeaOvO
+/docs/normal_readme.md @XyeaOvO
+/docs/normal_tokenizer_finetune.md @XyeaOvO
+/tests/test_normal_*.py @XyeaOvO
+/tests/test_tui_normal_tasks.py @XyeaOvO
+/tui.py @XyeaOvO
+
+# Repository checks, CI, and lightweight dependency boundaries.
+/.editorconfig @XyeaOvO
+/.gitattributes @XyeaOvO
+/.github/CODEOWNERS @XyeaOvO
+/.github/workflows/ci.yml @XyeaOvO
+/.github/dependabot.yml @XyeaOvO
+/.pre-commit-config.yaml @XyeaOvO
+/pyproject.toml @XyeaOvO
+/requirements-check.txt @XyeaOvO
+/scripts/check.sh @XyeaOvO
+/scripts/check_repo.py @XyeaOvO
+/tests/test_check_repo.py @XyeaOvO
+/tests/test_ci_config.py @XyeaOvO
+
+# Evaluation helper tools.
+/evaluation/gen_eval/rename.py @XyeaOvO
+/tests/test_eval_tools.py @XyeaOvO
+
+# Governance, contribution, security, citation, and license-boundary docs.
+/README.md @XyeaOvO
+/CONTRIBUTING.md @XyeaOvO
+/SECURITY.md @XyeaOvO
+/CODE_OF_CONDUCT.md @XyeaOvO
+/THIRD_PARTY_NOTICES.md @XyeaOvO
+/CITATION.cff @XyeaOvO
+/LICENSE @XyeaOvO
+/docs/engineering.md @XyeaOvO
+/.github/pull_request_template.md @XyeaOvO
+/.github/ISSUE_TEMPLATE/bug_report.md @XyeaOvO
+/.github/ISSUE_TEMPLATE/training_change.md @XyeaOvO
+/.github/ISSUE_TEMPLATE/config.yml @XyeaOvO

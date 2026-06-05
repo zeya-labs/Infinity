@@ -11,11 +11,9 @@ decord
 transformers
 torch==2.6.0
 pytz
-pandas
 wandb
 swanlab
 textual
-colorama
 imageio
 einops
 openai

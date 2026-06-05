@@ -1,0 +1,18 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.mp4 binary
+*.pth binary
+*.pth.tar binary
+*.ckpt binary
+*.safetensors binary
+*.bin binary
+*.tar.gz binary
+*.zip binary

@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: infinity-check
+        name: Infinity lightweight checks
+        entry: scripts/check.sh
+        language: system
+        pass_filenames: false
+        always_run: true

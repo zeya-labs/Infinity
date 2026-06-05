@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the Infinity paper."
+title: "Infinity: Scaling Bitwise AutoRegressive Modeling for High-Resolution Image Synthesis"
+type: software
+repository-code: "https://github.com/FoundationVision/Infinity"
+url: "https://foundationvision.github.io/infinity.project/"
+authors:
+  - family-names: Han
+    given-names: Jian
+  - family-names: Liu
+    given-names: Jinlai
+  - family-names: Jiang
+    given-names: Yi
+  - family-names: Yan
+    given-names: Bin
+  - family-names: Zhang
+    given-names: Yuqi
+  - family-names: Yuan
+    given-names: Zehuan
+  - family-names: Peng
+    given-names: Bingyue
+  - family-names: Liu
+    given-names: Xiaobing
+preferred-citation:
+  type: article
+  title: "Infinity: Scaling Bitwise AutoRegressive Modeling for High-Resolution Image Synthesis"
+  authors:
+    - family-names: Han
+      given-names: Jian
+    - family-names: Liu
+      given-names: Jinlai
+    - family-names: Jiang
+      given-names: Yi
+    - family-names: Yan
+      given-names: Bin
+    - family-names: Zhang
+      given-names: Yuqi
+    - family-names: Yuan
+      given-names: Zehuan
+    - family-names: Peng
+      given-names: Bingyue
+    - family-names: Liu
+      given-names: Xiaobing
+  year: 2024
+  doi: "10.48550/arXiv.2412.04431"
+  url: "https://arxiv.org/abs/2412.04431"
