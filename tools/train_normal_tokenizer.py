@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ import swanlab
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import make_grid, save_image
 
@@ -28,7 +29,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from infinity.models.bsq_vae.vae import vae_model
 from infinity.tokenizer_finetune.data import collate_normal_batch
-from infinity.normal_estimation import HypersimNormalDataset
+from infinity.normal_estimation import HypersimNormalDataset, VKITTI2NormalDataset
 
 
 LOGGER = logging.getLogger("train_normal_tokenizer")
@@ -37,6 +38,19 @@ LOGGER = logging.getLogger("train_normal_tokenizer")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fine-tune Infinity tokenizer on normal maps.")
     parser.add_argument("--data-root", type=str, default=str(ROOT_DIR / "data" / "hypersim" / "processed" / "hypersim"))
+    parser.add_argument(
+        "--train-datasets",
+        type=str,
+        default="hypersim",
+        help="Comma-separated train datasets. Supported: hypersim,vkitti2.",
+    )
+    parser.add_argument(
+        "--train-dataset-weights",
+        type=str,
+        default="",
+        help="Comma-separated dataset sampling weights, e.g. hypersim:3,vkitti2:1. Empty uses 1 for each train dataset.",
+    )
+    parser.add_argument("--vkitti2-root", type=str, default=str(ROOT_DIR / "data" / "VKITTI2"))
     parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="1M")
     parser.add_argument("--train-partition", type=str, default="train")
     parser.add_argument("--val-partition", type=str, default="val")
@@ -461,15 +475,179 @@ class RepeatDataset(Dataset):
         return self.dataset[index % len(self.dataset)]
 
 
+class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        distributed: bool,
+        seed: int,
+        rank: int,
+        world_size: int,
+        dataset_weights: dict[str, float] | None = None,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.distributed = distributed
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.dataset_weights = dataset_weights or {}
+        self.epoch = 0
+        self.groups = self._build_groups()
+
+    def _build_groups(self) -> dict[tuple[str, int, int], list[int]]:
+        groups: dict[tuple[str, int, int], list[int]] = {}
+        for index in range(len(self.dataset)):
+            metadata = dataset_metadata_at(self.dataset, index)
+            target_height, target_width = (int(item) for item in metadata["target_size"])
+            key = (str(metadata.get("dataset", "unknown")).lower(), target_height, target_width)
+            groups.setdefault(key, []).append(index)
+        return groups
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _group_batches(self) -> dict[tuple[str, int, int], list[list[int]]]:
+        rng = random.Random(self.seed + self.epoch)
+        group_batches: dict[tuple[str, int, int], list[list[int]]] = {}
+        for key in sorted(self.groups):
+            indices = list(self.groups[key])
+            if self.shuffle:
+                rng.shuffle(indices)
+            batches = []
+            for offset in range(0, len(indices), self.batch_size):
+                batch = indices[offset : offset + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+            if self.shuffle:
+                rng.shuffle(batches)
+            group_batches[key] = batches
+        return group_batches
+
+    def _weighted_group_pattern(self, keys: list[tuple[str, int, int]]) -> list[tuple[str, int, int]]:
+        if not self.dataset_weights:
+            return keys
+        pattern: list[tuple[str, int, int]] = []
+        for key in keys:
+            dataset_name = key[0]
+            weight = self.dataset_weights.get(dataset_name, 1.0)
+            repeats = max(1, int(round(weight)))
+            pattern.extend([key] * repeats)
+        return pattern or keys
+
+    def _all_batches(self) -> list[list[int]]:
+        group_batches = self._group_batches()
+        keys = [key for key in sorted(group_batches) if group_batches[key]]
+        pattern = self._weighted_group_pattern(keys)
+        if not pattern:
+            return []
+
+        batches: list[list[int]] = []
+        cursor = 0
+        empty_rounds = 0
+        while keys and empty_rounds < len(pattern):
+            key = pattern[cursor % len(pattern)]
+            cursor += 1
+            available = group_batches.get(key, [])
+            needed = self.world_size if self.distributed else 1
+            if len(available) < needed:
+                empty_rounds += 1
+                continue
+            empty_rounds = 0
+            for _ in range(needed):
+                batches.append(available.pop())
+        return batches
+
+    def __iter__(self):
+        batches = self._all_batches()
+        if self.distributed:
+            batches = batches[self.rank :: self.world_size]
+        return iter(batches)
+
+    def __len__(self) -> int:
+        batches = self._all_batches()
+        if self.distributed:
+            return len(batches[self.rank :: self.world_size])
+        return len(batches)
+
+
+def parse_train_dataset_names(value: str) -> list[str]:
+    names = [item.strip().lower() for item in value.replace(";", ",").split(",") if item.strip()]
+    if not names:
+        raise ValueError("--train-datasets must include at least one dataset")
+    supported = {"hypersim", "vkitti2"}
+    unknown = sorted(set(names) - supported)
+    if unknown:
+        raise ValueError(f"Unsupported --train-datasets entries: {unknown}. Supported: {sorted(supported)}")
+    return names
+
+
+def parse_train_dataset_weights(value: str, dataset_names: list[str]) -> dict[str, float]:
+    weights = {name: 1.0 for name in dataset_names}
+    if not value.strip():
+        return weights
+    for item in value.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid --train-dataset-weights item {item!r}; expected name:weight")
+        name, raw_weight = item.split(":", 1)
+        name = name.strip().lower()
+        if name not in weights:
+            raise ValueError(f"Weight specified for dataset {name!r}, but --train-datasets={dataset_names}")
+        weight = float(raw_weight)
+        if weight <= 0:
+            raise ValueError(f"Dataset weight must be > 0 for {name}, got {weight}")
+        weights[name] = weight
+    return weights
+
+
+def dataset_metadata_at(dataset: Dataset, index: int) -> dict[str, Any]:
+    if isinstance(dataset, RepeatDataset):
+        return dataset_metadata_at(dataset.dataset, index % len(dataset.dataset))
+    if isinstance(dataset, ConcatDataset):
+        dataset_index = bisect.bisect_right(dataset.cumulative_sizes, index)
+        sample_index = index if dataset_index == 0 else index - dataset.cumulative_sizes[dataset_index - 1]
+        return dataset_metadata_at(dataset.datasets[dataset_index], sample_index)
+    if isinstance(dataset, HypersimNormalDataset):
+        return dataset._metadata_only_sample(index)["metadata"]
+    if isinstance(dataset, VKITTI2NormalDataset):
+        return dataset._metadata_for_record(index, dataset.records[index])
+    sample = dataset[index]
+    return sample["metadata"]
+
+
 def build_tokenizer_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset]:
     if not args.data_root:
         raise ValueError("--data-root is required")
-    train_dataset: Dataset = HypersimNormalDataset(
-        root=args.data_root,
-        partition=args.train_partition,
-        pn=args.pn,
-        max_samples=args.max_train_samples,
-    )
+    train_datasets: list[Dataset] = []
+    for name in parse_train_dataset_names(args.train_datasets):
+        if name == "hypersim":
+            train_datasets.append(
+                HypersimNormalDataset(
+                    root=args.data_root,
+                    partition=args.train_partition,
+                    pn=args.pn,
+                    max_samples=args.max_train_samples,
+                )
+            )
+        elif name == "vkitti2":
+            train_datasets.append(
+                VKITTI2NormalDataset(
+                    root=args.vkitti2_root,
+                    partition=args.train_partition,
+                    pn=args.pn,
+                    max_samples=args.max_train_samples,
+                )
+            )
+    train_dataset: Dataset = train_datasets[0] if len(train_datasets) == 1 else ConcatDataset(train_datasets)
     val_dataset: Dataset = HypersimNormalDataset(
         root=args.data_root,
         partition=args.val_partition,
@@ -480,6 +658,9 @@ def build_tokenizer_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset
         train_dataset = RepeatDataset(train_dataset, args.repeat_train)
     if args.repeat_val > 1:
         val_dataset = RepeatDataset(val_dataset, args.repeat_val)
+    train_dataset_names = parse_train_dataset_names(args.train_datasets)
+    train_dataset.use_grouped_sampler = True  # type: ignore[attr-defined]
+    train_dataset.dataset_weights = parse_train_dataset_weights(args.train_dataset_weights, train_dataset_names)  # type: ignore[attr-defined]
     return train_dataset, val_dataset
 
 
@@ -491,7 +672,33 @@ def build_loader(
     distributed: bool,
     shuffle: bool,
     drop_last: bool,
-) -> tuple[DataLoader, DistributedSampler | None]:
+) -> tuple[DataLoader, Sampler | None]:
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
+    if getattr(dataset, "use_grouped_sampler", False):
+        batch_sampler = GroupedTargetSizeBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            distributed=distributed,
+            seed=0,
+            rank=rank,
+            world_size=world_size,
+            dataset_weights=getattr(dataset, "dataset_weights", None),
+        )
+        loader_kwargs: dict[str, Any] = {
+            "dataset": dataset,
+            "batch_sampler": batch_sampler,
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "collate_fn": collate_normal_batch,
+        }
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+        return DataLoader(**loader_kwargs), batch_sampler
+
     sampler = None
     if distributed:
         sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last)
@@ -800,6 +1007,14 @@ def main() -> None:
             args.val_partition,
             args.max_train_samples,
             args.max_val_samples,
+        )
+        train_dataset_names = parse_train_dataset_names(args.train_datasets)
+        train_dataset_weights = parse_train_dataset_weights(args.train_dataset_weights, train_dataset_names)
+        LOGGER.info(
+            "train_datasets=%s train_dataset_weights=%s vkitti2_root=%s",
+            ",".join(train_dataset_names),
+            ",".join(f"{name}:{train_dataset_weights[name]:g}" for name in train_dataset_names),
+            args.vkitti2_root,
         )
         LOGGER.info(
             "batch_size_per_gpu=%d global_batch_size=%d val_batch_size_per_gpu=%d",
