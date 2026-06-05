@@ -52,6 +52,7 @@ from infinity.normal_estimation import (  # noqa: E402
     normals_to_vis,
     parse_train_dataset_names,
     parse_train_dataset_weights,
+    require_positive_steps_per_epoch,
     resolve_scale_schedule_from_hw,
 )
 from infinity.models.infinity import MultipleLayers  # noqa: E402
@@ -1411,7 +1412,11 @@ def main() -> int:
         with timed_stage(init_timings if args.profile_timings else None, "distributed_wrap", device):
             model = build_training_model(model, args=args, device=device, distributed=distributed)
 
-        optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+        train_batches_per_epoch = require_positive_steps_per_epoch(
+            len(train_loader),
+            context="normal estimation training",
+        )
+        optimizer_steps_per_epoch = math.ceil(train_batches_per_epoch / args.grad_accum_steps)
         total_steps = optimizer_steps_per_epoch * args.epochs
         if args.max_steps > 0:
             total_steps = min(total_steps, args.max_steps)

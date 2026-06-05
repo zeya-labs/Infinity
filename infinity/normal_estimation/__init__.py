@@ -30,6 +30,7 @@ _EXPORT_MODULES = {
     "normals_to_vis": ".modeling",
     "resolve_scale_schedule_from_hw": ".modeling",
     "token_cache_sample_key": ".token_cache",
+    "require_positive_steps_per_epoch": ".training",
 }
 
 

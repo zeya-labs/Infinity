@@ -32,6 +32,7 @@ from infinity.normal_estimation import (
     build_normal_train_dataset,
     parse_train_dataset_names,
     parse_train_dataset_weights,
+    require_positive_steps_per_epoch,
 )
 from infinity.normal_estimation.defaults import (  # noqa: E402
     DEFAULT_HYPERSIM_ROOT,
@@ -772,7 +773,7 @@ def main() -> None:
             eps=1e-8,
         )
 
-        steps_per_epoch = len(train_loader)
+        steps_per_epoch = require_positive_steps_per_epoch(len(train_loader), context="normal tokenizer training")
         total_steps = args.max_steps if args.max_steps > 0 else args.epochs * steps_per_epoch
         scheduler = build_scheduler(optimizer, args, total_steps=total_steps)
 
