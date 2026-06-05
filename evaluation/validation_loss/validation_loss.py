@@ -13,7 +13,6 @@ import collections
 from collections import deque
 from contextlib import nullcontext
 from functools import partial
-from typing import List, Optional, Tuple
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import numpy as np
@@ -26,6 +25,7 @@ import tqdm
 from tools.run_infinity import *
 from infinity.dataset.dataset_t2i_iterable import T2IIterableDataset
 from infinity.models.bitwise_self_correction import BitwiseSelfCorrection
+from infinity.utils.text_condition import build_text_condition
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -84,18 +84,7 @@ if __name__ == '__main__':
 
         pbar.update(1)
         inp_B3HW, captions = data
-        tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
-        input_ids = tokens.input_ids.cuda(non_blocking=True)
-        mask = tokens.attention_mask.cuda(non_blocking=True)
-        text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-        lens: List[int] = mask.sum(dim=-1).tolist()
-        cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-        Ltext = max(lens)
-        kv_compact = []
-        for len_i, feat_i in zip(lens, text_features.unbind(0), strict=True):
-            kv_compact.append(feat_i[:len_i])
-        kv_compact = torch.cat(kv_compact, dim=0)
-        text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)
+        text_cond_tuple = build_text_condition(text_tokenizer, text_encoder, captions)
 
         h_div_w = inp_B3HW.shape[-2] / inp_B3HW.shape[-1]
         h_div_w_templates = np.array(list(dynamic_resolution_h_w.keys()))

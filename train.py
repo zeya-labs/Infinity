@@ -28,6 +28,7 @@ from infinity.dataset.build import build_t2i_dataset
 from infinity.utils.save_and_load import CKPTSaver, auto_resume
 from infinity.utils import arg_util, misc, wandb_utils
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
+from infinity.utils.text_condition import build_text_condition
 
 enable_timeline_sdk = False
 
@@ -488,20 +489,7 @@ def train_one_ep(
             with maybe_record_function('before_train'):
                 # [get data]
                 inp, captions = data
-                tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
-                input_ids = tokens.input_ids.cuda(non_blocking=True)
-                mask = tokens.attention_mask.cuda(non_blocking=True)
-                text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-
-                lens: List[int] = mask.sum(dim=-1).tolist()
-                cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-                Ltext = max(lens)
-
-                kv_compact = []
-                for len_i, feat_i in zip(lens, text_features.unbind(0), strict=True):
-                    kv_compact.append(feat_i[:len_i])
-                kv_compact = torch.cat(kv_compact, dim=0)
-                text_cond_tuple: Tuple[torch.FloatTensor, List[int], torch.LongTensor, int] = (kv_compact, lens, cu_seqlens_k, Ltext)
+                text_cond_tuple = build_text_condition(text_tokenizer, text_encoder, captions)
                 inp = inp.to(args.device, non_blocking=True)
                 if it > start_it + 10:
                     telling_dont_kill.early_stop()

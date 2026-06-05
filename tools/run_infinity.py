@@ -1,7 +1,6 @@
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import os.path as osp
-from typing import List
 import math
 import time
 import hashlib
@@ -17,7 +16,6 @@ torch._dynamo.config.cache_size_limit=64
 import pandas as pd
 from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 from PIL import Image, ImageEnhance
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 from infinity.models.infinity import Infinity
@@ -25,6 +23,7 @@ from infinity.models.basic import *
 import PIL.Image as PImage
 from torchvision.transforms.functional import to_tensor
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
+from infinity.utils.text_condition import build_text_condition
 
 
 def extract_key_val(text):
@@ -41,20 +40,7 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
         prompt = aug_with_positive_prompt(prompt)
         print(f'after positive_prompt aug: {prompt}')
     print(f'prompt={prompt}')
-    captions = [prompt]
-    tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
-    input_ids = tokens.input_ids.cuda(non_blocking=True)
-    mask = tokens.attention_mask.cuda(non_blocking=True)
-    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-    lens: List[int] = mask.sum(dim=-1).tolist()
-    cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-    Ltext = max(lens)
-    kv_compact = []
-    for len_i, feat_i in zip(lens, text_features.unbind(0), strict=True):
-        kv_compact.append(feat_i[:len_i])
-    kv_compact = torch.cat(kv_compact, dim=0)
-    text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
-    return text_cond_tuple
+    return build_text_condition(text_tokenizer, text_encoder, [prompt], max_length=512)
 
 def aug_with_positive_prompt(prompt):
     for key in ['man', 'woman', 'men', 'women', 'boy', 'girl', 'child', 'person', 'human', 'adult', 'teenager', 'employee',
