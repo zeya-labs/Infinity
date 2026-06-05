@@ -875,7 +875,7 @@ def resolve_resume_path(args: argparse.Namespace) -> Path | None:
                 return step_checkpoint
         if requested.is_file():
             return requested
-        return None
+        raise FileNotFoundError(f"--resume checkpoint not found: {requested}")
 
     for candidate in (checkpoint_dir / "last_step.pth", checkpoint_dir / "last.pth"):
         if candidate.is_file():
