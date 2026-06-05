@@ -241,7 +241,7 @@ def vae_model(vqgan_ckpt, schedule_mode, codebook_dim, codebook_size, test_mode=
     if not use_vae:
         num_codes = args.codebook_size
     if isinstance(vqgan_ckpt, str):
-        state_dict = torch.load(args.vqgan_ckpt, map_location=torch.device("cpu"), weights_only=True)
+        state_dict = torch.load(args.vqgan_ckpt, map_location=torch.device("cpu"), weights_only=True, mmap=True)
     else:
         state_dict = args.vqgan_ckpt
     if state_dict:

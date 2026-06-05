@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ except ImportError:
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 try:
@@ -49,6 +51,7 @@ from infinity.normal_estimation import (  # noqa: E402
     collate_normal_estimation_batch,
     compute_normal_metrics,
     decode_logits_to_normal,
+    load_hypersim_normal_sample_from_metadata,
     load_infinity_state_dict,
     normals_to_vis,
     resolve_scale_schedule_from_hw,
@@ -80,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Micro-batches to accumulate before each optimizer step.")
     parser.add_argument("--val-batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4)
@@ -96,6 +100,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--precision", type=str, choices=("fp32", "bf16", "fp16"), default="bf16")
+    parser.add_argument(
+        "--optimizer-backend",
+        type=str,
+        choices=("loop", "foreach", "fused"),
+        default="loop",
+        help="AdamW implementation. 'loop' preserves the previous foreach=False path; 'fused' is fastest on supported CUDA builds.",
+    )
     parser.add_argument("--zero", type=int, choices=(0, 2, 3), default=0)
     parser.add_argument(
         "--ddp-bucket-cap-mb",
@@ -115,6 +126,12 @@ def parse_args() -> argparse.Namespace:
         choices=("full-block", "self-attn", "none"),
         default="full-block",
         help="Activation checkpointing mode for Infinity blocks. Use 'none' for speed if memory allows.",
+    )
+    parser.add_argument(
+        "--full-block-checkpoint-skip-interval",
+        type=int,
+        default=0,
+        help="For --checkpointing=full-block, leave every Nth block uncheckpointed. 0 preserves the previous every-block policy.",
     )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--image-log-every", type=int, default=200)
@@ -144,7 +161,31 @@ def parse_args() -> argparse.Namespace:
         help="Optional directory for deterministic train token cache. Skips RGB/normal VAE tokenization on cache hits.",
     )
     parser.add_argument("--token-cache-memory", action="store_true", default=False, help="Keep token cache entries in host memory after first load/write.")
+    parser.add_argument(
+        "--token-cache-metadata-only",
+        action="store_true",
+        default=False,
+        help="For train data, return metadata only and materialize raw samples only on token-cache misses or decoded-metric/image steps.",
+    )
+    parser.add_argument(
+        "--token-cache-require-hit",
+        action="store_true",
+        default=False,
+        help="Fail instead of falling back to raw VAE tokenization if a train token-cache entry is missing.",
+    )
+    parser.add_argument(
+        "--token-cache-filter-missing",
+        action="store_true",
+        default=False,
+        help="Filter the train dataset to samples with existing token-cache entries before training.",
+    )
     parser.add_argument("--model-name", type=str, default="infinity_8b")
+    parser.add_argument(
+        "--fast-model-init",
+        action="store_true",
+        default=False,
+        help="Skip expensive default parameter initialization for the Infinity model when it will be immediately warm-started.",
+    )
     parser.add_argument("--use-bit-label", action="store_true", default=True)
     parser.add_argument("--disable-bit-label", dest="use_bit_label", action="store_false")
     parser.add_argument("--add-lvl-embeding-only-first-block", type=int, choices=(0, 1), default=1)
@@ -191,6 +232,21 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("SWANLAB_MODE", "cloud"),
     )
     parser.add_argument("--swanlab-logdir", type=str, default="")
+    parser.add_argument("--profile-timings", action="store_true", default=False, help="Log coarse init and per-step timing breakdowns.")
+    parser.add_argument("--profile-warmup-steps", type=int, default=1, help="Skip this many optimizer steps before logging profile_step timings.")
+    parser.add_argument("--profile-max-steps", type=int, default=0, help="Maximum number of profile_step logs after warmup; 0 logs all.")
+    parser.add_argument(
+        "--profile-torch-step",
+        type=int,
+        default=0,
+        help="Capture one torch.profiler optimizer step at this 1-based global step; 0 disables.",
+    )
+    parser.add_argument(
+        "--profile-torch-row-limit",
+        type=int,
+        default=40,
+        help="Number of rows to write in the torch.profiler CUDA time table.",
+    )
     return parser.parse_args()
 
 
@@ -262,6 +318,83 @@ def dist_barrier_if_initialized() -> None:
         dist.barrier()
 
 
+@contextmanager
+def skip_torch_weight_init(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    init_names = (
+        "uniform_",
+        "normal_",
+        "trunc_normal_",
+        "constant_",
+        "ones_",
+        "zeros_",
+        "xavier_uniform_",
+        "xavier_normal_",
+        "kaiming_uniform_",
+        "kaiming_normal_",
+    )
+    saved_init_fns = {name: getattr(torch.nn.init, name) for name in init_names if hasattr(torch.nn.init, name)}
+    saved_resets = {
+        torch.nn.Linear: torch.nn.Linear.reset_parameters,
+        torch.nn.Embedding: torch.nn.Embedding.reset_parameters,
+        torch.nn.LayerNorm: torch.nn.LayerNorm.reset_parameters,
+    }
+
+    def no_init_(tensor, *args, **kwargs):
+        return tensor
+
+    try:
+        for name in saved_init_fns:
+            setattr(torch.nn.init, name, no_init_)
+        for module_cls in saved_resets:
+            module_cls.reset_parameters = lambda self: None
+        yield
+    finally:
+        for name, fn in saved_init_fns.items():
+            setattr(torch.nn.init, name, fn)
+        for module_cls, reset in saved_resets.items():
+            module_cls.reset_parameters = reset
+
+
+def cuda_synchronize_if_needed(device: torch.device, enabled: bool) -> None:
+    if enabled and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+@contextmanager
+def timed_stage(timings: dict[str, float] | None, name: str, device: torch.device):
+    if timings is None:
+        yield
+        return
+    cuda_synchronize_if_needed(device, True)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        cuda_synchronize_if_needed(device, True)
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - start)
+
+
+def format_timing_dict(timings: dict[str, float]) -> str:
+    parts = []
+    for key, value in sorted(timings.items()):
+        suffix = "GiB" if key.endswith("_gib") else "s"
+        parts.append(f"{key}={value:.3f}{suffix}")
+    return " ".join(parts)
+
+
+def reduce_timing_dict(timings: dict[str, float], distributed: bool, device: torch.device) -> dict[str, float]:
+    if not distributed:
+        return dict(timings)
+    keys = sorted(timings)
+    values = torch.tensor([timings[key] for key in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    return {key: float(value) for key, value in zip(keys, values.tolist())}
+
+
 def make_dataloader(
     dataset: HypersimNormalDataset,
     *,
@@ -291,13 +424,32 @@ def make_dataloader(
 
 def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace, total_steps: int) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
     params = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(
-        params,
-        lr=args.lr,
-        betas=tuple(args.betas),
-        weight_decay=args.weight_decay,
-        foreach=False,
-    )
+    optimizer_kwargs: dict[str, Any] = {}
+    if args.optimizer_backend == "fused":
+        optimizer_kwargs["fused"] = True
+    elif args.optimizer_backend == "foreach":
+        optimizer_kwargs["foreach"] = True
+    else:
+        optimizer_kwargs["foreach"] = False
+    try:
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=args.lr,
+            betas=tuple(args.betas),
+            weight_decay=args.weight_decay,
+            **optimizer_kwargs,
+        )
+    except (TypeError, RuntimeError) as exc:
+        if args.optimizer_backend != "fused":
+            raise
+        LOGGER.warning("Fused AdamW is unavailable (%s); falling back to foreach AdamW.", exc)
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=args.lr,
+            betas=tuple(args.betas),
+            weight_decay=args.weight_decay,
+            foreach=True,
+        )
 
     warmup_steps = int(total_steps * args.warmup_ratio)
 
@@ -332,6 +484,26 @@ def token_cache_enabled(args: argparse.Namespace) -> bool:
     return bool(args.token_cache_dir) and not (
         args.noise_apply_layers >= 0 and args.noise_apply_strength > 0
     )
+
+
+def batch_has_full_tensors(batch: dict[str, Any]) -> bool:
+    return bool(batch["image"].numel() > 0 and batch["target"].numel() > 0 and batch["mask"].numel() > 0)
+
+
+def materialize_batch_from_metadata(batch: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    samples = [load_hypersim_normal_sample_from_metadata(metadata, args.pn) for metadata in batch["metadata"]]
+    return collate_normal_estimation_batch(samples)
+
+
+def resolve_batch_scale_schedule(batch: dict[str, Any], args: argparse.Namespace) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
+    target_cpu = batch["target"]
+    if target_cpu.numel() > 0:
+        target_hw = (int(target_cpu.shape[-2]), int(target_cpu.shape[-1]))
+    else:
+        target_hw = tuple(int(item) for item in batch["metadata"][0]["target_size"])
+    scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target_hw[0], target_hw[1], args.pn)[1]]
+    training_scales = min(args.always_training_scales, len(scale_schedule))
+    return target_cpu, scale_schedule[:training_scales]
 
 
 def token_cache_signature(args: argparse.Namespace, scale_schedule: list[tuple[int, int, int]]) -> str:
@@ -376,7 +548,7 @@ def load_token_cache_batch(
         if payload is None:
             if not path.is_file():
                 return None
-            payload = torch.load(path, map_location="cpu", weights_only=False)
+            payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             if use_memory_cache:
                 TOKEN_CACHE_MEMORY[path_key] = payload
         payloads.append(payload)
@@ -386,6 +558,42 @@ def load_token_cache_batch(
         torch.stack([payload["gt_bl"] for payload in payloads], dim=0).to(device, non_blocking=True),
         torch.stack([payload["raw_features"] for payload in payloads], dim=0).to(device, non_blocking=True),
     )
+
+
+def missing_token_cache_paths(cache_dir: Path, metadata: list[dict[str, Any]], signature: str) -> list[Path]:
+    return [
+        cache_dir / token_cache_sample_key(item, signature)
+        for item in metadata
+        if not (cache_dir / token_cache_sample_key(item, signature)).is_file()
+    ]
+
+
+def filter_dataset_to_token_cache_hits(dataset: HypersimNormalDataset, args: argparse.Namespace, cache_dir: Path) -> int:
+    kept_records = []
+    for index, record in enumerate(dataset.records):
+        image_path = dataset.root / record["images"]
+        depth_path = dataset.root / record["depth"]
+        normal_path = dataset.root / record["normal"]
+        target_hw = tuple(int(item) for item in dataset._metadata_only_sample(index)["metadata"]["target_size"])
+        metadata = dataset._metadata_for_record(
+            index,
+            record,
+            image_path,
+            depth_path,
+            normal_path,
+            target_hw,
+            original_hw=(768, 1024),
+        )
+        scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target_hw[0], target_hw[1], args.pn)[1]]
+        scale_schedule = scale_schedule[: min(args.always_training_scales, len(scale_schedule))]
+        signature = token_cache_signature(args, scale_schedule)
+        if (cache_dir / token_cache_sample_key(metadata, signature)).is_file():
+            kept_record = dict(record)
+            kept_record["__original_index"] = str(index)
+            kept_records.append(kept_record)
+    original_len = len(dataset.records)
+    dataset.records = kept_records
+    return original_len
 
 
 def save_token_cache_batch(
@@ -639,6 +847,9 @@ def swanlab_local_resume_patch(logdir: Path, run_id: str, run_dir: Path | None):
 def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> Any | None:
     if not enabled or args.swanlab_mode == "disabled":
         return None
+    if args.swanlab_mode == "local" and importlib.util.find_spec("swanboard") is None:
+        LOGGER.warning("Disabled SwanLab local mode because swanboard is not installed.")
+        return None
     if swanlab is None:
         raise ImportError("swanlab is not installed, but SwanLab logging is enabled.")
 
@@ -671,7 +882,11 @@ def init_swanlab(args: argparse.Namespace, output_dir: Path, enabled: bool) -> A
 
     local_run_dir = find_swanlab_local_run_dir(logdir, run_id, state) if args.swanlab_mode == "local" else None
     with swanlab_local_resume_patch(logdir, run_id, local_run_dir):
-        run = swanlab.init(**init_kwargs)
+        try:
+            run = swanlab.init(**init_kwargs)
+        except Exception:
+            LOGGER.exception("SwanLab init failed mode=%s logdir=%s", args.swanlab_mode, logdir)
+            raise
     run_public = getattr(run, "public", None)
     current_run_id = str(getattr(run_public, "run_id", "")).strip()
     current_run_dir = str(getattr(run_public, "run_dir", "")).strip()
@@ -821,7 +1036,7 @@ def maybe_resume(
     if resume_path is None:
         return 0, 0, float("inf")
 
-    checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False, mmap=True)
     checkpoint_zero = int(checkpoint.get("zero", 0))
     if is_fsdp_model(model):
         require_fsdp_state_dict_api()
@@ -900,11 +1115,11 @@ def forward_batch(
     precision: str,
     compute_decoded_metrics: bool = True,
     include_aux_loss: bool = True,
+    require_token_cache_hit: bool = True,
+    timings: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    target_cpu = batch["target"]
-    scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target_cpu.shape[-2], target_cpu.shape[-1], args.pn)[1]]
-    training_scales = min(args.always_training_scales, len(scale_schedule))
-    scale_schedule = scale_schedule[:training_scales]
+    with timed_stage(timings, "schedule", device):
+        target_cpu, scale_schedule = resolve_batch_scale_schedule(batch, args)
     image: torch.Tensor | None = None
     target: torch.Tensor | None = None
     mask: torch.Tensor | None = None
@@ -912,51 +1127,66 @@ def forward_batch(
     with torch.no_grad():
         cache_dir = Path(args.token_cache_dir) if token_cache_enabled(args) else None
         cache_signature = token_cache_signature(args, scale_schedule) if cache_dir is not None else ""
-        cached_tokens = (
-            load_token_cache_batch(cache_dir, batch["metadata"], cache_signature, device, args.token_cache_memory)
-            if cache_dir is not None
-            else None
-        )
+        with timed_stage(timings, "cache_load", device):
+            cached_tokens = (
+                load_token_cache_batch(cache_dir, batch["metadata"], cache_signature, device, args.token_cache_memory)
+                if cache_dir is not None
+                else None
+            )
         if cached_tokens is not None:
             rgb_prefix_blc, x_blc_without_prefix, gt_bl, raw_features = cached_tokens
         else:
-            image = batch["image"].to(device, non_blocking=True)
-            target = target_cpu.to(device, non_blocking=True)
-            rgb_prefix_blc = build_prefix_tokens_from_image(
-                image_01=image,
-                rgb_vae=rgb_vae,
-                scale_schedule=scale_schedule,
-                apply_spatial_patchify=args.rgb_apply_spatial_patchify,
-            )
+            if cache_dir is not None and args.token_cache_require_hit and require_token_cache_hit:
+                missing_paths = missing_token_cache_paths(cache_dir, batch["metadata"], cache_signature)
+                preview = ", ".join(str(path) for path in missing_paths[:3])
+                raise FileNotFoundError(f"Token cache miss for {len(missing_paths)} samples. First missing paths: {preview}")
+            if not batch_has_full_tensors(batch):
+                with timed_stage(timings, "raw_materialize", device):
+                    batch = materialize_batch_from_metadata(batch, args)
+                with timed_stage(timings, "schedule", device):
+                    target_cpu, scale_schedule = resolve_batch_scale_schedule(batch, args)
+                    cache_signature = token_cache_signature(args, scale_schedule) if cache_dir is not None else ""
+            with timed_stage(timings, "batch_to_gpu", device):
+                image = batch["image"].to(device, non_blocking=True)
+                target = target_cpu.to(device, non_blocking=True)
+            with timed_stage(timings, "rgb_tokenize", device):
+                rgb_prefix_blc = build_prefix_tokens_from_image(
+                    image_01=image,
+                    rgb_vae=rgb_vae,
+                    scale_schedule=scale_schedule,
+                    apply_spatial_patchify=args.rgb_apply_spatial_patchify,
+                )
             normal_vae_scale_schedule = [
                 (pt, 2 * ph, 2 * pw) if args.normal_apply_spatial_patchify else (pt, ph, pw)
                 for pt, ph, pw in scale_schedule
             ]
-            raw_features, _, _ = normal_vae.encode_for_raw_features(target, scale_schedule=normal_vae_scale_schedule)
-            x_blc_without_prefix, gt_ms_idx_bl = build_multiscale_var_inputs(
-                vae=normal_vae,
-                raw_features=raw_features,
-                vae_scale_schedule=normal_vae_scale_schedule,
-                apply_spatial_patchify=args.normal_apply_spatial_patchify,
-                noise_apply_layers=args.noise_apply_layers,
-                noise_apply_strength=args.noise_apply_strength,
-                noise_apply_requant=args.noise_apply_requant,
-            )
-            total_seq_len = int(sum(np.array(item).prod() for item in scale_schedule))
-            gt_bl = torch.cat(gt_ms_idx_bl, dim=1)[:, :total_seq_len].contiguous().long()
+            with timed_stage(timings, "normal_tokenize", device):
+                raw_features, _, _ = normal_vae.encode_for_raw_features(target, scale_schedule=normal_vae_scale_schedule)
+                x_blc_without_prefix, gt_ms_idx_bl = build_multiscale_var_inputs(
+                    vae=normal_vae,
+                    raw_features=raw_features,
+                    vae_scale_schedule=normal_vae_scale_schedule,
+                    apply_spatial_patchify=args.normal_apply_spatial_patchify,
+                    noise_apply_layers=args.noise_apply_layers,
+                    noise_apply_strength=args.noise_apply_strength,
+                    noise_apply_requant=args.noise_apply_requant,
+                )
+                total_seq_len = int(sum(np.array(item).prod() for item in scale_schedule))
+                gt_bl = torch.cat(gt_ms_idx_bl, dim=1)[:, :total_seq_len].contiguous().long()
             if cache_dir is not None:
                 first_stage_len = int(np.array(scale_schedule[0]).prod())
                 cache_x_blc = x_blc_without_prefix[:, : total_seq_len - first_stage_len, :].contiguous()
-                save_token_cache_batch(
-                    cache_dir,
-                    batch["metadata"],
-                    cache_signature,
-                    rgb_prefix_blc,
-                    cache_x_blc,
-                    gt_bl,
-                    raw_features,
-                    args.token_cache_memory,
-                )
+                with timed_stage(timings, "cache_save", device):
+                    save_token_cache_batch(
+                        cache_dir,
+                        batch["metadata"],
+                        cache_signature,
+                        rgb_prefix_blc,
+                        cache_x_blc,
+                        gt_bl,
+                        raw_features,
+                        args.token_cache_memory,
+                    )
 
     total_seq_len = int(sum(np.array(item).prod() for item in scale_schedule))
     first_stage_len = int(np.array(scale_schedule[0]).prod())
@@ -971,36 +1201,43 @@ def forward_batch(
 
     with precision_context(precision):
         with activation_context:
-            logits_blv = model(rgb_prefix_blc, x_blc_without_prefix, scale_schedule=scale_schedule)
-        ce_loss, ce_metrics = compute_ce_loss(logits_blv, gt_bl, use_bit_label=args.use_bit_label)
+            with timed_stage(timings, "model_forward", device):
+                logits_blv = model(rgb_prefix_blc, x_blc_without_prefix, scale_schedule=scale_schedule)
+        with timed_stage(timings, "ce_loss", device):
+            ce_loss, ce_metrics = compute_ce_loss(logits_blv, gt_bl, use_bit_label=args.use_bit_label)
         if compute_decoded_metrics:
-            if target is None:
-                target = target_cpu.to(device, non_blocking=True)
-            if mask is None:
-                mask = batch["mask"].to(device, non_blocking=True)
-            prediction, latent_prediction = decode_logits_to_normal(
-                logits_blv=logits_blv,
-                vae=normal_vae,
-                scale_schedule=scale_schedule,
-                use_bit_label=args.use_bit_label,
-                apply_spatial_patchify=args.normal_apply_spatial_patchify,
-            )
-            target_for_prediction, mask_for_prediction = maybe_resize_target_for_prediction(prediction, target, mask)
-            if latent_prediction.shape == raw_features.unsqueeze(2).shape:
-                latent_target = raw_features.unsqueeze(2)
-            else:
-                latent_target = None
-            aux_loss, aux_metrics = compute_normal_metrics(
-                prediction=prediction,
-                target=target_for_prediction,
-                mask=mask_for_prediction,
-                latent_prediction=latent_prediction,
-                latent_target=latent_target,
-                l1_weight=args.normal_l1_weight,
-                angular_weight=args.normal_angular_weight,
-                latent_weight=args.normal_latent_weight,
-                norm_weight=args.normal_norm_weight,
-            )
+            with timed_stage(timings, "decoded_metrics", device):
+                if not batch_has_full_tensors(batch):
+                    batch = materialize_batch_from_metadata(batch, args)
+                    target_cpu = batch["target"]
+                if target is None:
+                    target = target_cpu.to(device, non_blocking=True)
+                if mask is None:
+                    mask = batch["mask"].to(device, non_blocking=True)
+                with torch.set_grad_enabled(include_aux_loss and torch.is_grad_enabled()):
+                    prediction, latent_prediction = decode_logits_to_normal(
+                        logits_blv=logits_blv,
+                        vae=normal_vae,
+                        scale_schedule=scale_schedule,
+                        use_bit_label=args.use_bit_label,
+                        apply_spatial_patchify=args.normal_apply_spatial_patchify,
+                    )
+                    target_for_prediction, mask_for_prediction = maybe_resize_target_for_prediction(prediction, target, mask)
+                    if latent_prediction.shape == raw_features.unsqueeze(2).shape:
+                        latent_target = raw_features.unsqueeze(2)
+                    else:
+                        latent_target = None
+                    aux_loss, aux_metrics = compute_normal_metrics(
+                        prediction=prediction,
+                        target=target_for_prediction,
+                        mask=mask_for_prediction,
+                        latent_prediction=latent_prediction,
+                        latent_target=latent_target,
+                        l1_weight=args.normal_l1_weight,
+                        angular_weight=args.normal_angular_weight,
+                        latent_weight=args.normal_latent_weight,
+                        norm_weight=args.normal_norm_weight,
+                    )
         else:
             prediction = target if target is not None else target_cpu
             aux_loss = ce_loss.new_tensor(0.0)
@@ -1023,7 +1260,7 @@ def forward_batch(
         "loss_total": total_loss.detach(),
     }
     if image is None:
-        image = batch["image"]
+        image = batch["image"] if batch["image"].numel() > 0 else torch.empty(0)
     return total_loss, metrics, prediction.detach(), image.detach()
 
 
@@ -1052,6 +1289,7 @@ def evaluate(
             args=args,
             device=device,
             precision=args.precision,
+            require_token_cache_hit=False,
         )
         if visual_payload is None:
             visual_payload = {
@@ -1153,7 +1391,10 @@ def evaluate_ar(
 
 
 def main() -> int:
+    script_start_time = time.perf_counter()
     args = parse_args()
+    args.grad_accum_steps = max(1, int(args.grad_accum_steps))
+    init_timings: dict[str, float] = {}
     distributed, rank, world_size, device = init_distributed()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1168,54 +1409,64 @@ def main() -> int:
     try:
         if rank == 0:
             LOGGER.info(
-                "batch_size_per_gpu=%d global_batch_size=%d val_batch_size_per_gpu=%d zero=%d swanlab_mode=%s",
+                "batch_size_per_gpu=%d grad_accum_steps=%d global_batch_size=%d effective_global_batch_size=%d val_batch_size_per_gpu=%d zero=%d swanlab_mode=%s",
                 args.batch_size,
+                args.grad_accum_steps,
                 args.batch_size * world_size,
+                args.batch_size * world_size * args.grad_accum_steps,
                 args.val_batch_size,
                 args.zero,
                 args.swanlab_mode,
             )
+            if args.token_cache_metadata_only and not token_cache_enabled(args):
+                LOGGER.warning("--token-cache-metadata-only was requested, but token cache is disabled for this run.")
 
-        train_dataset = HypersimNormalDataset(
-            root=args.data_root,
-            partition=args.train_partition,
-            pn=args.pn,
-            max_samples=args.max_train_samples,
-        )
-        val_dataset = HypersimNormalDataset(
-            root=args.data_root,
-            partition=args.val_partition,
-            pn=args.pn,
-            max_samples=args.max_val_samples,
-        )
-        ar_val_dataset = HypersimNormalDataset(
-            root=args.data_root,
-            partition=args.val_partition,
-            pn=args.pn,
-            max_samples=args.ar_eval_samples,
-        ) if args.ar_eval_samples > 0 else None
-        train_loader, train_sampler = make_dataloader(
-            train_dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            prefetch_factor=args.prefetch_factor,
-            distributed=distributed,
-            shuffle=True,
-            drop_last=True,
-        )
-        val_loader, _ = make_dataloader(
-            val_dataset,
-            batch_size=args.val_batch_size,
-            num_workers=args.num_workers,
-            prefetch_factor=args.prefetch_factor,
-            distributed=distributed,
-            shuffle=False,
-            drop_last=False,
-        )
-        ar_val_loader = None
-        if ar_val_dataset is not None:
-            ar_val_loader, _ = make_dataloader(
-                ar_val_dataset,
+        with timed_stage(init_timings if args.profile_timings else None, "dataset_loader", device):
+            train_dataset = HypersimNormalDataset(
+                root=args.data_root,
+                partition=args.train_partition,
+                pn=args.pn,
+                max_samples=args.max_train_samples,
+                metadata_only=args.token_cache_metadata_only and token_cache_enabled(args),
+            )
+            if args.token_cache_filter_missing:
+                if not token_cache_enabled(args):
+                    raise ValueError("--token-cache-filter-missing requires --token-cache-dir.")
+                original_len = filter_dataset_to_token_cache_hits(train_dataset, args, Path(args.token_cache_dir))
+                if rank == 0:
+                    LOGGER.info(
+                        "Filtered train dataset by token cache hits: kept=%d original=%d",
+                        len(train_dataset),
+                        original_len,
+                    )
+                if len(train_dataset) == 0:
+                    raise RuntimeError("No train samples have token-cache entries after --token-cache-filter-missing.")
+            val_dataset = HypersimNormalDataset(
+                root=args.data_root,
+                partition=args.val_partition,
+                pn=args.pn,
+                max_samples=args.max_val_samples,
+            )
+            ar_val_dataset = HypersimNormalDataset(
+                root=args.data_root,
+                partition=args.val_partition,
+                pn=args.pn,
+                max_samples=args.ar_eval_samples,
+            ) if args.ar_eval_samples > 0 else None
+            train_shuffle = not args.token_cache_filter_missing
+            if rank == 0 and not train_shuffle:
+                LOGGER.info("Disabled train shuffle because --token-cache-filter-missing is enabled.")
+            train_loader, train_sampler = make_dataloader(
+                train_dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                distributed=distributed,
+                shuffle=train_shuffle,
+                drop_last=True,
+            )
+            val_loader, _ = make_dataloader(
+                val_dataset,
                 batch_size=args.val_batch_size,
                 num_workers=args.num_workers,
                 prefetch_factor=args.prefetch_factor,
@@ -1223,77 +1474,109 @@ def main() -> int:
                 shuffle=False,
                 drop_last=False,
             )
+            ar_val_loader = None
+            if ar_val_dataset is not None:
+                ar_val_loader, _ = make_dataloader(
+                    ar_val_dataset,
+                    batch_size=args.val_batch_size,
+                    num_workers=args.num_workers,
+                    prefetch_factor=args.prefetch_factor,
+                    distributed=distributed,
+                    shuffle=False,
+                    drop_last=False,
+                )
 
-        normal_vae = build_bsq_vae(
-            ckpt_path=args.normal_vae_ckpt,
-            codebook_dim=args.normal_vae_type,
-            apply_spatial_patchify=args.normal_apply_spatial_patchify,
-            device=device,
-        )
-        rgb_vae = build_bsq_vae(
-            ckpt_path=args.rgb_vae_ckpt,
-            codebook_dim=args.rgb_vae_type,
-            apply_spatial_patchify=args.rgb_apply_spatial_patchify,
-            device=device,
-        )
+        with timed_stage(init_timings if args.profile_timings else None, "vae_load", device):
+            normal_vae = build_bsq_vae(
+                ckpt_path=args.normal_vae_ckpt,
+                codebook_dim=args.normal_vae_type,
+                apply_spatial_patchify=args.normal_apply_spatial_patchify,
+                device=device,
+            )
+            rgb_vae = build_bsq_vae(
+                ckpt_path=args.rgb_vae_ckpt,
+                codebook_dim=args.rgb_vae_type,
+                apply_spatial_patchify=args.rgb_apply_spatial_patchify,
+                device=device,
+            )
 
-        model = build_infinity_normal_model(
-            model_name=args.model_name,
-            vae_local=normal_vae,
-            pn=args.pn,
-            batch_size=args.batch_size,
-            use_bit_label=args.use_bit_label,
-            add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
-            rope2d_each_sa_layer=args.rope2d_each_sa_layer,
-            rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
-            apply_spatial_patchify=args.normal_apply_spatial_patchify,
-            checkpointing=None if args.checkpointing == "none" else args.checkpointing,
-            normal_use_flex_attn=args.normal_use_flex_attn,
-            normal_use_segmented_flash_attn=args.normal_use_segmented_flash_attn,
-            normal_bf16_activations=args.normal_bf16_activations,
-            fused_mlp=args.fused_mlp,
-            fused_norm=args.fused_norm,
-            device=device,
-        )
-        model = convert_model_precision(model, args.precision)
-        maybe_load_init_model(model, args.init_model, is_main=(rank == 0))
-        model = build_training_model(model, args=args, device=device, distributed=distributed)
+        with timed_stage(init_timings if args.profile_timings else None, "model_build", device):
+            with skip_torch_weight_init(args.fast_model_init and bool(args.init_model)):
+                model = build_infinity_normal_model(
+                    model_name=args.model_name,
+                    vae_local=normal_vae,
+                    pn=args.pn,
+                    batch_size=args.batch_size,
+                    use_bit_label=args.use_bit_label,
+                    add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
+                    rope2d_each_sa_layer=args.rope2d_each_sa_layer,
+                    rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
+                    apply_spatial_patchify=args.normal_apply_spatial_patchify,
+                    checkpointing=None if args.checkpointing == "none" else args.checkpointing,
+                    normal_use_flex_attn=args.normal_use_flex_attn,
+                    normal_use_segmented_flash_attn=args.normal_use_segmented_flash_attn,
+                    normal_bf16_activations=args.normal_bf16_activations,
+                    fused_mlp=args.fused_mlp,
+                    fused_norm=args.fused_norm,
+                    device=device,
+                )
+            if args.checkpointing == "full-block":
+                model.checkpointing_full_block_skip_interval = max(0, int(args.full_block_checkpoint_skip_interval))
+            model = convert_model_precision(model, args.precision)
+        with timed_stage(init_timings if args.profile_timings else None, "init_model_load", device):
+            maybe_load_init_model(model, args.init_model, is_main=(rank == 0))
+        with timed_stage(init_timings if args.profile_timings else None, "distributed_wrap", device):
+            model = build_training_model(model, args=args, device=device, distributed=distributed)
 
-        total_steps = len(train_loader) * args.epochs
+        optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+        total_steps = optimizer_steps_per_epoch * args.epochs
         if args.max_steps > 0:
             total_steps = min(total_steps, args.max_steps)
-        optimizer, scheduler = build_optimizer_and_scheduler(model, args, total_steps=max(1, total_steps))
-        scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16"))
-        start_epoch, global_step, best_val_angle = maybe_resume(
-            args=args,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler if args.precision == "fp16" else None,
-            is_main=(rank == 0),
-        )
+        with timed_stage(init_timings if args.profile_timings else None, "optimizer_build", device):
+            optimizer, scheduler = build_optimizer_and_scheduler(model, args, total_steps=max(1, total_steps))
+            scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16"))
+        with timed_stage(init_timings if args.profile_timings else None, "resume_load", device):
+            start_epoch, global_step, best_val_angle = maybe_resume(
+                args=args,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler if args.precision == "fp16" else None,
+                is_main=(rank == 0),
+            )
         if global_step > 0:
-            step_epoch = min(global_step // len(train_loader), args.epochs)
+            step_epoch = min(global_step // optimizer_steps_per_epoch, args.epochs)
             if step_epoch > start_epoch:
                 if rank == 0:
                     LOGGER.info(
-                        "Adjusted start_epoch from %d to %d based on global_step=%d and train_batches=%d",
+                        "Adjusted start_epoch from %d to %d based on global_step=%d and optimizer_steps_per_epoch=%d",
                         start_epoch,
                         step_epoch,
                         global_step,
-                        len(train_loader),
+                        optimizer_steps_per_epoch,
                     )
                 start_epoch = step_epoch
 
-        swanlab_run = init_swanlab(args, output_dir, enabled=(rank == 0))
+        with timed_stage(init_timings if args.profile_timings else None, "swanlab_init", device):
+            swanlab_run = init_swanlab(args, output_dir, enabled=(rank == 0))
+        if args.profile_timings:
+            init_timings["startup_total"] = time.perf_counter() - script_start_time
+            reduced_init_timings = reduce_timing_dict(init_timings, distributed, device)
+            if rank == 0:
+                LOGGER.info("profile_init %s", format_timing_dict(reduced_init_timings))
 
         model.train()
         start_time = time.time()
+        profile_steps_logged = 0
         for epoch in range(start_epoch, args.epochs):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
-            resume_batch_offset = global_step % len(train_loader) if epoch == start_epoch else 0
+            resume_batch_offset = (
+                (global_step % optimizer_steps_per_epoch) * args.grad_accum_steps
+                if epoch == start_epoch
+                else 0
+            )
             if resume_batch_offset and rank == 0:
                 LOGGER.info(
                     "Skipping %d already-completed batches in resumed epoch %d",
@@ -1301,67 +1584,181 @@ def main() -> int:
                     epoch + 1,
                 )
             for batch_idx, batch in enumerate(train_loader):
+                step_timings = {} if args.profile_timings else None
+                if step_timings is not None and device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
                 if batch_idx < resume_batch_offset:
                     continue
+                is_last_batch = batch_idx + 1 == len(train_loader)
+                accum_index = (batch_idx - resume_batch_offset) % args.grad_accum_steps
+                accum_count = accum_index + 1
+                accum_start_batch = batch_idx - accum_index
+                current_accum_steps = min(args.grad_accum_steps, len(train_loader) - accum_start_batch)
+                should_step_optimizer = accum_count == args.grad_accum_steps or is_last_batch
                 next_step = global_step + 1
-                should_log_step = next_step % args.log_every == 0 or next_step == 1
-                should_log_image = next_step % args.image_log_every == 0 or next_step == 1
+                profile_this_step = should_step_optimizer and args.profile_torch_step == next_step and rank == 0
+                profiler_context = (
+                    profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=False,
+                    )
+                    if profile_this_step
+                    else nullcontext()
+                )
+                should_log_step = should_step_optimizer and (next_step % args.log_every == 0 or next_step == 1)
+                should_log_image = should_step_optimizer and args.image_log_every > 0 and (
+                    next_step % args.image_log_every == 0 or next_step == 1
+                )
                 should_compute_train_normals = should_log_image or (
-                    args.train_normal_metrics_every > 0 and next_step % args.train_normal_metrics_every == 0
+                    should_step_optimizer
+                    and args.train_normal_metrics_every > 0
+                    and next_step % args.train_normal_metrics_every == 0
                 )
-                optimizer.zero_grad(set_to_none=True)
-                total_loss, metrics, prediction, image = forward_batch(
-                    model=model,
-                    normal_vae=normal_vae,
-                    rgb_vae=rgb_vae,
-                    batch=batch,
-                    args=args,
-                    device=device,
-                    precision=args.precision,
-                    compute_decoded_metrics=should_compute_train_normals,
-                    include_aux_loss=False,
-                )
+                with profiler_context as torch_prof:
+                    if accum_index == 0:
+                        with timed_stage(step_timings, "zero_grad", device):
+                            optimizer.zero_grad(set_to_none=True)
+                    sync_context = (
+                        model.no_sync()
+                        if (
+                            distributed
+                            and world_size > 1
+                            and isinstance(model, DDP)
+                            and not args.ddp_static_graph
+                            and not should_step_optimizer
+                        )
+                        else nullcontext()
+                    )
+                    with sync_context:
+                        total_loss, metrics, prediction, image = forward_batch(
+                            model=model,
+                            normal_vae=normal_vae,
+                            rgb_vae=rgb_vae,
+                            batch=batch,
+                            args=args,
+                            device=device,
+                            precision=args.precision,
+                            compute_decoded_metrics=should_compute_train_normals,
+                            include_aux_loss=False,
+                            require_token_cache_hit=True,
+                            timings=step_timings,
+                        )
+                        backward_loss = total_loss / current_accum_steps
 
-                if args.precision == "fp16":
-                    scaler.scale(total_loss).backward()
-                    if args.grad_clip > 0:
-                        scaler.unscale_(optimizer)
-                        clip_grad_norm(model, args.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    total_loss.backward()
-                    clip_grad_norm(model, args.grad_clip)
-                    optimizer.step()
-                scheduler.step()
+                        with timed_stage(step_timings, "backward", device):
+                            if args.precision == "fp16":
+                                scaler.scale(backward_loss).backward()
+                            else:
+                                backward_loss.backward()
+                    if not should_step_optimizer:
+                        continue
+
+                    if args.precision == "fp16":
+                        if args.grad_clip > 0:
+                            with timed_stage(step_timings, "grad_clip", device):
+                                scaler.unscale_(optimizer)
+                                clip_grad_norm(model, args.grad_clip)
+                        with timed_stage(step_timings, "optimizer_step", device):
+                            scaler.step(optimizer)
+                            scaler.update()
+                    else:
+                        with timed_stage(step_timings, "grad_clip", device):
+                            clip_grad_norm(model, args.grad_clip)
+                        with timed_stage(step_timings, "optimizer_step", device):
+                            optimizer.step()
+                    with timed_stage(step_timings, "scheduler_step", device):
+                        scheduler.step()
+                if profile_this_step:
+                    torch_profile_dir = output_dir / "profiles"
+                    torch_profile_dir.mkdir(parents=True, exist_ok=True)
+                    table = torch_prof.key_averages().table(
+                        sort_by="self_cuda_time_total",
+                        row_limit=args.profile_torch_row_limit,
+                    )
+                    table_path = torch_profile_dir / f"torch_step_{next_step:06d}.txt"
+                    trace_path = torch_profile_dir / f"torch_step_{next_step:06d}.json"
+                    table_path.write_text(table)
+                    torch_prof.export_chrome_trace(str(trace_path))
+                    LOGGER.info("Wrote torch profiler table to %s and trace to %s", table_path, trace_path)
                 global_step += 1
 
                 current_lr = optimizer.param_groups[0]["lr"]
                 if should_log_step:
                     reduced = reduce_metrics(metrics, distributed)
                 if rank == 0 and should_log_step:
-                    LOGGER.info(
-                        "epoch=%d batch=%d/%d global_step=%d/%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f lr=%.2e",
-                        epoch + 1,
-                        batch_idx + 1,
-                        len(train_loader),
-                        global_step,
-                        total_steps,
-                        reduced["loss_total"],
-                        reduced["loss_ce"],
-                        reduced["loss_total_aux"],
-                        reduced["angle_deg"],
-                        reduced["acc_11_25"],
-                        reduced["acc_22_5"],
-                        reduced["acc_30"],
-                        current_lr,
+                    normal_metric_keys = (
+                        "loss_total_aux",
+                        "loss_l1",
+                        "loss_angular_rad",
+                        "loss_latent",
+                        "loss_norm",
+                        "angle_deg",
+                        "acc_11_25",
+                        "acc_22_5",
+                        "acc_30",
                     )
+                    has_normal_metrics = all(
+                        math.isfinite(reduced[key])
+                        for key in ("angle_deg", "acc_11_25", "acc_22_5", "acc_30")
+                    )
+                    if has_normal_metrics:
+                        LOGGER.info(
+                            "epoch=%d batch=%d/%d global_step=%d/%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f lr=%.2e",
+                            epoch + 1,
+                            batch_idx + 1,
+                            len(train_loader),
+                            global_step,
+                            total_steps,
+                            reduced["loss_total"],
+                            reduced["loss_ce"],
+                            reduced["loss_total_aux"],
+                            reduced["angle_deg"],
+                            reduced["acc_11_25"],
+                            reduced["acc_22_5"],
+                            reduced["acc_30"],
+                            current_lr,
+                        )
+                    else:
+                        LOGGER.info(
+                            "epoch=%d batch=%d/%d global_step=%d/%d loss=%.4f ce=%.4f lr=%.2e",
+                            epoch + 1,
+                            batch_idx + 1,
+                            len(train_loader),
+                            global_step,
+                            total_steps,
+                            reduced["loss_total"],
+                            reduced["loss_ce"],
+                            current_lr,
+                        )
                     if swanlab_run is not None:
-                        payload = {f"train/{key}": value for key, value in reduced.items()}
+                        payload = {
+                            f"train/{key}": value
+                            for key, value in reduced.items()
+                            if has_normal_metrics or key not in normal_metric_keys
+                        }
                         payload["train/lr"] = current_lr
                         payload["train/epoch"] = epoch + 1
                         swanlab_run.log(payload, step=global_step)
+                if step_timings is not None:
+                    step_timings["step_total"] = sum(step_timings.values())
+                    if device.type == "cuda":
+                        step_timings["cuda_peak_alloc_gib"] = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+                        step_timings["cuda_peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+                    if (
+                        global_step > args.profile_warmup_steps
+                        and (args.profile_max_steps <= 0 or profile_steps_logged < args.profile_max_steps)
+                    ):
+                        reduced_step_timings = reduce_timing_dict(step_timings, distributed, device)
+                        if rank == 0:
+                            LOGGER.info("profile_step global_step=%d %s", global_step, format_timing_dict(reduced_step_timings))
+                        profile_steps_logged += 1
                 if rank == 0 and should_log_image:
+                    if batch["target"].numel() == 0:
+                        batch = materialize_batch_from_metadata(batch, args)
+                    if image.numel() == 0:
+                        image = batch["image"]
                     save_visuals(
                         output_dir,
                         swanlab_run,
@@ -1430,6 +1827,9 @@ def main() -> int:
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
 
+            if args.max_steps > 0 and global_step >= args.max_steps:
+                break
+
             val_metrics, val_visuals = evaluate(
                 model=model,
                 normal_vae=normal_vae,
@@ -1470,7 +1870,7 @@ def main() -> int:
                         val_visuals["prediction"],
                         is_main=True,
                     )
-            if ar_val_loader is not None:
+            if ar_val_loader is not None and args.ar_eval_every > 0:
                 ar_metrics, ar_visuals = evaluate_ar(
                     model=model,
                     normal_vae=normal_vae,

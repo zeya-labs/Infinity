@@ -63,6 +63,62 @@ def _compute_hypersim_intrinsics(fov_value: float, pixel_height: int, pixel_widt
     return [float(fx), float(cx), float(fy), float(cy)]
 
 
+def load_hypersim_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[str, Any]:
+    image_path = Path(metadata["image_path"])
+    depth_path = Path(metadata["depth_path"])
+    normal_path = Path(metadata["normal_path"])
+    fov_value = float(metadata["settings_camera_fov"])
+
+    with Image.open(image_path) as image_handle:
+        image = image_handle.convert("RGB")
+        original_width, original_height = image.size
+        image_tensor = _resize_image(
+            image,
+            _resolve_target_size(original_height, original_width, pn)[:2],
+        )
+
+    depth_np, normal_np = read_depth_normal_hypersim(
+        str(depth_path),
+        str(normal_path),
+        _compute_hypersim_intrinsics(
+            fov_value=fov_value,
+            pixel_height=original_height,
+            pixel_width=original_width,
+        ),
+        metric_scale=1.0,
+    )
+
+    valid_normal_np = np.isfinite(normal_np).all(axis=2) & (np.linalg.norm(normal_np, axis=2) > 1e-6)
+    depth_np = np.nan_to_num(depth_np, nan=0.0, posinf=0.0, neginf=0.0)
+    normal_np = np.nan_to_num(normal_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+    depth_tensor = torch.from_numpy(depth_np).float().unsqueeze(0)
+    normal_tensor = torch.from_numpy(normal_np).float().permute(2, 0, 1)
+    valid_normal_tensor = torch.from_numpy(valid_normal_np.astype(np.float32)).unsqueeze(0)
+    target_height, target_width, template = _resolve_target_size(depth_np.shape[0], depth_np.shape[1], pn)
+    target_hw = (target_height, target_width)
+    depth_tensor = _resize_tensor(depth_tensor, target_hw, mode="nearest")
+    normal_tensor = _resize_tensor(normal_tensor, target_hw, mode="bilinear", normalize_normals=True)
+    valid_normal_tensor = _resize_tensor(valid_normal_tensor, target_hw, mode="nearest") > 0.5
+    mask = (depth_tensor > 0) & valid_normal_tensor.bool()
+
+    sample_metadata = dict(metadata)
+    sample_metadata.update(
+        {
+            "h_div_w": float(depth_np.shape[0]) / float(depth_np.shape[1]),
+            "h_div_w_template": template,
+            "target_size": [int(target_hw[0]), int(target_hw[1])],
+            "original_size": (original_height, original_width),
+        }
+    )
+    return {
+        "image": image_tensor.clamp(0.0, 1.0),
+        "target": normal_tensor.clamp(-1.0, 1.0),
+        "mask": mask.bool(),
+        "metadata": sample_metadata,
+    }
+
+
 class HypersimNormalDataset(Dataset):
     """Read raw Hypersim jpg+hdf5 samples for RGB-to-normal estimation."""
 
@@ -72,12 +128,14 @@ class HypersimNormalDataset(Dataset):
         partition: str = "train",
         pn: str = "0.06M",
         max_samples: int = 0,
+        metadata_only: bool = False,
     ) -> None:
         super().__init__()
         if partition not in {"train", "val", "test"}:
             raise ValueError(f"partition must be one of train/val/test, got {partition}")
 
         self.root = Path(root)
+        self.metadata_only = metadata_only
         csv_path = self.root / f"final_{partition}_split.csv"
         if not csv_path.is_file():
             raise FileNotFoundError(f"Hypersim split CSV not found: {csv_path}")
@@ -95,66 +153,82 @@ class HypersimNormalDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[index]
-        image_path = self.root / record["images"]
-        depth_path = self.root / record["depth"]
-        normal_path = self.root / record["normal"]
-
-        with Image.open(image_path) as image_handle:
-            image = image_handle.convert("RGB")
-            original_width, original_height = image.size
-            image_tensor = _resize_image(
-                image,
-                _resolve_target_size(original_height, original_width, self.pn)[:2],
-            )
-
-        depth_np, normal_np = read_depth_normal_hypersim(
-            str(depth_path),
-            str(normal_path),
-            _compute_hypersim_intrinsics(
-                fov_value=float(record["settings_camera_fov"]),
-                pixel_height=original_height,
-                pixel_width=original_width,
-            ),
-            metric_scale=1.0,
-        )
-
-        # Some raw Hypersim normal maps contain invalid values. Zero them out before
-        # resizing so interpolation and VAE encoding stay finite, and exclude them from
-        # the supervision mask.
-        valid_normal_np = np.isfinite(normal_np).all(axis=2) & (np.linalg.norm(normal_np, axis=2) > 1e-6)
-        depth_np = np.nan_to_num(depth_np, nan=0.0, posinf=0.0, neginf=0.0)
-        normal_np = np.nan_to_num(normal_np, nan=0.0, posinf=0.0, neginf=0.0)
-
-        depth_tensor = torch.from_numpy(depth_np).float().unsqueeze(0)
-        normal_tensor = torch.from_numpy(normal_np).float().permute(2, 0, 1)
-        valid_normal_tensor = torch.from_numpy(valid_normal_np.astype(np.float32)).unsqueeze(0)
-        target_height, target_width, template = _resolve_target_size(depth_np.shape[0], depth_np.shape[1], self.pn)
-        target_hw = (target_height, target_width)
-        depth_tensor = _resize_tensor(depth_tensor, target_hw, mode="nearest")
-        normal_tensor = _resize_tensor(normal_tensor, target_hw, mode="bilinear", normalize_normals=True)
-        valid_normal_tensor = _resize_tensor(valid_normal_tensor, target_hw, mode="nearest") > 0.5
-        mask = (depth_tensor > 0) & valid_normal_tensor.bool()
-
-        metadata = {
+    def _metadata_for_record(
+        self,
+        index: int,
+        record: dict[str, str],
+        image_path: Path,
+        depth_path: Path,
+        normal_path: Path,
+        target_hw: tuple[int, int],
+        original_hw: tuple[int, int] | None = None,
+        h_div_w: float | None = None,
+        template: float | None = None,
+    ) -> dict[str, Any]:
+        if template is None:
+            template = _nearest_h_div_w_template(*(original_hw or target_hw))
+        if h_div_w is None:
+            height, width = original_hw or target_hw
+            h_div_w = float(height) / float(width)
+        original_size = original_hw if original_hw is not None else target_hw
+        return {
             "image_path": str(image_path),
             "depth_path": str(depth_path),
             "normal_path": str(normal_path),
             "partition": self.partition,
             "index": index,
             "stem": image_path.stem,
-            "h_div_w": float(depth_np.shape[0]) / float(depth_np.shape[1]),
+            "h_div_w": h_div_w,
             "h_div_w_template": template,
-            "target_size": target_hw,
-            "original_size": (original_height, original_width),
+            "target_size": [int(target_hw[0]), int(target_hw[1])],
+            "original_size": original_size,
+            "settings_camera_fov": float(record["settings_camera_fov"]),
         }
+
+    def _metadata_only_sample(self, index: int) -> dict[str, Any]:
+        record = self.records[index]
+        source_index = int(record.get("__original_index", index))
+        image_path = self.root / record["images"]
+        depth_path = self.root / record["depth"]
+        normal_path = self.root / record["normal"]
+        target_hw = _resolve_target_size(768, 1024, self.pn)[:2]
+        metadata = self._metadata_for_record(
+            source_index,
+            record,
+            image_path,
+            depth_path,
+            normal_path,
+            target_hw,
+            original_hw=(768, 1024),
+        )
         return {
-            "image": image_tensor.clamp(0.0, 1.0),
-            "target": normal_tensor.clamp(-1.0, 1.0),
-            "mask": mask.bool(),
+            "image": torch.empty(0),
+            "target": torch.empty(0),
+            "mask": torch.empty(0, dtype=torch.bool),
             "metadata": metadata,
         }
+
+    def load_full_sample(self, index: int) -> dict[str, Any]:
+        record = self.records[index]
+        source_index = int(record.get("__original_index", index))
+        image_path = self.root / record["images"]
+        depth_path = self.root / record["depth"]
+        normal_path = self.root / record["normal"]
+        metadata = self._metadata_for_record(
+            source_index,
+            record,
+            image_path,
+            depth_path,
+            normal_path,
+            _resolve_target_size(768, 1024, self.pn)[:2],
+            original_hw=(768, 1024),
+        )
+        return load_hypersim_normal_sample_from_metadata(metadata, self.pn)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        if self.metadata_only:
+            return self._metadata_only_sample(index)
+        return self.load_full_sample(index)
 
 
 class NYUv2ParquetNormalDataset(Dataset):
@@ -253,6 +327,13 @@ class NYUv2ParquetNormalDataset(Dataset):
 
 
 def collate_normal_estimation_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if all(sample["image"].numel() == 0 for sample in samples):
+        return {
+            "image": torch.empty(0),
+            "target": torch.empty(0),
+            "mask": torch.empty(0, dtype=torch.bool),
+            "metadata": [sample["metadata"] for sample in samples],
+        }
     return {
         "image": torch.stack([sample["image"] for sample in samples], dim=0),
         "target": torch.stack([sample["target"] for sample in samples], dim=0),

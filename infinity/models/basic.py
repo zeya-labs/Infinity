@@ -104,11 +104,11 @@ def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_
     return rope2d_freqs_grid
 
 
-def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind):
+def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier, rope2d_normalized_by_hw, scale_ind, seq_dim=2):
     device_type = q.device.type
     device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
     with torch.autocast(device_type=device_type, enabled=False):
-        seq_len = q.shape[2]
+        seq_len = q.shape[seq_dim]
         start = 0
         if scale_ind >= 1:
             assert len(scale_schedule[0]) == 3
@@ -117,18 +117,24 @@ def apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, pad_to_multiplier,
         assert start+seq_len <= rope2d_freqs_grid[str(tuple(scale_schedule))].shape[4]
         output_dtype = q.dtype
         rope_cache = rope2d_freqs_grid[str(tuple(scale_schedule))][:, :, :, :, start:start+seq_len].float() # rope_cache shape: [2, 1, 1, 1, seq_len, half_head_dim]
-        cos, sin = rope_cache[0], rope_cache[1]
+        cos, sin = rope_cache[0, 0, 0, 0], rope_cache[1, 0, 0, 0]
+        rope_shape = [1] * q.dim()
+        rope_shape[seq_dim] = seq_len
+        rope_shape[-1] = cos.shape[-1]
+        cos = cos.reshape(rope_shape)
+        sin = sin.reshape(rope_shape)
 
         def rotate(x):
             x_pair = x.float().reshape(*x.shape[:-1], -1, 2)
-            out = torch.empty_like(x_pair)
+            out = torch.empty_like(x)
+            out_pair = out.reshape(*x.shape[:-1], -1, 2)
             x0, x1 = x_pair[..., 0], x_pair[..., 1]
-            out[..., 0] = cos * x0 - sin * x1
-            out[..., 1] = sin * x0 + cos * x1
-            return out.reshape_as(x).to(output_dtype)
+            out_pair[..., 0] = cos * x0 - sin * x1
+            out_pair[..., 1] = sin * x0 + cos * x1
+            return out.to(output_dtype)
 
         q, k = rotate(q), rotate(k)
-    return q, k
+        return q, k
 
 
 class FastRMSNorm(nn.Module):
@@ -290,7 +296,12 @@ class SelfAttention(nn.Module):
         B, L, C = x.shape
         
         # qkv: amp, bf16
-        if self.bf16_activations and attn_fn is not None and not self.using_flash:
+        flash_layout_attn = attn_fn is not None and getattr(attn_fn, "expects_blhc", False)
+        if flash_layout_attn:
+            qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv.unbind(dim=2)
+            L_dim = 1
+        elif self.bf16_activations and attn_fn is not None and not self.using_flash:
             q_weight, k_weight, v_weight = self.mat_qkv.weight.chunk(3, dim=0)
             q = F.linear(input=x, weight=q_weight, bias=self.q_bias).view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
             k = F.linear(input=x, weight=k_weight, bias=self.zero_k_bias).view(B, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
@@ -303,6 +314,8 @@ class SelfAttention(nn.Module):
         
         if self.cos_attn:   # always True
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp() # 11H1 (flash), or 1H11 (not flash)
+            if flash_layout_attn:
+                scale_mul = scale_mul.transpose(1, 2)
             v = v.contiguous()                                                  # bf16
             if self.bf16_activations:
                 q = F.normalize(q.float(), dim=-1, eps=1e-12).mul(scale_mul).to(v.dtype).contiguous()
@@ -315,7 +328,16 @@ class SelfAttention(nn.Module):
             k = k.contiguous()      # bf16
             v = v.contiguous()      # bf16
         if rope2d_freqs_grid is not None:
-            q, k = apply_rotary_emb(q, k, scale_schedule, rope2d_freqs_grid, self.pad_to_multiplier, self.rope2d_normalized_by_hw, scale_ind) #, freqs_cis=freqs_cis)
+            q, k = apply_rotary_emb(
+                q,
+                k,
+                scale_schedule,
+                rope2d_freqs_grid,
+                self.pad_to_multiplier,
+                self.rope2d_normalized_by_hw,
+                scale_ind,
+                seq_dim=1 if flash_layout_attn else 2,
+            ) #, freqs_cis=freqs_cis)
         if self.caching:    # kv caching: only used during inference
             if self.cached_k is None: self.cached_k = k; self.cached_v = v
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
@@ -330,7 +352,10 @@ class SelfAttention(nn.Module):
             # if self.cos_attn: q, k are in fp32; v is in bf16
             # else: q, k, v are in bf16
             if attn_fn is not None:
-                oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
+                if flash_layout_attn:
+                    oup = attn_fn(q, k, v, scale=self.scale).reshape(B, L, C)
+                else:
+                    oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
                 oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C)
             # oup: bf16

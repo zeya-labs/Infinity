@@ -25,6 +25,7 @@ from textual.widgets import DataTable, Input, Label, ListItem, ListView, Selecti
 ROOT = Path(__file__).resolve().parent
 PYTHON = str(ROOT / ".venv" / "bin" / "python") if (ROOT / ".venv" / "bin" / "python").exists() else sys.executable
 TORCHRUN = str(ROOT / ".venv" / "bin" / "torchrun") if (ROOT / ".venv" / "bin" / "torchrun").exists() else "torchrun"
+TORCHRUN_CMD = [TORCHRUN] if Path(TORCHRUN).exists() else [PYTHON, "-m", "torch.distributed.run"]
 JOB_DIR = ROOT / ".tui" / "jobs"
 VOLC_CONF_DIR = ROOT / ".tui" / "volc"
 VOLC = str(Path.home() / ".volc" / "bin" / "volc") if (Path.home() / ".volc" / "bin" / "volc").exists() else "volc"
@@ -32,7 +33,7 @@ VOLC_DEFAULT_QUEUE_NAME = os.environ.get("INFINITY_VOLC_QUEUE_NAME", "queue010")
 VOLC_DEFAULT_QUEUE_ID = os.environ.get("INFINITY_VOLC_QUEUE_ID", "")
 VOLC_DEFAULT_IMAGE = os.environ.get(
     "INFINITY_VOLC_IMAGE",
-    "cr-mlp-cn-beijing.cr.volces.com/public/cmh_test:1.6",
+    "cr-mlp-cn-beijing.cr.volces.com/public/cmh_test:1.7",
 )
 VOLC_DEFAULT_FLAVOR = os.environ.get("INFINITY_VOLC_FLAVOR", "ml.pni2.28xlarge")
 VOLC_DEFAULT_GPUS = os.environ.get("INFINITY_VOLC_GPUS", "8")
@@ -385,8 +386,8 @@ def remoteize_command(command: list[str], remote_root: str) -> list[str]:
     remote = [remoteize_value(part, remote_root) for part in command]
     if os.environ.get("INFINITY_VOLC_PYTHON") and command and command[0] == PYTHON:
         remote[0] = os.environ["INFINITY_VOLC_PYTHON"]
-    if os.environ.get("INFINITY_VOLC_TORCHRUN") and command and command[0] == TORCHRUN:
-        remote[0] = os.environ["INFINITY_VOLC_TORCHRUN"]
+    if os.environ.get("INFINITY_VOLC_TORCHRUN") and command[: len(TORCHRUN_CMD)] == TORCHRUN_CMD:
+        remote = shlex.split(os.environ["INFINITY_VOLC_TORCHRUN"]) + remote[len(TORCHRUN_CMD) :]
     return remote
 
 
@@ -483,7 +484,7 @@ def parse_volc_topology(values: dict[str, str], config: VolcConfig) -> tuple[int
     if raw:
         match = re.fullmatch(r"(\d+)\s*x\s*(\d+)", raw)
         if not match:
-            raise ValueError(f"Volc topology 必须形如 1x8/2x4/4x2/8x1，当前是: {raw}")
+            raise ValueError(f"Volc topology 必须形如 1x4/1x8/2x4/4x2/8x1，当前是: {raw}")
         worker_count = int(match.group(1))
         gpus_per_worker = int(match.group(2))
         if worker_count <= 0 or gpus_per_worker <= 0:
@@ -545,7 +546,17 @@ def volc_runtime_values(task: Task, values: dict[str, str], gpus_per_worker: int
 
 
 def volc_distributed_command(command: list[str], worker_count: int, gpus_per_worker: int) -> list[str]:
-    if worker_count <= 1 or not command or not command[0].endswith("torchrun"):
+    launcher_name = Path(command[0]).name if command else ""
+    is_torchrun = bool(command) and (
+        launcher_name == "torchrun"
+        or command[:3] == [PYTHON, "-m", "torch.distributed.run"]
+        or (
+            len(command) >= 3
+            and launcher_name.startswith("python")
+            and command[1:3] == ["-m", "torch.distributed.run"]
+        )
+    )
+    if worker_count <= 1 or not is_torchrun:
         return command
     transformed = [command[0]]
     inserted = False
@@ -874,7 +885,7 @@ def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
 
 def build_train_normal(values: dict[str, str]) -> list[str]:
     cmd = [
-        TORCHRUN,
+        *TORCHRUN_CMD,
         "--standalone",
         "--nproc_per_node",
         values["gpus"],
@@ -899,6 +910,8 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["pn"],
         "--batch-size",
         values["batch_size"],
+        "--grad-accum-steps",
+        values["grad_accum_steps"],
         "--val-batch-size",
         values["val_batch_size"],
         "--num-workers",
@@ -924,10 +937,14 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["grad_clip"],
         "--precision",
         values["precision"],
+        "--optimizer-backend",
+        values["optimizer_backend"],
         "--zero",
         values["zero"],
         "--checkpointing",
         values["checkpointing"],
+        "--full-block-checkpoint-skip-interval",
+        values["full_block_checkpoint_skip_interval"],
         "--epochs",
         values["epochs"],
         "--max-steps",
@@ -983,6 +1000,14 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         cmd.append("--save-optimizer-state")
     if values["token_cache_memory"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--token-cache-memory")
+    if values["token_cache_metadata_only"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--token-cache-metadata-only")
+    if values["token_cache_require_hit"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--token-cache-require-hit")
+    if values["token_cache_filter_missing"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--token-cache-filter-missing")
+    if values["fast_model_init"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--fast-model-init")
     if values["normal_use_segmented_flash_attn"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--normal-use-segmented-flash-attn")
     if values["normal_bf16_activations"].lower() in {"1", "yes", "true", "y"}:
@@ -1000,7 +1025,7 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
 
 def build_train_tokenizer(values: dict[str, str]) -> list[str]:
     cmd = [
-        TORCHRUN,
+        *TORCHRUN_CMD,
         "--standalone",
         "--nproc_per_node",
         values["gpus"],
@@ -1145,8 +1170,8 @@ TASKS: list[Task] = [
         "训练 RGB 到 Normal",
         "启动 normal estimation 正式训练。",
         [
-            Field("gpus", "GPU 数", "2"),
-            Field("volc_topology", "Volc topology", "1x8", choices=("1x8", "2x4", "4x2", "8x1")),
+            Field("gpus", "GPU 数", "8"),
+            Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
             Field("data_root", "数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
             Field(
@@ -1166,6 +1191,7 @@ TASKS: list[Task] = [
             Field("init_model", "初始化模型", "weights/infinity_2b_reg.pth"),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("batch_size", "Batch/GPU", "4"),
+            Field("grad_accum_steps", "Grad accum", "2"),
             Field("val_batch_size", "Val batch/GPU", "4"),
             Field("num_workers", "Workers", "4"),
             Field("prefetch_factor", "Prefetch factor", "4"),
@@ -1178,10 +1204,16 @@ TASKS: list[Task] = [
             Field("train_normal_metrics_every", "Train normal metrics every", "10"),
             Field("token_cache_dir", "Token cache dir", "outputs/normal_token_cache"),
             Field("token_cache_memory", "Memory token cache", "1", choices=("0", "1")),
+            Field("token_cache_metadata_only", "Metadata-only cache", "1", choices=("0", "1")),
+            Field("token_cache_require_hit", "Require cache hit", "0", choices=("0", "1")),
+            Field("token_cache_filter_missing", "Filter cache misses", "0", choices=("0", "1")),
             Field("grad_clip", "Grad clip", "1.0"),
             Field("precision", "Precision", "bf16", choices=("bf16", "fp16", "fp32")),
+            Field("optimizer_backend", "Optimizer backend", "fused", choices=("fused", "foreach", "loop")),
             Field("zero", "ZeRO", "0", choices=("0", "2", "3")),
             Field("checkpointing", "Checkpointing", "full-block", choices=("full-block", "self-attn", "none")),
+            Field("full_block_checkpoint_skip_interval", "Checkpoint skip interval", "16"),
+            Field("fast_model_init", "Fast model init", "1", choices=("0", "1")),
             Field("normal_use_segmented_flash_attn", "Segmented flash attn", "1", choices=("0", "1")),
             Field("normal_bf16_activations", "BF16 activations", "1", choices=("0", "1")),
             Field("normal_save_activations_on_cpu", "CPU activation offload", "0", choices=("0", "1")),
@@ -1194,7 +1226,7 @@ TASKS: list[Task] = [
             Field("ar_eval_top_k", "AR top-k", "1"),
             Field("ar_eval_top_p", "AR top-p", "0.0"),
             Field("ar_eval_tau", "AR tau", "1.0"),
-            Field("save_every_steps", "Save every steps", "100"),
+            Field("save_every_steps", "Save every steps", "50"),
             Field("save_every_epoch", "Save every epoch", "1"),
             Field("save_optimizer_state", "保存优化器", "1", choices=("0", "1")),
             Field("train_partition", "Train split", "train"),
@@ -1212,7 +1244,7 @@ TASKS: list[Task] = [
             Field("swanlab_mode", "SwanLab", "local", choices=("local", "cloud", "offline", "disabled")),
             Field("swanlab_project", "SwanLab project", "infinity_normal_estimation_hypersim"),
             Field("swanlab_experiment", "SwanLab experiment", ""),
-            Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1"),
+            Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
         ],
         build_train_normal,
         env=lambda v: {"CUDA_VISIBLE_DEVICES": v["cuda"]},
@@ -1224,8 +1256,8 @@ TASKS: list[Task] = [
         "训练法线 Tokenizer",
         "启动 normal tokenizer 正式微调。",
         [
-            Field("gpus", "GPU 数", "2"),
-            Field("volc_topology", "Volc topology", "2x4", choices=("1x8", "2x4", "4x2", "8x1")),
+            Field("gpus", "GPU 数", "8"),
+            Field("volc_topology", "Volc topology", "2x4", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_tokenizer")),
             Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
@@ -1267,7 +1299,7 @@ TASKS: list[Task] = [
             Field("swanlab_mode", "SwanLab", "local", choices=("local", "cloud", "offline", "disabled")),
             Field("swanlab_project", "SwanLab project", "infinity_normal_tokenizer_hypersim"),
             Field("swanlab_experiment", "SwanLab experiment", ""),
-            Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1"),
+            Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
         ],
         build_train_tokenizer,
         env=lambda v: {"CUDA_VISIBLE_DEVICES": v["cuda"]},

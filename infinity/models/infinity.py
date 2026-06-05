@@ -58,6 +58,7 @@ class SharedAdaLin(nn.Linear):
 class MultipleLayers(nn.Module):
     def __init__(self, ls, num_blocks_in_a_chunk, index):
         super().__init__()
+        self.start_index = index
         self.module = nn.ModuleList()
         for i in range(index, index+num_blocks_in_a_chunk):
             self.module.append(ls[i])
@@ -71,12 +72,22 @@ class MultipleLayers(nn.Module):
         attn_fn=None,
         scale_schedule=None,
         checkpointing_full_block=False,
+        checkpointing_full_block_skip_interval=0,
         rope2d_freqs_grid=None,
         scale_ind=0,
     ):
         h = x
-        for m in self.module:
-            if checkpointing_full_block:
+        for block_offset, m in enumerate(self.module):
+            block_index = self.start_index + block_offset
+            skip_checkpoint = (
+                checkpointing_full_block_skip_interval > 0
+                and (block_index + 1) % checkpointing_full_block_skip_interval == 0
+            )
+            should_checkpoint = (
+                checkpointing_full_block
+                and not skip_checkpoint
+            )
+            if should_checkpoint:
                 h = torch.utils.checkpoint.checkpoint(m, h, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             elif isinstance(m, CrossAttnBlock):
                 h = m(
@@ -164,6 +175,7 @@ class Infinity(nn.Module):
             assert all(raw_pn % word_patch_size == 0 for raw_pn in raw_scale_schedule), f'raw_scale_schedule={raw_scale_schedule}, not compatible with word_patch_size={word_patch_size}'
         
         self.checkpointing = checkpointing
+        self.checkpointing_full_block_skip_interval = 0
         self.pad_to_multiplier = max(1, pad_to_multiplier)
         
         customized_kernel_installed = any('Infinity' in arg_name for arg_name in flash_attn_func.__code__.co_varnames)

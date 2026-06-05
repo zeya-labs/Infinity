@@ -226,6 +226,7 @@ class InfinityNormalPrefixModel(Infinity):
         self.normal_bf16_activations = normal_bf16_activations
         self.normal_flex_attention = torch.compile(flex_attention) if normal_use_flex_attn else None
         self.normal_flex_block_masks: dict[str, Any] = {}
+        self.normal_prefix_layout_cache: dict[str, dict[str, Any]] = {}
         self.image_word_embed = nn.Linear(self.d_vae, self.C)
         self.image_word_embed.load_state_dict(self.word_embed.state_dict())
         self.image_modality_embed = nn.Parameter(torch.zeros(1, 1, self.C))
@@ -244,6 +245,10 @@ class InfinityNormalPrefixModel(Infinity):
                 self.image_word_embed.weight.copy_(self.word_embed.weight)
             if "image_word_embed.bias" not in loaded_keys and self.word_embed.bias is not None:
                 self.image_word_embed.bias.copy_(self.word_embed.bias)
+            if "image_modality_embed" not in loaded_keys:
+                self.image_modality_embed.zero_()
+            if "normal_modality_embed" not in loaded_keys:
+                self.normal_modality_embed.zero_()
             if "normal_task_kv" not in loaded_keys and hasattr(self, "cfg_uncond"):
                 copy_len = min(self.normal_task_kv.shape[0], self.cfg_uncond.shape[0])
                 copy_dim = min(self.normal_task_kv.shape[1], self.cfg_uncond.shape[1])
@@ -337,6 +342,40 @@ class InfinityNormalPrefixModel(Infinity):
                 return cache
         return None
 
+    def _normal_prefix_layout(
+        self,
+        prefix_schedule: list[tuple[int, int, int]],
+        normal_schedule: list[tuple[int, int, int]],
+        device: torch.device,
+    ) -> dict[str, Any]:
+        key = f"{device}:{tuple(prefix_schedule)}:{tuple(normal_schedule)}"
+        layout = self.normal_prefix_layout_cache.get(key)
+        if layout is not None:
+            return layout
+
+        prefix_len = _scale_seq_len(prefix_schedule)
+        normal_len = _scale_seq_len(normal_schedule)
+        prefix_stage_ids = _stage_ids_for_schedule(prefix_schedule, device)
+        normal_stage_ids = _stage_ids_for_schedule(normal_schedule, device)
+        stage_ids = torch.cat((prefix_stage_ids, normal_stage_ids), dim=0)
+
+        segments: list[tuple[int, int, int]] = [(0, prefix_len, prefix_len)]
+        start = prefix_len
+        for pt, ph, pw in normal_schedule:
+            end = start + int(pt) * int(ph) * int(pw)
+            segments.append((start, end, end))
+            start = end
+
+        layout = {
+            "prefix_len": prefix_len,
+            "normal_len": normal_len,
+            "normal_stage_ids": normal_stage_ids,
+            "stage_ids": stage_ids,
+            "segments": tuple(segments),
+        }
+        self.normal_prefix_layout_cache[key] = layout
+        return layout
+
     def _add_prefix_level_embedding(self, x: torch.Tensor, stage_ids: torch.Tensor) -> torch.Tensor:
         if stage_ids.numel() == 0:
             return x
@@ -390,32 +429,36 @@ class InfinityNormalPrefixModel(Infinity):
     def _normal_prefix_segmented_flash_attn(
         self,
         *,
-        prefix_len: int,
-        stage_ids: torch.Tensor,
+        segments: tuple[tuple[int, int, int], ...],
     ):
         if not self.normal_use_segmented_flash_attn:
             return None
         if normal_flash_attn_func is None:
             raise RuntimeError("flash-attn was not initialized.")
-
-        stage_ids_cpu = stage_ids.detach().cpu()
-        segments: list[tuple[int, int, int]] = [(0, int(prefix_len), int(prefix_len))]
-        start = int(prefix_len)
-        total_len = int(stage_ids_cpu.numel())
-        while start < total_len:
-            stage = int(stage_ids_cpu[start].item())
-            end = start + 1
-            while end < total_len and int(stage_ids_cpu[end].item()) == stage:
-                end += 1
-            segments.append((start, end, end))
-            start = end
+        force_contiguous = os.environ.get("INFINITY_NORMAL_SEGMENTED_FLASH_CONTIG", "").strip().lower() in {"1", "true", "yes", "y"}
 
         def attn_fn(q, k, v, scale=None):
+            if force_contiguous:
+                pieces = []
+                for query_start, query_end, key_end in segments:
+                    q_part = q[:, query_start:query_end, :, :].contiguous()
+                    k_part = k[:, :key_end, :, :].contiguous()
+                    v_part = v[:, :key_end, :, :].contiguous()
+                    out = normal_flash_attn_func(
+                        q_part.to(v_part.dtype),
+                        k_part.to(v_part.dtype),
+                        v_part,
+                        dropout_p=0,
+                        softmax_scale=scale,
+                    )
+                    pieces.append(out)
+                return torch.cat(pieces, dim=1)
+
             pieces = []
             for query_start, query_end, key_end in segments:
-                q_part = q[:, :, query_start:query_end, :].transpose(1, 2).contiguous()
-                k_part = k[:, :, :key_end, :].transpose(1, 2).contiguous()
-                v_part = v[:, :, :key_end, :].transpose(1, 2).contiguous()
+                q_part = q[:, query_start:query_end, :, :]
+                k_part = k[:, :key_end, :, :]
+                v_part = v[:, :key_end, :, :]
                 out = normal_flash_attn_func(
                     q_part.to(v_part.dtype),
                     k_part.to(v_part.dtype),
@@ -423,9 +466,10 @@ class InfinityNormalPrefixModel(Infinity):
                     dropout_p=0,
                     softmax_scale=scale,
                 )
-                pieces.append(out.transpose(1, 2))
-            return torch.cat(pieces, dim=2)
+                pieces.append(out)
+            return torch.cat(pieces, dim=1)
 
+        attn_fn.expects_blhc = True
         return attn_fn
 
     def _prepare_prefix_sequence(
@@ -435,18 +479,18 @@ class InfinityNormalPrefixModel(Infinity):
         normal_input_emb: torch.Tensor,
         prefix_schedule: list[tuple[int, int, int]],
         normal_schedule: list[tuple[int, int, int]],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int, int]], torch.Tensor, int, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int, int]], torch.Tensor, int, int, tuple[tuple[int, int, int], ...]]:
         prefix_len = _scale_seq_len(prefix_schedule)
         normal_len = _scale_seq_len(normal_schedule)
+        layout = self._normal_prefix_layout(prefix_schedule, normal_schedule, rgb_prefix_emb.device)
         if rgb_prefix_emb.shape[1] != prefix_len:
             raise ValueError(f"RGB prefix length {rgb_prefix_emb.shape[1]} does not match schedule length {prefix_len}.")
         if normal_input_emb.shape[1] != normal_len:
             raise ValueError(f"Normal input length {normal_input_emb.shape[1]} does not match schedule length {normal_len}.")
 
         x = torch.cat((rgb_prefix_emb, normal_input_emb), dim=1)
-        prefix_stage_ids = _stage_ids_for_schedule(prefix_schedule, x.device)
-        normal_stage_ids = _stage_ids_for_schedule(normal_schedule, x.device)
-        stage_ids = torch.cat((prefix_stage_ids, normal_stage_ids), dim=0)
+        normal_stage_ids = layout["normal_stage_ids"]
+        stage_ids = layout["stage_ids"]
 
         l_end = x.shape[1]
         need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end
@@ -471,7 +515,7 @@ class InfinityNormalPrefixModel(Infinity):
             x = F.pad(x, (0, 0, 0, need_to_pad))
 
         rope_schedule = self._ensure_prefix_rope_cache(prefix_schedule, normal_schedule, x.shape[1])
-        return x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len
+        return x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, layout["segments"]
 
     def _run_prefix_blocks(
         self,
@@ -485,12 +529,21 @@ class InfinityNormalPrefixModel(Infinity):
         attn_fn: Any | None = None,
     ) -> torch.Tensor:
         checkpointing_full_block = self.checkpointing == "full-block" and self.training
+        checkpointing_full_block_skip_interval = int(getattr(self, "checkpointing_full_block_skip_interval", 0))
         attn_bias_or_mask = None if attn_fn is not None else attn_bias
         if self.num_block_chunks == 1:
             for block_index, block in enumerate(self.blocks):
                 if (self.add_lvl_embeding_only_first_block and block_index == 0) or not self.add_lvl_embeding_only_first_block:
                     x = self._add_prefix_level_embedding(x, stage_ids)
-                if checkpointing_full_block:
+                skip_checkpoint = (
+                    checkpointing_full_block_skip_interval > 0
+                    and (block_index + 1) % checkpointing_full_block_skip_interval == 0
+                )
+                should_checkpoint = (
+                    checkpointing_full_block
+                    and not skip_checkpoint
+                )
+                if should_checkpoint:
                     x = torch.utils.checkpoint.checkpoint(
                         block,
                         x,
@@ -525,6 +578,7 @@ class InfinityNormalPrefixModel(Infinity):
                 attn_fn=attn_fn,
                 scale_schedule=rope_schedule,
                 checkpointing_full_block=checkpointing_full_block,
+                checkpointing_full_block_skip_interval=checkpointing_full_block_skip_interval,
                 rope2d_freqs_grid=self.rope2d_freqs_grid,
             )
         return x
@@ -544,15 +598,14 @@ class InfinityNormalPrefixModel(Infinity):
             sos, cond_BD, cond_BD_or_gss, ca_kv = self._task_condition(batch_size)
             rgb_prefix_emb = self._embed_rgb_prefix(rgb_prefix_blc)
             normal_input_emb = self._embed_normal_inputs(normal_x_blc_wo_prefix, sos)
-            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len = self._prepare_prefix_sequence(
+            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, segments = self._prepare_prefix_sequence(
                 rgb_prefix_emb=rgb_prefix_emb,
                 normal_input_emb=normal_input_emb,
                 prefix_schedule=scale_schedule,
                 normal_schedule=scale_schedule,
             )
             attn_fn = self._normal_prefix_segmented_flash_attn(
-                prefix_len=prefix_len,
-                stage_ids=stage_ids,
+                segments=segments,
             )
             if attn_fn is None:
                 attn_fn = self._normal_prefix_flex_attn(
@@ -785,7 +838,7 @@ class InfinityNormalPrefixModel(Infinity):
 
             normal_input_emb = torch.cat(normal_embeds, dim=1)
             normal_schedule = scale_schedule[: scale_index + 1]
-            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len = self._prepare_prefix_sequence(
+            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, _segments = self._prepare_prefix_sequence(
                 rgb_prefix_emb=rgb_prefix_emb,
                 normal_input_emb=normal_input_emb,
                 prefix_schedule=scale_schedule,
@@ -982,7 +1035,7 @@ def _load_directory_state_dict(model: torch.nn.Module, checkpoint_dir: Path) -> 
 
             shard_state = load_file(str(shard_path))
         else:
-            shard_state = _extract_state_dict(torch.load(shard_path, map_location="cpu", weights_only=False))
+            shard_state = _extract_state_dict(torch.load(shard_path, map_location="cpu", weights_only=True, mmap=True))
         _copy_matching_state_dict_tensors(model, shard_state, loaded_keys=loaded_keys, skipped_keys=skipped_keys)
 
     if hasattr(model, "initialize_missing_prefix_parameters"):
@@ -996,7 +1049,7 @@ def load_infinity_state_dict(model: torch.nn.Module, checkpoint_path: str) -> tu
     if Path(checkpoint_path_str).is_dir():
         return _load_directory_state_dict(model, Path(checkpoint_path_str))
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
     state_dict = _extract_state_dict(checkpoint)
     loaded_keys: set[str] = set()
     skipped_keys: list[str] = []
