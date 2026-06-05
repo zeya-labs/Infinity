@@ -68,6 +68,13 @@ def __initialize(fork=False, backend='nccl', gpu_id_if_not_distibuted=0, timeout
     print(f'[lrk={get_local_rank()}, rk={get_rank()}]')
 
 
+def _reset_distributed_state():
+    global __rank, __local_rank, __world_size, __device, __rank_str_zfill, __initialized
+    __rank, __local_rank, __world_size, __device = 0, 0, 1, 'cpu'
+    __rank_str_zfill = '0'
+    __initialized = False
+
+
 def get_rank():
     return __rank
 
@@ -254,8 +261,12 @@ def for_visualize(func):
 
 
 def finalize():
-    if __initialized:
+    if not __initialized:
+        return
+    try:
         tdist.destroy_process_group()
+    finally:
+        _reset_distributed_state()
 
 
 def init_distributed_mode(local_out_path, fork=False, only_sync_master=False, timeout_minutes=30):
