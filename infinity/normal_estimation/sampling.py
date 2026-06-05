@@ -111,7 +111,9 @@ class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
         dataset_to_keys: dict[str, list[tuple[str, int, int]]] = {}
         for key in sorted(original_batches):
             dataset_to_keys.setdefault(key[0], []).append(key)
-        dataset_names = [name for name in sorted(dataset_to_keys) if self.dataset_weights.get(name, 1) > 0]
+        weighted_names = [name for name, weight in self.dataset_weights.items() if weight > 0]
+        dataset_names = [name for name in weighted_names if name in dataset_to_keys]
+        dataset_names.extend(name for name in sorted(dataset_to_keys) if name not in dataset_names)
         dataset_pattern = [
             name
             for name in dataset_names
@@ -120,7 +122,23 @@ class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
         if not dataset_pattern:
             return []
 
-        total_global_steps = sum(len(batches) // needed for batches in original_batches.values())
+        anchor_dataset = dataset_names[0]
+        anchor_weight = self.dataset_weights.get(anchor_dataset, 1)
+        anchor_global_steps = sum(
+            len(original_batches[key]) // needed
+            for key in dataset_to_keys[anchor_dataset]
+            if key in original_batches
+        )
+        if anchor_global_steps <= 0:
+            return []
+        target_global_steps_by_dataset = {
+            name: (
+                anchor_global_steps
+                if name == anchor_dataset
+                else (anchor_global_steps * self.dataset_weights.get(name, 1) + anchor_weight - 1) // anchor_weight
+            )
+            for name in dataset_names
+        }
         queues = {key: list(batches) for key, batches in original_batches.items()}
         key_cursors = {name: 0 for name in dataset_to_keys}
         batches: list[list[int]] = []
@@ -130,8 +148,12 @@ class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
             if self.shuffle:
                 rng.shuffle(queues[key])
 
-        for step in range(total_global_steps):
-            dataset_name = dataset_pattern[step % len(dataset_pattern)]
+        cursor = 0
+        while any(remaining > 0 for remaining in target_global_steps_by_dataset.values()):
+            dataset_name = dataset_pattern[cursor % len(dataset_pattern)]
+            cursor += 1
+            if target_global_steps_by_dataset.get(dataset_name, 0) <= 0:
+                continue
             keys = dataset_to_keys.get(dataset_name, [])
             if not keys:
                 continue
@@ -150,6 +172,7 @@ class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
 
             for _ in range(needed):
                 batches.append(queues[selected_key].pop())
+            target_global_steps_by_dataset[dataset_name] -= 1
         return batches
 
     def _all_batches(self) -> list[list[int]]:

@@ -83,7 +83,9 @@ class NormalSamplingTest(unittest.TestCase):
                 world_size=8,
                 dataset_weights=weights,
             )
-            rank_batches.append(list(sampler)[:6])
+            rank_batches.append(list(sampler))
+
+        self.assertEqual([len(batches) for batches in rank_batches], [7] * 8)
 
         for step in range(6):
             step_datasets = []
@@ -94,6 +96,32 @@ class NormalSamplingTest(unittest.TestCase):
 
         rank0_datasets = [dataset_metadata_at(dataset, batch[0])["dataset"] for batch in rank_batches[0][:4]]
         self.assertEqual(rank0_datasets, ["hypersim", "hypersim", "hypersim", "vkitti2"])
+
+    def test_weighted_sampler_uses_first_dataset_as_epoch_anchor(self) -> None:
+        from torch.utils.data import ConcatDataset
+
+        dataset = ConcatDataset(
+            [
+                ToyNormalDataset("hypersim", (864, 1152), 96),
+                ToyNormalDataset("vkitti2", (592, 1776), 1000),
+            ]
+        )
+        sampler = GroupedTargetSizeBatchSampler(
+            dataset,
+            batch_size=2,
+            shuffle=False,
+            drop_last=True,
+            distributed=True,
+            seed=0,
+            rank=0,
+            world_size=8,
+            dataset_weights={"hypersim": 3, "vkitti2": 1},
+        )
+
+        batches = list(sampler)
+        self.assertEqual(len(batches), 8)
+        datasets = [dataset_metadata_at(dataset, batch[0])["dataset"] for batch in batches]
+        self.assertEqual(datasets, ["hypersim", "hypersim", "hypersim", "vkitti2", "hypersim", "hypersim", "hypersim", "vkitti2"])
 
 
 if __name__ == "__main__":
