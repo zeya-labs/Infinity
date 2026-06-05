@@ -14,8 +14,11 @@ from .modeling import (
 _DATA_EXPORTS = {
     "HypersimNormalDataset",
     "NYUv2ParquetNormalDataset",
+    "VKITTI2NormalDataset",
     "collate_normal_estimation_batch",
     "load_hypersim_normal_sample_from_metadata",
+    "load_normal_sample_from_metadata",
+    "load_vkitti2_normal_sample_from_metadata",
 }
 
 
@@ -24,15 +27,21 @@ def __getattr__(name: str):
         from .data import (
             HypersimNormalDataset,
             NYUv2ParquetNormalDataset,
+            VKITTI2NormalDataset,
             collate_normal_estimation_batch,
             load_hypersim_normal_sample_from_metadata,
+            load_normal_sample_from_metadata,
+            load_vkitti2_normal_sample_from_metadata,
         )
 
         exports = {
             "HypersimNormalDataset": HypersimNormalDataset,
             "NYUv2ParquetNormalDataset": NYUv2ParquetNormalDataset,
+            "VKITTI2NormalDataset": VKITTI2NormalDataset,
             "collate_normal_estimation_batch": collate_normal_estimation_batch,
             "load_hypersim_normal_sample_from_metadata": load_hypersim_normal_sample_from_metadata,
+            "load_normal_sample_from_metadata": load_normal_sample_from_metadata,
+            "load_vkitti2_normal_sample_from_metadata": load_vkitti2_normal_sample_from_metadata,
         }
         globals().update(exports)
         return exports[name]
@@ -42,12 +51,15 @@ def __getattr__(name: str):
 __all__ = [
     "HypersimNormalDataset",
     "NYUv2ParquetNormalDataset",
+    "VKITTI2NormalDataset",
     "build_bsq_vae",
     "build_infinity_normal_model",
     "build_multiscale_var_inputs",
     "build_prefix_tokens_from_image",
     "collate_normal_estimation_batch",
     "load_hypersim_normal_sample_from_metadata",
+    "load_normal_sample_from_metadata",
+    "load_vkitti2_normal_sample_from_metadata",
     "compute_normal_metrics",
     "decode_logits_to_normal",
     "load_infinity_state_dict",

@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int, default=0)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument(
+        "--resume-weights-only",
+        action="store_true",
+        help="Load model weights from --resume but start a fresh optimizer, scheduler, step, and best metric.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=0)
@@ -554,11 +559,14 @@ def load_resume(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler | None,
     device: torch.device,
+    weights_only: bool = False,
 ) -> tuple[int, int, float]:
     if resume_path is None:
         return 0, 0, float("inf")
     checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
     raw_model.load_state_dict(checkpoint["vae"], strict=True)
+    if weights_only:
+        return 0, 0, float("inf")
     if "opt_vae" in checkpoint and checkpoint["opt_vae"] is not None:
         try:
             optimizer.load_state_dict(checkpoint["opt_vae"])
@@ -848,9 +856,24 @@ def main() -> None:
         scheduler = build_scheduler(optimizer, args, total_steps=total_steps)
 
         resume_path = auto_resume_path(output_dir, args.resume)
-        start_epoch, global_step, best_val_angle = load_resume(resume_path, raw_model, optimizer, scheduler, device)
+        start_epoch, global_step, best_val_angle = load_resume(
+            resume_path,
+            raw_model,
+            optimizer,
+            scheduler,
+            device,
+            weights_only=args.resume_weights_only,
+        )
         if resume_path is not None:
-            LOGGER.info("resume from %s (epoch=%d step=%d best_val_angle=%.4f)", resume_path, start_epoch, global_step, best_val_angle)
+            resume_mode = "weights-only" if args.resume_weights_only else "weights+optimizer"
+            LOGGER.info(
+                "resume from %s (epoch=%d step=%d best_val_angle=%.4f mode=%s)",
+                resume_path,
+                start_epoch,
+                global_step,
+                best_val_angle,
+                resume_mode,
+            )
 
         use_fp16_scaler = device.type == "cuda" and args.precision == "fp16"
         scaler = build_grad_scaler(enabled=use_fp16_scaler)

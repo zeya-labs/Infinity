@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,9 @@ from torch.utils.data import Dataset
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 from .file_io import read_depth_normal_hypersim
+
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
 def _nearest_h_div_w_template(height: int, width: int) -> float:
@@ -119,6 +123,86 @@ def load_hypersim_normal_sample_from_metadata(metadata: dict[str, Any], pn: str)
     }
 
 
+def _resolve_path(value: str | Path, base_dir: Path | None = None) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    candidates = []
+    if base_dir is not None:
+        candidates.append(base_dir / path)
+    candidates.extend([Path.cwd() / path, ROOT_DIR / path])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0] if candidates else path
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def load_vkitti2_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[str, Any]:
+    base_dir = Path(metadata["manifest_dir"]) if metadata.get("manifest_dir") else None
+    image_path = _resolve_path(metadata["image_path"], base_dir)
+    normal_path = _resolve_path(metadata["normal_path"], base_dir)
+    mask_path = _resolve_path(metadata["mask_path"], base_dir)
+
+    with Image.open(image_path) as image_handle:
+        image = image_handle.convert("RGB")
+        original_width, original_height = image.size
+        target_height, target_width, template = _resolve_target_size(original_height, original_width, pn)
+        target_hw = (target_height, target_width)
+        image_tensor = _resize_image(image, target_hw)
+
+    normal_np = np.load(normal_path).astype(np.float32)
+    if normal_np.ndim != 3 or normal_np.shape[2] != 3:
+        raise ValueError(f"VKITTI2 normal must have shape HxWx3, got {normal_np.shape} from {normal_path}")
+    # Existing VKITTI2 preprocessing saves D2NT normals with flipped=true, matching the
+    # final Hypersim training convention (x left, y up, z backward). If an older
+    # manifest explicitly says otherwise, flip it here into the same convention.
+    if not _truthy(metadata.get("flipped"), default=True):
+        normal_np *= -1.0
+
+    with Image.open(mask_path) as mask_handle:
+        valid_np = np.asarray(mask_handle.convert("L")) > 0
+    valid_np = valid_np & np.isfinite(normal_np).all(axis=2) & (np.linalg.norm(normal_np, axis=2) > 1e-6)
+    normal_np = np.nan_to_num(normal_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+    normal_tensor = torch.from_numpy(normal_np).float().permute(2, 0, 1)
+    valid_normal_tensor = torch.from_numpy(valid_np.astype(np.float32)).unsqueeze(0)
+    normal_tensor = _resize_tensor(normal_tensor, target_hw, mode="bilinear", normalize_normals=True)
+    valid_normal_tensor = _resize_tensor(valid_normal_tensor, target_hw, mode="nearest") > 0.5
+
+    sample_metadata = dict(metadata)
+    sample_metadata.update(
+        {
+            "target_size": [int(target_hw[0]), int(target_hw[1])],
+            "original_size": (original_height, original_width),
+            "h_div_w": float(original_height) / float(original_width),
+            "h_div_w_template": template,
+        }
+    )
+    return {
+        "image": image_tensor.clamp(0.0, 1.0),
+        "target": normal_tensor.clamp(-1.0, 1.0),
+        "mask": valid_normal_tensor.bool(),
+        "metadata": sample_metadata,
+    }
+
+
+def load_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[str, Any]:
+    dataset_name = str(metadata.get("dataset", "hypersim")).lower()
+    if dataset_name == "hypersim":
+        return load_hypersim_normal_sample_from_metadata(metadata, pn)
+    if dataset_name == "vkitti2":
+        return load_vkitti2_normal_sample_from_metadata(metadata, pn)
+    raise ValueError(f"Unsupported normal dataset in metadata: {dataset_name}")
+
+
 class HypersimNormalDataset(Dataset):
     """Read raw Hypersim jpg+hdf5 samples for RGB-to-normal estimation."""
 
@@ -172,6 +256,7 @@ class HypersimNormalDataset(Dataset):
             h_div_w = float(height) / float(width)
         original_size = original_hw if original_hw is not None else target_hw
         return {
+            "dataset": "hypersim",
             "image_path": str(image_path),
             "depth_path": str(depth_path),
             "normal_path": str(normal_path),
@@ -229,6 +314,88 @@ class HypersimNormalDataset(Dataset):
         if self.metadata_only:
             return self._metadata_only_sample(index)
         return self.load_full_sample(index)
+
+
+class VKITTI2NormalDataset(Dataset):
+    """Read preprocessed VKITTI2 RGB + D2NT normal samples for RGB-to-normal training."""
+
+    def __init__(
+        self,
+        root: str,
+        partition: str = "train",
+        pn: str = "0.06M",
+        max_samples: int = 0,
+        metadata_only: bool = False,
+    ) -> None:
+        super().__init__()
+        if pn not in {"0.06M", "0.25M", "1M"}:
+            raise ValueError(f"Unsupported pn: {pn}")
+
+        self.root = Path(root)
+        self.partition = partition
+        self.pn = pn
+        self.metadata_only = metadata_only
+        self.manifest_path = self._resolve_manifest_path(self.root)
+        self.manifest_dir = self.manifest_path.parent
+        with self.manifest_path.open("r", encoding="utf-8") as handle:
+            self.records = [json.loads(line) for line in handle if line.strip()]
+        if max_samples > 0:
+            self.records = self.records[:max_samples]
+        self.original_hw = self._infer_original_hw()
+
+    @staticmethod
+    def _resolve_manifest_path(root: Path) -> Path:
+        candidates = [
+            root / "manifest.jsonl",
+            root / "processed" / "normals_d2nt_v3" / "manifest.jsonl",
+            root / "processed" / "normals_from_depth" / "manifest.jsonl",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(f"VKITTI2 manifest.jsonl not found under {root}")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _infer_original_hw(self) -> tuple[int, int]:
+        if not self.records:
+            return (375, 1242)
+        image_path = _resolve_path(self.records[0]["rgb_path"], self.manifest_dir)
+        with Image.open(image_path) as image_handle:
+            original_width, original_height = image_handle.size
+        return int(original_height), int(original_width)
+
+    def _metadata_for_record(self, index: int, record: dict[str, Any]) -> dict[str, Any]:
+        original_height, original_width = self.original_hw
+        target_height, target_width, template = _resolve_target_size(original_height, original_width, self.pn)
+        metadata = dict(record)
+        metadata.update(
+            {
+                "dataset": "vkitti2",
+                "image_path": record["rgb_path"],
+                "partition": self.partition,
+                "index": int(record.get("__original_index", index)),
+                "stem": f"{record.get('scene', 'scene')}_{record.get('variant', 'variant')}_{record.get('camera', 'camera')}_{int(record.get('frame', index)):05d}",
+                "h_div_w": float(original_height) / float(original_width),
+                "h_div_w_template": template,
+                "target_size": [int(target_height), int(target_width)],
+                "original_size": (original_height, original_width),
+                "manifest_dir": str(self.manifest_dir),
+            }
+        )
+        return metadata
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        metadata = self._metadata_for_record(index, self.records[index])
+        if self.metadata_only:
+            return {
+                "image": torch.empty(0),
+                "target": torch.empty(0),
+                "mask": torch.empty(0, dtype=torch.bool),
+                "metadata": metadata,
+            }
+        return load_vkitti2_normal_sample_from_metadata(metadata, self.pn)
 
 
 class NYUv2ParquetNormalDataset(Dataset):

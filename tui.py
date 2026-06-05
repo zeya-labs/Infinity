@@ -894,6 +894,10 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["output_dir"],
         "--data-root",
         values["data_root"],
+        "--train-datasets",
+        values["train_datasets"],
+        "--vkitti2-root",
+        values["vkitti2_root"],
         "--normal-vae-ckpt",
         values["normal_vae"],
         "--rgb-vae-ckpt",
@@ -1110,6 +1114,10 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
     ]
     if values["swanlab_experiment"]:
         cmd += ["--swanlab-experiment-name", values["swanlab_experiment"]]
+    if values.get("resume", "").strip():
+        cmd += ["--resume", values["resume"].strip()]
+    if values.get("resume_weights_only", "0").lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--resume-weights-only")
     if values["spatial_patchify"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--apply-spatial-patchify")
     else:
@@ -1173,7 +1181,9 @@ TASKS: list[Task] = [
             Field("gpus", "GPU 数", "8"),
             Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
-            Field("data_root", "数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
+            Field("train_datasets", "训练数据集", "hypersim,vkitti2", help="逗号分隔：hypersim,vkitti2"),
+            Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
+            Field("vkitti2_root", "VKITTI2 数据目录", "/root/vepfs/Infinity/data/VKITTI2"),
             Field(
                 "normal_vae",
                 "Normal VAE",
@@ -1259,6 +1269,12 @@ TASKS: list[Task] = [
             Field("gpus", "GPU 数", "8"),
             Field("volc_topology", "Volc topology", "2x4", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_tokenizer")),
+            Field(
+                "resume",
+                "Resume checkpoint",
+                "",
+            ),
+            Field("resume_weights_only", "只加载权重", "0", choices=("0", "1")),
             Field("data_root", "Hypersim 数据目录", "/root/vepfs/Infinity/data/hypersim/processed/hypersim"),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("train_partition", "Train split", "train"),
@@ -1272,7 +1288,7 @@ TASKS: list[Task] = [
             Field("prefetch_factor", "Prefetch factor", "4"),
             Field("repeat_train", "Repeat train", "1"),
             Field("repeat_val", "Repeat val", "1"),
-            Field("lr", "Learning rate", "2e-4"),
+            Field("lr", "Learning rate", "1e-4"),
             Field("min_lr", "Min LR", "1e-5"),
             Field("warmup_ratio", "Warmup ratio", "0.03"),
             Field("beta1", "Adam beta1", "0.9"),

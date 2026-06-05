@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import importlib.util
 import json
@@ -34,7 +35,7 @@ except ImportError:
     StateDictType = None
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import make_grid, save_image
 
@@ -44,6 +45,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from infinity.normal_estimation import (  # noqa: E402
     HypersimNormalDataset,
+    VKITTI2NormalDataset,
     build_bsq_vae,
     build_prefix_tokens_from_image,
     build_infinity_normal_model,
@@ -51,7 +53,7 @@ from infinity.normal_estimation import (  # noqa: E402
     collate_normal_estimation_batch,
     compute_normal_metrics,
     decode_logits_to_normal,
-    load_hypersim_normal_sample_from_metadata,
+    load_normal_sample_from_metadata,
     load_infinity_state_dict,
     normals_to_vis,
     resolve_scale_schedule_from_hw,
@@ -66,6 +68,72 @@ FULLSTATE_SAVE_POLICY = (
     if FullStateDictConfig is not None
     else None
 )
+
+
+class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        distributed: bool,
+        seed: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.distributed = distributed
+        self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+        self.groups = self._build_groups()
+
+    def _build_groups(self) -> dict[tuple[int, int], list[int]]:
+        groups: dict[tuple[int, int], list[int]] = {}
+        for index in range(len(self.dataset)):
+            metadata = dataset_metadata_at(self.dataset, index)
+            key = tuple(int(item) for item in metadata["target_size"])
+            groups.setdefault(key, []).append(index)
+        return groups
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def _all_batches(self) -> list[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        batches: list[list[int]] = []
+        for key in sorted(self.groups):
+            indices = list(self.groups[key])
+            if self.shuffle:
+                rng.shuffle(indices)
+            for offset in range(0, len(indices), self.batch_size):
+                batch = indices[offset : offset + self.batch_size]
+                if len(batch) == self.batch_size or (batch and not self.drop_last):
+                    batches.append(batch)
+        if self.shuffle:
+            rng.shuffle(batches)
+        if self.distributed and self.drop_last:
+            usable = (len(batches) // self.world_size) * self.world_size
+            batches = batches[:usable]
+        return batches
+
+    def __iter__(self):
+        batches = self._all_batches()
+        if self.distributed:
+            batches = batches[self.rank :: self.world_size]
+        return iter(batches)
+
+    def __len__(self) -> int:
+        batches = self._all_batches()
+        if self.distributed:
+            return len(batches[self.rank :: self.world_size])
+        return len(batches)
 FULLOPTSTATE_SAVE_POLICY = (
     FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
     if FullOptimStateDictConfig is not None
@@ -76,6 +144,13 @@ FULLOPTSTATE_SAVE_POLICY = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Infinity for RGB-to-normal estimation on raw Hypersim.")
     parser.add_argument("--data-root", type=str, default="/root/vepfs/Infinity/data/hypersim/processed/hypersim")
+    parser.add_argument(
+        "--train-datasets",
+        type=str,
+        default="hypersim",
+        help="Comma-separated train datasets. Supported: hypersim,vkitti2.",
+    )
+    parser.add_argument("--vkitti2-root", type=str, default="/root/vepfs/Infinity/data/VKITTI2")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--init-model", type=str, default="")
@@ -396,15 +471,41 @@ def reduce_timing_dict(timings: dict[str, float], distributed: bool, device: tor
 
 
 def make_dataloader(
-    dataset: HypersimNormalDataset,
+    dataset: Dataset,
     *,
     batch_size: int,
     num_workers: int,
     prefetch_factor: int,
     distributed: bool,
+    rank: int = 0,
+    world_size: int = 1,
     shuffle: bool,
     drop_last: bool,
-) -> tuple[DataLoader, DistributedSampler | None]:
+    group_by_target_size: bool = False,
+) -> tuple[DataLoader, Sampler | None]:
+    if group_by_target_size:
+        batch_sampler = GroupedTargetSizeBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            distributed=distributed,
+            seed=0,
+            rank=rank,
+            world_size=world_size,
+        )
+        kwargs: dict[str, Any] = {
+            "dataset": dataset,
+            "batch_sampler": batch_sampler,
+            "num_workers": num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "collate_fn": collate_normal_estimation_batch,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = prefetch_factor
+        return DataLoader(**kwargs), batch_sampler
+
     sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=drop_last) if distributed else None
     kwargs: dict[str, Any] = {
         "dataset": dataset,
@@ -420,6 +521,61 @@ def make_dataloader(
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = prefetch_factor
     return DataLoader(**kwargs), sampler
+
+
+def dataset_metadata_at(dataset: Dataset, index: int) -> dict[str, Any]:
+    if isinstance(dataset, Subset):
+        return dataset_metadata_at(dataset.dataset, int(dataset.indices[index]))
+    if isinstance(dataset, ConcatDataset):
+        dataset_index = bisect.bisect_right(dataset.cumulative_sizes, index)
+        sample_index = index if dataset_index == 0 else index - dataset.cumulative_sizes[dataset_index - 1]
+        return dataset_metadata_at(dataset.datasets[dataset_index], sample_index)
+    if isinstance(dataset, HypersimNormalDataset):
+        return dataset._metadata_only_sample(index)["metadata"]
+    if isinstance(dataset, VKITTI2NormalDataset):
+        return dataset._metadata_for_record(index, dataset.records[index])
+    sample = dataset[index]
+    return sample["metadata"]
+
+
+def parse_train_dataset_names(value: str) -> list[str]:
+    names = [item.strip().lower() for item in value.replace(";", ",").split(",") if item.strip()]
+    if not names:
+        raise ValueError("--train-datasets must include at least one dataset")
+    supported = {"hypersim", "vkitti2"}
+    unknown = sorted(set(names) - supported)
+    if unknown:
+        raise ValueError(f"Unsupported --train-datasets entries: {unknown}. Supported: {sorted(supported)}")
+    return names
+
+
+def build_train_dataset(args: argparse.Namespace) -> Dataset:
+    metadata_only = args.token_cache_metadata_only and token_cache_enabled(args)
+    datasets: list[Dataset] = []
+    for name in parse_train_dataset_names(args.train_datasets):
+        if name == "hypersim":
+            datasets.append(
+                HypersimNormalDataset(
+                    root=args.data_root,
+                    partition=args.train_partition,
+                    pn=args.pn,
+                    max_samples=args.max_train_samples,
+                    metadata_only=metadata_only,
+                )
+            )
+        elif name == "vkitti2":
+            datasets.append(
+                VKITTI2NormalDataset(
+                    root=args.vkitti2_root,
+                    partition=args.train_partition,
+                    pn=args.pn,
+                    max_samples=args.max_train_samples,
+                    metadata_only=metadata_only,
+                )
+            )
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatDataset(datasets)
 
 
 def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace, total_steps: int) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
@@ -491,7 +647,7 @@ def batch_has_full_tensors(batch: dict[str, Any]) -> bool:
 
 
 def materialize_batch_from_metadata(batch: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    samples = [load_hypersim_normal_sample_from_metadata(metadata, args.pn) for metadata in batch["metadata"]]
+    samples = [load_normal_sample_from_metadata(metadata, args.pn) for metadata in batch["metadata"]]
     return collate_normal_estimation_batch(samples)
 
 
@@ -527,7 +683,7 @@ def token_cache_signature(args: argparse.Namespace, scale_schedule: list[tuple[i
 def token_cache_sample_key(metadata: dict[str, Any], signature: str) -> str:
     source = "|".join(
         str(metadata.get(key, ""))
-        for key in ("partition", "index", "image_path", "normal_path", "target_size")
+        for key in ("dataset", "partition", "index", "image_path", "normal_path", "target_size")
     )
     digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:24]
     return f"{signature}_{digest}.pt"
@@ -568,32 +724,18 @@ def missing_token_cache_paths(cache_dir: Path, metadata: list[dict[str, Any]], s
     ]
 
 
-def filter_dataset_to_token_cache_hits(dataset: HypersimNormalDataset, args: argparse.Namespace, cache_dir: Path) -> int:
-    kept_records = []
-    for index, record in enumerate(dataset.records):
-        image_path = dataset.root / record["images"]
-        depth_path = dataset.root / record["depth"]
-        normal_path = dataset.root / record["normal"]
-        target_hw = tuple(int(item) for item in dataset._metadata_only_sample(index)["metadata"]["target_size"])
-        metadata = dataset._metadata_for_record(
-            index,
-            record,
-            image_path,
-            depth_path,
-            normal_path,
-            target_hw,
-            original_hw=(768, 1024),
-        )
+def filter_dataset_to_token_cache_hits(dataset: Dataset, args: argparse.Namespace, cache_dir: Path) -> tuple[Dataset, int]:
+    kept_indices = []
+    for index in range(len(dataset)):
+        metadata = dataset_metadata_at(dataset, index)
+        target_hw = tuple(int(item) for item in metadata["target_size"])
         scale_schedule = [tuple(item) for item in resolve_scale_schedule_from_hw(target_hw[0], target_hw[1], args.pn)[1]]
         scale_schedule = scale_schedule[: min(args.always_training_scales, len(scale_schedule))]
         signature = token_cache_signature(args, scale_schedule)
         if (cache_dir / token_cache_sample_key(metadata, signature)).is_file():
-            kept_record = dict(record)
-            kept_record["__original_index"] = str(index)
-            kept_records.append(kept_record)
-    original_len = len(dataset.records)
-    dataset.records = kept_records
-    return original_len
+            kept_indices.append(index)
+    original_len = len(dataset)
+    return Subset(dataset, kept_indices), original_len
 
 
 def save_token_cache_batch(
@@ -1422,17 +1564,11 @@ def main() -> int:
                 LOGGER.warning("--token-cache-metadata-only was requested, but token cache is disabled for this run.")
 
         with timed_stage(init_timings if args.profile_timings else None, "dataset_loader", device):
-            train_dataset = HypersimNormalDataset(
-                root=args.data_root,
-                partition=args.train_partition,
-                pn=args.pn,
-                max_samples=args.max_train_samples,
-                metadata_only=args.token_cache_metadata_only and token_cache_enabled(args),
-            )
+            train_dataset = build_train_dataset(args)
             if args.token_cache_filter_missing:
                 if not token_cache_enabled(args):
                     raise ValueError("--token-cache-filter-missing requires --token-cache-dir.")
-                original_len = filter_dataset_to_token_cache_hits(train_dataset, args, Path(args.token_cache_dir))
+                train_dataset, original_len = filter_dataset_to_token_cache_hits(train_dataset, args, Path(args.token_cache_dir))
                 if rank == 0:
                     LOGGER.info(
                         "Filtered train dataset by token cache hits: kept=%d original=%d",
@@ -1462,8 +1598,11 @@ def main() -> int:
                 num_workers=args.num_workers,
                 prefetch_factor=args.prefetch_factor,
                 distributed=distributed,
+                rank=rank,
+                world_size=world_size,
                 shuffle=train_shuffle,
                 drop_last=True,
+                group_by_target_size=True,
             )
             val_loader, _ = make_dataloader(
                 val_dataset,
@@ -1471,6 +1610,8 @@ def main() -> int:
                 num_workers=args.num_workers,
                 prefetch_factor=args.prefetch_factor,
                 distributed=distributed,
+                rank=rank,
+                world_size=world_size,
                 shuffle=False,
                 drop_last=False,
             )
@@ -1482,6 +1623,8 @@ def main() -> int:
                     num_workers=args.num_workers,
                     prefetch_factor=args.prefetch_factor,
                     distributed=distributed,
+                    rank=rank,
+                    world_size=world_size,
                     shuffle=False,
                     drop_last=False,
                 )
