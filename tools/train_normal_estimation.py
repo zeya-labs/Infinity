@@ -1924,7 +1924,7 @@ def main() -> int:
                         val_visuals["prediction"],
                         is_main=True,
                     )
-            if ar_val_loader is not None and args.ar_eval_every > 0:
+            if ar_val_loader is not None and args.ar_eval_every > 0 and global_step % args.ar_eval_every == 0:
                 ar_metrics, ar_visuals = evaluate_ar(
                     model=model,
                     normal_vae=normal_vae,
