@@ -165,7 +165,7 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Compute decoded normal train metrics every N optimizer steps; 0 disables them during train. Validation is unchanged.",
     )
-    parser.add_argument("--ar-eval-every", type=int, default=0)
+    parser.add_argument("--ar-eval-every", type=int, default=9999999)
     parser.add_argument("--ar-eval-samples", type=int, default=32)
     parser.add_argument("--ar-eval-top-k", type=int, default=1)
     parser.add_argument("--ar-eval-top-p", type=float, default=0.0)

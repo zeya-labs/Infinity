@@ -1248,7 +1248,7 @@ TASKS: list[Task] = [
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
-            Field("ar_eval_every", "AR eval every", "0"),
+            Field("ar_eval_every", "AR eval every", "9999999"),
             Field("ar_eval_samples", "AR eval samples", "32"),
             Field("ar_eval_top_k", "AR top-k", "1"),
             Field("ar_eval_top_p", "AR top-p", "0.0"),
