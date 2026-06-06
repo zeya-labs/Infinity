@@ -29,7 +29,6 @@ from infinity.normal_estimation.defaults import (
     DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
     DEFAULT_VKITTI2_ROOT,
-    LEGACY_NORMAL_TOKENIZER_CKPT,
 )
 
 
@@ -1226,7 +1225,6 @@ TASKS: list[Task] = [
                 choices=(
                     DEFAULT_NORMAL_TOKENIZER_CKPT,
                     "weights/infinity_vae_d32reg.pth",
-                    LEGACY_NORMAL_TOKENIZER_CKPT,
                 ),
             ),
             Field("rgb_vae", "RGB VAE", "weights/infinity_vae_d32reg.pth"),

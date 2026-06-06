@@ -8,7 +8,6 @@ from infinity.normal_estimation.defaults import (
     DEFAULT_NORMAL_TOKENIZER_CKPT,
     DEFAULT_HYPERSIM_ROOT,
     DEFAULT_VKITTI2_ROOT,
-    LEGACY_NORMAL_TOKENIZER_CKPT,
     REPO_ROOT,
 )
 
@@ -23,11 +22,7 @@ class NormalDefaultsTest(unittest.TestCase):
     def test_checkpoint_defaults_are_centralized_repo_relative_paths(self) -> None:
         self.assertEqual(
             Path(DEFAULT_NORMAL_TOKENIZER_CKPT),
-            REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-06-03" / "00-39-35" / "checkpoints" / "best_angle_3.5732.pth",
-        )
-        self.assertEqual(
-            Path(LEGACY_NORMAL_TOKENIZER_CKPT),
-            REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-05-31" / "15-08-43" / "checkpoints" / "best_angle_6.7867.pth",
+            REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-06-05" / "06-25-00" / "checkpoints" / "best_angle_3.0379.pth",
         )
         self.assertEqual(
             Path(DEFAULT_NORMAL_ESTIMATION_CKPT),

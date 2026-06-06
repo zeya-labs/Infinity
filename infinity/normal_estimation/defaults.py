@@ -12,11 +12,7 @@ DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS = "hypersim:9,vkitti2:1"
 
 DEFAULT_NORMAL_TOKENIZER_CKPT = os.environ.get(
     "INFINITY_NORMAL_TOKENIZER_CKPT",
-    str(REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-06-03" / "00-39-35" / "checkpoints" / "best_angle_3.5732.pth"),
-)
-LEGACY_NORMAL_TOKENIZER_CKPT = os.environ.get(
-    "INFINITY_LEGACY_NORMAL_TOKENIZER_CKPT",
-    str(REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-05-31" / "15-08-43" / "checkpoints" / "best_angle_6.7867.pth"),
+    str(REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-06-05" / "06-25-00" / "checkpoints" / "best_angle_3.0379.pth"),
 )
 DEFAULT_NORMAL_ESTIMATION_CKPT = os.environ.get(
     "INFINITY_NORMAL_ESTIMATION_CKPT",
