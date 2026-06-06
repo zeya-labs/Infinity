@@ -113,6 +113,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument(
+        "--word-head-lr",
+        type=float,
+        default=0.0,
+        help="LR for token embedding/output head parameters; 0 uses --lr.",
+    )
+    parser.add_argument(
+        "--word-head-min-lr",
+        type=float,
+        default=0.0,
+        help="Minimum LR for token embedding/output head parameters; 0 uses --min-lr.",
+    )
+    parser.add_argument(
+        "--image-word-lr",
+        type=float,
+        default=0.0,
+        help="LR for RGB prefix image_word_embed parameters; 0 uses --lr.",
+    )
+    parser.add_argument(
+        "--image-word-min-lr",
+        type=float,
+        default=0.0,
+        help="Minimum LR for RGB prefix image_word_embed parameters; 0 uses --min-lr.",
+    )
+    parser.add_argument(
+        "--normal-task-lr",
+        type=float,
+        default=0.0,
+        help="LR for normal task/modal embedding parameters; 0 uses --lr.",
+    )
+    parser.add_argument(
+        "--normal-task-min-lr",
+        type=float,
+        default=0.0,
+        help="Minimum LR for normal task/modal embedding parameters; 0 uses --min-lr.",
+    )
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument(
         "--resume-lr-step",
@@ -418,8 +454,86 @@ def reduce_timing_dict(timings: dict[str, float], distributed: bool, device: tor
     return {key: float(value) for key, value in zip(keys, values.tolist(), strict=True)}
 
 
+def _normal_lr_group_name(parameter_name: str) -> str:
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("module.", "_orig_mod.", "_fsdp_wrapped_module."):
+            if parameter_name.startswith(prefix):
+                parameter_name = parameter_name[len(prefix) :]
+                changed = True
+    if parameter_name.startswith("image_word_embed."):
+        return "image_word"
+    if parameter_name in {"image_modality_embed", "normal_modality_embed", "normal_task_kv"}:
+        return "normal_task"
+    if (
+        parameter_name.startswith("word_embed.")
+        or parameter_name.startswith("norm0_ve.")
+        or parameter_name.startswith("head.")
+        or parameter_name.startswith("head_nm.")
+    ):
+        return "word_head"
+    return "backbone"
+
+
+def _resolve_group_lr(value: float, fallback: float) -> float:
+    return value if value > 0 else fallback
+
+
+def build_normal_lr_param_groups(model: torch.nn.Module, args: argparse.Namespace) -> list[dict[str, Any]]:
+    lr_config = {
+        "backbone": (args.lr, args.min_lr),
+        "word_head": (
+            _resolve_group_lr(args.word_head_lr, args.lr),
+            _resolve_group_lr(args.word_head_min_lr, args.min_lr),
+        ),
+        "image_word": (
+            _resolve_group_lr(args.image_word_lr, args.lr),
+            _resolve_group_lr(args.image_word_min_lr, args.min_lr),
+        ),
+        "normal_task": (
+            _resolve_group_lr(args.normal_task_lr, args.lr),
+            _resolve_group_lr(args.normal_task_min_lr, args.min_lr),
+        ),
+    }
+    grouped: dict[str, list[tuple[str, torch.nn.Parameter]]] = {name: [] for name in lr_config}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            grouped[_normal_lr_group_name(name)].append((name, parameter))
+
+    param_groups: list[dict[str, Any]] = []
+    for group_name in ("backbone", "word_head", "image_word", "normal_task"):
+        named_parameters = grouped[group_name]
+        if not named_parameters:
+            continue
+        lr, min_lr = lr_config[group_name]
+        if min_lr > lr:
+            raise ValueError(f"{group_name} min_lr ({min_lr:g}) must be <= lr ({lr:g}).")
+        parameter_count = sum(parameter.numel() for _, parameter in named_parameters)
+        LOGGER.info(
+            "optimizer_group=%s params=%.2fM lr=%.3g min_lr=%.3g examples=%s",
+            group_name,
+            parameter_count / 1_000_000,
+            lr,
+            min_lr,
+            ",".join(name for name, _ in named_parameters[:3]),
+        )
+        param_groups.append(
+            {
+                "params": [parameter for _, parameter in named_parameters],
+                "lr": lr,
+                "initial_lr": lr,
+                "min_lr": min_lr,
+                "group_name": group_name,
+            }
+        )
+    if not param_groups:
+        raise RuntimeError("No trainable parameters found for normal estimation optimizer.")
+    return param_groups
+
+
 def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespace, total_steps: int) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
-    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    param_groups = build_normal_lr_param_groups(model, args)
     optimizer_kwargs: dict[str, Any] = {}
     if args.optimizer_backend == "fused":
         optimizer_kwargs["fused"] = True
@@ -429,8 +543,7 @@ def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespa
         optimizer_kwargs["foreach"] = False
     try:
         optimizer = torch.optim.AdamW(
-            params,
-            lr=args.lr,
+            param_groups,
             betas=tuple(args.betas),
             weight_decay=args.weight_decay,
             **optimizer_kwargs,
@@ -440,8 +553,7 @@ def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespa
             raise
         LOGGER.warning("Fused AdamW is unavailable (%s); falling back to foreach AdamW.", exc)
         optimizer = torch.optim.AdamW(
-            params,
-            lr=args.lr,
+            param_groups,
             betas=tuple(args.betas),
             weight_decay=args.weight_decay,
             foreach=True,
@@ -449,18 +561,32 @@ def build_optimizer_and_scheduler(model: torch.nn.Module, args: argparse.Namespa
 
     warmup_steps = int(total_steps * args.warmup_ratio)
 
-    def lr_lambda(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return max(1e-8, float(step + 1) / float(max(1, warmup_steps)))
-        if total_steps <= warmup_steps:
-            return 1.0
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        min_ratio = args.min_lr / args.lr
-        return min_ratio + (1.0 - min_ratio) * cosine
+    def group_lr_lambda(group_index: int):
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return max(1e-8, float(step + 1) / float(max(1, warmup_steps)))
+            if total_steps <= warmup_steps:
+                return 1.0
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            group = optimizer.param_groups[group_index]
+            min_ratio = float(group["min_lr"]) / float(group["initial_lr"])
+            return min_ratio + (1.0 - min_ratio) * cosine
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return lr_lambda
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        [group_lr_lambda(group_index) for group_index in range(len(optimizer.param_groups))],
+    )
     return optimizer, scheduler
+
+
+def optimizer_lr_by_group(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    return {
+        str(group.get("group_name", index)): float(group["lr"])
+        for index, group in enumerate(optimizer.param_groups)
+    }
 
 
 def maybe_resize_target_for_prediction(
@@ -886,23 +1012,27 @@ def maybe_resume(
     has_optimizer_state = "optimizer" in checkpoint and "scheduler" in checkpoint
     optimizer_loaded = False
     if has_optimizer_state:
-        if is_fsdp_model(model) and checkpoint_zero > 0:
-            optim_state_dict = FSDP.optim_state_dict_to_load(
-                model=model,
-                optim=optimizer,
-                optim_state_dict=checkpoint["optimizer"],
-            )
-            optimizer.load_state_dict(optim_state_dict)
-            scheduler.load_state_dict(checkpoint["scheduler"])
-            if scaler is not None and checkpoint.get("scaler") is not None:
-                scaler.load_state_dict(checkpoint["scaler"])
-            optimizer_loaded = True
-        elif not is_fsdp_model(model) and checkpoint_zero == 0:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            scheduler.load_state_dict(checkpoint["scheduler"])
-            if scaler is not None and checkpoint.get("scaler") is not None:
-                scaler.load_state_dict(checkpoint["scaler"])
-            optimizer_loaded = True
+        can_load_optimizer_state = (is_fsdp_model(model) and checkpoint_zero > 0) or (
+            not is_fsdp_model(model) and checkpoint_zero == 0
+        )
+        if can_load_optimizer_state:
+            try:
+                if is_fsdp_model(model):
+                    optim_state_dict = FSDP.optim_state_dict_to_load(
+                        model=model,
+                        optim=optimizer,
+                        optim_state_dict=checkpoint["optimizer"],
+                    )
+                    optimizer.load_state_dict(optim_state_dict)
+                else:
+                    optimizer.load_state_dict(checkpoint["optimizer"])
+                scheduler.load_state_dict(checkpoint["scheduler"])
+                if scaler is not None and checkpoint.get("scaler") is not None:
+                    scaler.load_state_dict(checkpoint["scaler"])
+                optimizer_loaded = True
+            except ValueError as exc:
+                if is_main:
+                    LOGGER.info("Resumed weights from %s but skipped optimizer state: %s", resume_path, exc)
         elif is_main:
             LOGGER.info(
                 "Resumed weights from %s but skipped optimizer state because checkpoint zero=%s and current zero=%s",
@@ -1548,7 +1678,8 @@ def main() -> int:
                     LOGGER.info("Wrote torch profiler table to %s and trace to %s", table_path, trace_path)
                 global_step += 1
 
-                current_lr = optimizer.param_groups[0]["lr"]
+                current_lr_by_group = optimizer_lr_by_group(optimizer)
+                current_lr = current_lr_by_group.get("backbone", optimizer.param_groups[0]["lr"])
                 if should_log_step:
                     reduced = reduce_metrics(metrics, distributed)
                 if rank == 0 and should_log_step:
@@ -1603,6 +1734,8 @@ def main() -> int:
                             if has_normal_metrics or key not in normal_metric_keys
                         }
                         payload["train/lr"] = current_lr
+                        for group_name, group_lr in current_lr_by_group.items():
+                            payload[f"train/lr/{group_name}"] = group_lr
                         payload["train/epoch"] = epoch + 1
                         swanlab_run.log(payload, step=global_step)
                 if step_timings is not None:
