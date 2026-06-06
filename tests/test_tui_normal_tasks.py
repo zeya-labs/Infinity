@@ -32,8 +32,8 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--image-word-lr", "5e-5")
         self.assert_flag_value(cmd, "--normal-task-lr", "1e-4")
         self.assert_flag_value(cmd, "--train-normal-metrics-every", "100")
-        self.assert_flag_value(cmd, "--image-log-every", "500")
-        self.assert_flag_value(cmd, "--save-every-steps", "500")
+        self.assert_flag_value(cmd, "--image-log-every", "200")
+        self.assert_flag_value(cmd, "--save-every-steps", "100")
         self.assertNotIn("--token-cache-" + "memory", cmd)
 
     def test_normal_tokenizer_uses_mixed_dataset_defaults(self) -> None:
