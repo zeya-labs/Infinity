@@ -1925,6 +1925,8 @@ def main() -> int:
                         is_main=True,
                     )
             if ar_val_loader is not None and args.ar_eval_every > 0:
+                if rank == 0:
+                    LOGGER.info("val_ar epoch=%d start", epoch + 1)
                 ar_metrics, ar_visuals = evaluate_ar(
                     model=model,
                     normal_vae=normal_vae,
@@ -1960,6 +1962,8 @@ def main() -> int:
                             is_main=True,
                         )
                 dist_barrier_if_initialized()
+                if rank == 0:
+                    LOGGER.info("val_ar epoch=%d done", epoch + 1)
             if should_save_last:
                 save_checkpoint(
                     output_dir / "checkpoints" / "last.pth",
