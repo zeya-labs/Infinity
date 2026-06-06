@@ -34,6 +34,7 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-normal-metrics-every", "100")
         self.assert_flag_value(cmd, "--image-log-every", "200")
         self.assert_flag_value(cmd, "--save-every-steps", "100")
+        self.assertIn("--hypersim-filter-depth-nan", cmd)
         self.assertNotIn("--token-cache-" + "memory", cmd)
 
     def test_normal_tokenizer_uses_mixed_dataset_defaults(self) -> None:
@@ -42,6 +43,7 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-datasets", DEFAULT_NORMAL_TRAIN_DATASETS)
         self.assert_flag_value(cmd, "--train-dataset-weights", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS)
         self.assert_flag_value(cmd, "--vkitti2-root", DEFAULT_VKITTI2_ROOT)
+        self.assertIn("--hypersim-filter-depth-nan", cmd)
 
     def test_tui_does_not_embed_local_vepfs_literal(self) -> None:
         text = Path(tui.__file__).read_text(encoding="utf-8")

@@ -100,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated dataset sampling weights, e.g. hypersim:9,vkitti2:1. Empty uses 1 for each train dataset.",
     )
     parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
+    parser.add_argument(
+        "--hypersim-filter-depth-nan",
+        action="store_true",
+        default=False,
+        help="Drop Hypersim samples whose depth HDF5 contains NaN before training/validation.",
+    )
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--init-model", type=str, default="")
@@ -1438,6 +1444,7 @@ def main() -> int:
                 pn=args.pn,
                 max_samples=args.max_train_samples,
                 metadata_only=args.token_cache_metadata_only and token_cache_enabled(args),
+                hypersim_filter_depth_nan=args.hypersim_filter_depth_nan,
             )
             if rank == 0:
                 LOGGER.info(
@@ -1462,12 +1469,14 @@ def main() -> int:
                 partition=args.val_partition,
                 pn=args.pn,
                 max_samples=args.max_val_samples,
+                filter_depth_nan=args.hypersim_filter_depth_nan,
             )
             ar_val_dataset = HypersimNormalDataset(
                 root=args.data_root,
                 partition=args.val_partition,
                 pn=args.pn,
                 max_samples=args.ar_eval_samples,
+                filter_depth_nan=args.hypersim_filter_depth_nan,
             ) if args.ar_eval_samples > 0 else None
             train_shuffle = not args.token_cache_filter_missing
             if rank == 0 and not train_shuffle:

@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated dataset sampling weights, e.g. hypersim:9,vkitti2:1. Empty uses 1 for each train dataset.",
     )
     parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
+    parser.add_argument(
+        "--hypersim-filter-depth-nan",
+        action="store_true",
+        default=False,
+        help="Drop Hypersim samples whose depth HDF5 contains NaN before training/validation.",
+    )
     parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="1M")
     parser.add_argument("--train-partition", type=str, default="train")
     parser.add_argument("--val-partition", type=str, default="val")
@@ -488,12 +494,14 @@ def build_tokenizer_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset
         partition=args.train_partition,
         pn=args.pn,
         max_samples=args.max_train_samples,
+        hypersim_filter_depth_nan=args.hypersim_filter_depth_nan,
     )
     val_dataset: Dataset = HypersimNormalDataset(
         root=args.data_root,
         partition=args.val_partition,
         pn=args.pn,
         max_samples=args.max_val_samples,
+        filter_depth_nan=args.hypersim_filter_depth_nan,
     )
     if args.repeat_train > 1:
         train_dataset = RepeatDataset(train_dataset, args.repeat_train)

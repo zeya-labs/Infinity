@@ -288,6 +288,7 @@ def build_normal_train_dataset(
     pn: str,
     max_samples: int,
     metadata_only: bool = False,
+    hypersim_filter_depth_nan: bool = False,
 ) -> Dataset:
     datasets: list[Dataset] = []
     for name in parse_train_dataset_names(train_datasets):
@@ -299,6 +300,7 @@ def build_normal_train_dataset(
                     pn=pn,
                     max_samples=max_samples,
                     metadata_only=metadata_only,
+                    filter_depth_nan=hypersim_filter_depth_nan,
                 )
             )
         elif name == "vkitti2":

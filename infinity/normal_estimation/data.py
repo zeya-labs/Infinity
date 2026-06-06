@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
-from .file_io import read_depth_normal_hypersim
+from .file_io import read_depth_normal_hypersim, read_hdf5
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -237,6 +237,7 @@ class HypersimNormalDataset(Dataset):
         pn: str = "0.06M",
         max_samples: int = 0,
         metadata_only: bool = False,
+        filter_depth_nan: bool = False,
     ) -> None:
         super().__init__()
         if partition not in {"train", "val", "test"}:
@@ -255,11 +256,35 @@ class HypersimNormalDataset(Dataset):
         with csv_path.open("r", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             self.records = list(reader)
+        if filter_depth_nan:
+            self.records = self._records_without_depth_nan(csv_path)
         if max_samples > 0:
             self.records = self.records[:max_samples]
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def _records_without_depth_nan(self, csv_path: Path) -> list[dict[str, str]]:
+        cache_path = csv_path.with_suffix(".no_depth_nan.jsonl")
+        if cache_path.is_file():
+            records = []
+            with cache_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        records.append(json.loads(line))
+            return records
+
+        records = []
+        for record in self.records:
+            depth_path = self.root / record["depth"]
+            depth = read_hdf5(str(depth_path))
+            if np.isnan(depth).any():
+                continue
+            records.append(record)
+        with cache_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return records
 
     def _metadata_for_record(
         self,

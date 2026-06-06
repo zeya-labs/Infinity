@@ -1023,6 +1023,8 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         "--swanlab-project",
         values["swanlab_project"],
     ]
+    if values["hypersim_filter_depth_nan"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--hypersim-filter-depth-nan")
     if values["swanlab_experiment"]:
         cmd += ["--swanlab-experiment-name", values["swanlab_experiment"]]
     if values["save_optimizer_state"].lower() in {"1", "yes", "true", "y"}:
@@ -1141,6 +1143,8 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
         "--swanlab-project",
         values["swanlab_project"],
     ]
+    if values["hypersim_filter_depth_nan"].lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--hypersim-filter-depth-nan")
     if values["swanlab_experiment"]:
         cmd += ["--swanlab-experiment-name", values["swanlab_experiment"]]
     if values.get("resume", "").strip():
@@ -1214,6 +1218,7 @@ TASKS: list[Task] = [
             Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
+            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "1", choices=("0", "1")),
             Field(
                 "normal_vae",
                 "Normal VAE",
@@ -1314,6 +1319,7 @@ TASKS: list[Task] = [
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
             Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
+            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "1", choices=("0", "1")),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("train_partition", "Train split", "train"),
             Field("val_partition", "Val split", "val"),
