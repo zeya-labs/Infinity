@@ -123,6 +123,36 @@ class NormalSamplingTest(unittest.TestCase):
         datasets = [dataset_metadata_at(dataset, batch[0])["dataset"] for batch in batches]
         self.assertEqual(datasets, ["hypersim", "hypersim", "hypersim", "vkitti2", "hypersim", "hypersim", "hypersim", "vkitti2"])
 
+    def test_weighted_sampler_shuffles_dataset_sequence(self) -> None:
+        from torch.utils.data import ConcatDataset
+
+        dataset = ConcatDataset(
+            [
+                ToyNormalDataset("hypersim", (864, 1152), 96),
+                ToyNormalDataset("vkitti2", (592, 1776), 1000),
+            ]
+        )
+        sampler = GroupedTargetSizeBatchSampler(
+            dataset,
+            batch_size=2,
+            shuffle=True,
+            drop_last=True,
+            distributed=True,
+            seed=0,
+            rank=0,
+            world_size=8,
+            dataset_weights={"hypersim": 3, "vkitti2": 1},
+        )
+
+        batches = list(sampler)
+        datasets = [dataset_metadata_at(dataset, batch[0])["dataset"] for batch in batches]
+        self.assertEqual(datasets.count("hypersim"), 6)
+        self.assertEqual(datasets.count("vkitti2"), 2)
+        self.assertNotEqual(
+            datasets,
+            ["hypersim", "hypersim", "hypersim", "vkitti2", "hypersim", "hypersim", "hypersim", "vkitti2"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

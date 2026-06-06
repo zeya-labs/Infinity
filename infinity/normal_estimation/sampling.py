@@ -148,12 +148,27 @@ class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
             if self.shuffle:
                 rng.shuffle(queues[key])
 
-        cursor = 0
-        while any(remaining > 0 for remaining in target_global_steps_by_dataset.values()):
-            dataset_name = dataset_pattern[cursor % len(dataset_pattern)]
-            cursor += 1
-            if target_global_steps_by_dataset.get(dataset_name, 0) <= 0:
-                continue
+        dataset_sequence = [
+            name
+            for name in dataset_names
+            for _ in range(target_global_steps_by_dataset.get(name, 0))
+        ]
+        if self.shuffle:
+            rng.shuffle(dataset_sequence)
+        else:
+            cursor = 0
+            ordered_sequence = []
+            remaining_by_dataset = dict(target_global_steps_by_dataset)
+            while any(remaining > 0 for remaining in remaining_by_dataset.values()):
+                dataset_name = dataset_pattern[cursor % len(dataset_pattern)]
+                cursor += 1
+                if remaining_by_dataset.get(dataset_name, 0) <= 0:
+                    continue
+                ordered_sequence.append(dataset_name)
+                remaining_by_dataset[dataset_name] -= 1
+            dataset_sequence = ordered_sequence
+
+        for dataset_name in dataset_sequence:
             keys = dataset_to_keys.get(dataset_name, [])
             if not keys:
                 continue
@@ -172,7 +187,6 @@ class GroupedTargetSizeBatchSampler(Sampler[list[int]]):
 
             for _ in range(needed):
                 batches.append(queues[selected_key].pop())
-            target_global_steps_by_dataset[dataset_name] -= 1
         return batches
 
     def _all_batches(self) -> list[list[int]]:
