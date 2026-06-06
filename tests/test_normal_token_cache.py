@@ -8,7 +8,7 @@ import torch
 
 from infinity.normal_estimation.token_cache import token_cache_sample_key
 from infinity.utils.torch_io import atomic_torch_save
-from tools.train_normal_estimation import load_token_cache_batch, save_token_cache_batch
+from tools.train_normal_estimation import batch_dataset_name, load_token_cache_batch, save_token_cache_batch
 
 
 class NormalTokenCacheTest(unittest.TestCase):
@@ -104,6 +104,13 @@ class NormalTokenCacheTest(unittest.TestCase):
         text = Path("tools/train_normal_estimation.py").read_text(encoding="utf-8")
         self.assertNotIn("--token-cache-" + "memory", text)
         self.assertNotIn("TOKEN_CACHE_" + "MEMORY", text)
+
+    def test_batch_dataset_name(self) -> None:
+        self.assertEqual(batch_dataset_name({"metadata": [self._metadata(1), self._metadata(2)]}), "hypersim")
+        self.assertEqual(
+            batch_dataset_name({"metadata": [self._metadata(1), {**self._metadata(2), "dataset": "vkitti2"}]}),
+            "mixed",
+        )
 
 
 if __name__ == "__main__":

@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         "--train-dataset-weights",
         type=str,
         default=DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
-        help="Comma-separated dataset sampling weights, e.g. hypersim:3,vkitti2:1. Empty uses 1 for each train dataset.",
+        help="Comma-separated dataset sampling weights, e.g. hypersim:9,vkitti2:1. Empty uses 1 for each train dataset.",
     )
     parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
     parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="1M")

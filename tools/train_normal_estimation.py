@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
         "--train-dataset-weights",
         type=str,
         default=DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
-        help="Comma-separated dataset sampling weights, e.g. hypersim:3,vkitti2:1. Empty uses 1 for each train dataset.",
+        help="Comma-separated dataset sampling weights, e.g. hypersim:9,vkitti2:1. Empty uses 1 for each train dataset.",
     )
     parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
     parser.add_argument("--output-dir", type=str, required=True)
@@ -587,6 +587,19 @@ def optimizer_lr_by_group(optimizer: torch.optim.Optimizer) -> dict[str, float]:
         str(group.get("group_name", index)): float(group["lr"])
         for index, group in enumerate(optimizer.param_groups)
     }
+
+
+def batch_dataset_name(batch: dict[str, Any]) -> str | None:
+    names = {
+        str(metadata.get("dataset", "")).strip()
+        for metadata in batch.get("metadata", [])
+        if isinstance(metadata, dict) and metadata.get("dataset")
+    }
+    if len(names) == 1:
+        return next(iter(names))
+    if len(names) > 1:
+        return "mixed"
+    return None
 
 
 def maybe_resize_target_for_prediction(
@@ -1240,11 +1253,14 @@ def evaluate(
     args: argparse.Namespace,
     device: torch.device,
     distributed: bool,
-) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, torch.Tensor] | None]:
     training = model.training
     model.eval()
     sums: dict[str, torch.Tensor] = {}
     count = 0
+    dataset_names = parse_train_dataset_names(args.train_datasets)
+    dataset_sums: dict[str, dict[str, torch.Tensor]] = {name: {} for name in dataset_names}
+    dataset_counts: dict[str, int] = {name: 0 for name in dataset_names}
     visual_payload = None
     for batch in dataloader:
         _, metrics, prediction, image = forward_batch(
@@ -1267,6 +1283,12 @@ def evaluate(
         count += batch_size
         for key, value in metrics.items():
             sums[key] = sums.get(key, value.new_tensor(0.0)) + value * batch_size
+        dataset_name = batch_dataset_name(batch)
+        if dataset_name in dataset_sums:
+            dataset_counts[dataset_name] += batch_size
+            dataset_sum = dataset_sums[dataset_name]
+            for key, value in metrics.items():
+                dataset_sum[key] = dataset_sum.get(key, value.new_tensor(0.0)) + value * batch_size
 
     count_tensor = torch.tensor(float(count), device=device)
     if distributed:
@@ -1275,9 +1297,27 @@ def evaluate(
             dist.all_reduce(value, op=dist.ReduceOp.SUM)
     total_count = max(1.0, float(count_tensor.item()))
     result = {key: float(value.item() / total_count) for key, value in sums.items()}
+    dataset_results: dict[str, dict[str, float]] = {}
+    for dataset_name in dataset_names:
+        dataset_sum = dataset_sums[dataset_name]
+        dataset_count_tensor = torch.tensor(float(dataset_counts[dataset_name]), device=device)
+        if distributed:
+            dist.all_reduce(dataset_count_tensor, op=dist.ReduceOp.SUM)
+        if dataset_count_tensor.item() <= 0:
+            continue
+        for key in sums:
+            if key not in dataset_sum:
+                dataset_sum[key] = next(iter(sums.values())).new_tensor(0.0)
+            if distributed:
+                dist.all_reduce(dataset_sum[key], op=dist.ReduceOp.SUM)
+        dataset_total_count = max(1.0, float(dataset_count_tensor.item()))
+        dataset_results[dataset_name] = {
+            key: float(value.item() / dataset_total_count)
+            for key, value in dataset_sum.items()
+        }
     if training:
         model.train()
-    return result, visual_payload
+    return result, dataset_results, visual_payload
 
 
 @torch.no_grad()
@@ -1733,6 +1773,11 @@ def main() -> int:
                             for key, value in reduced.items()
                             if has_normal_metrics or key not in normal_metric_keys
                         }
+                        dataset_name = batch_dataset_name(batch)
+                        if dataset_name is not None:
+                            for key, value in reduced.items():
+                                if has_normal_metrics or key not in normal_metric_keys:
+                                    payload[f"train/{dataset_name}/{key}"] = value
                         payload["train/lr"] = current_lr
                         for group_name, group_lr in current_lr_by_group.items():
                             payload[f"train/lr/{group_name}"] = group_lr
@@ -1827,7 +1872,7 @@ def main() -> int:
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
 
-            val_metrics, val_visuals = evaluate(
+            val_metrics, val_dataset_metrics, val_visuals = evaluate(
                 model=model,
                 normal_vae=normal_vae,
                 rgb_vae=rgb_vae,
@@ -1854,6 +1899,9 @@ def main() -> int:
                 )
                 if swanlab_run is not None:
                     payload = {f"val/{key}": value for key, value in val_metrics.items()}
+                    for dataset_name, dataset_metrics in val_dataset_metrics.items():
+                        for key, value in dataset_metrics.items():
+                            payload[f"val/{dataset_name}/{key}"] = value
                     payload["val/epoch"] = epoch + 1
                     swanlab_run.log(payload, step=global_step)
                 if val_visuals is not None:

@@ -1211,7 +1211,7 @@ TASKS: list[Task] = [
             Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
-            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:3,vkitti2:1"),
+            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
             Field(
@@ -1312,7 +1312,7 @@ TASKS: list[Task] = [
             Field("resume_weights_only", "只加载权重", "0", choices=("0", "1")),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
-            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:3,vkitti2:1"),
+            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("train_partition", "Train split", "train"),

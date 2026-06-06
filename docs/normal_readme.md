@@ -9,7 +9,7 @@ Both jobs can train on a mixture of Hypersim and VKITTI2. The default training m
 
 ```bash
 --train-datasets hypersim,vkitti2
---train-dataset-weights hypersim:3,vkitti2:1
+--train-dataset-weights hypersim:9,vkitti2:1
 --vkitti2-root data/VKITTI2
 ```
 
@@ -23,7 +23,7 @@ The mixed normal dataloader uses `GroupedTargetSizeBatchSampler`.
 - A local batch contains only one dataset and one target resolution.
 - In distributed training, all ranks in the same global step receive the same dataset/target-size group.
 - `--train-dataset-weights` is a positive-integer step ratio.
-- With `hypersim:3,vkitti2:1`, the global step pattern is `Hypersim, Hypersim, Hypersim, VKITTI2, ...`.
+- With `hypersim:9,vkitti2:1`, the global step pattern is `Hypersim x9, VKITTI2, ...`.
 
 This avoids cross-rank shape skew and keeps per-step metrics interpretable.
 
@@ -54,7 +54,7 @@ Environment overrides shared by both scripts:
 
 ```bash
 NORMAL_TRAIN_DATASETS=hypersim,vkitti2
-NORMAL_TRAIN_DATASET_WEIGHTS=hypersim:3,vkitti2:1
+NORMAL_TRAIN_DATASET_WEIGHTS=hypersim:9,vkitti2:1
 NORMAL_VKITTI2_ROOT=data/VKITTI2
 NORMAL_DATA_ROOT=data/hypersim/processed/hypersim
 ```

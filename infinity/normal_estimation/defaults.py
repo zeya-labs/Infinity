@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HYPERSIM_ROOT = str(REPO_ROOT / "data" / "hypersim" / "processed" / "hypersim")
 DEFAULT_VKITTI2_ROOT = str(REPO_ROOT / "data" / "VKITTI2")
 DEFAULT_NORMAL_TRAIN_DATASETS = "hypersim,vkitti2"
-DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS = "hypersim:3,vkitti2:1"
+DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS = "hypersim:9,vkitti2:1"
 
 DEFAULT_NORMAL_TOKENIZER_CKPT = os.environ.get(
     "INFINITY_NORMAL_TOKENIZER_CKPT",

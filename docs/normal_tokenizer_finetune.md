@@ -18,12 +18,12 @@ The tokenizer uses the same normal dataset mixing controls as RGB-to-normal esti
 
 ```bash
 --train-datasets hypersim,vkitti2
---train-dataset-weights hypersim:3,vkitti2:1
+--train-dataset-weights hypersim:9,vkitti2:1
 --data-root data/hypersim/processed/hypersim
 --vkitti2-root data/VKITTI2
 ```
 
-The `3:1` default intentionally down-weights VKITTI2 because it contains repeated scene variants. If the goal is to
+The `9:1` default intentionally down-weights VKITTI2 because it contains repeated scene variants. If the goal is to
 optimize indoor Hypersim validation, use `--train-datasets hypersim`. If the goal is outdoor robustness, experiment
 with `hypersim:2,vkitti2:1` or `hypersim:1,vkitti2:1` and add a separate VKITTI2 validation split.
 
@@ -32,7 +32,7 @@ with `hypersim:2,vkitti2:1` or `hypersim:1,vkitti2:1` and add a separate VKITTI2
 The `训练法线 Tokenizer` TUI task uses:
 
 - `train_datasets = hypersim,vkitti2`
-- `train_dataset_weights = hypersim:3,vkitti2:1`
+- `train_dataset_weights = hypersim:9,vkitti2:1`
 - `vkitti2_root = data/VKITTI2`
 
 ## Notes
