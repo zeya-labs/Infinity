@@ -6,15 +6,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HYPERSIM_ROOT = str(REPO_ROOT / "data" / "hypersim" / "processed" / "hypersim")
-DEFAULT_VKITTI2_ROOT = str(REPO_ROOT / "data" / "VKITTI2")
+DEFAULT_VKITTI2_ROOT = str(REPO_ROOT / "data" / "VKITTI2" / "processed" / "normals_lotus_svd")
 DEFAULT_NORMAL_TRAIN_DATASETS = "hypersim,vkitti2"
 DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS = "hypersim:9,vkitti2:1"
 
 DEFAULT_NORMAL_TOKENIZER_CKPT = os.environ.get(
     "INFINITY_NORMAL_TOKENIZER_CKPT",
-    str(REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-06-05" / "06-25-00" / "checkpoints" / "best_angle_3.0379.pth"),
+    str(REPO_ROOT / "outputs" / "normal_tokenizer" / "2026-06-08" / "07-06-39" / "checkpoints" / "best_angle_2.9407.pth"),
 )
 DEFAULT_NORMAL_ESTIMATION_CKPT = os.environ.get(
     "INFINITY_NORMAL_ESTIMATION_CKPT",
-    str(REPO_ROOT / "outputs" / "normal_estimation" / "2026-06-01" / "09-27-05" / "checkpoints" / "best_angle_18.5532.pth"),
+    str(REPO_ROOT / "outputs" / "normal_estimation" / "2026-06-07" / "06-24-56" / "checkpoints" / "best_angle_13.7721.pth"),
 )

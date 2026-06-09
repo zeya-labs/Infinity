@@ -61,6 +61,28 @@ VOLC_DEFAULT_RESOURCE_MEMORY = os.environ.get("INFINITY_VOLC_RESOURCE_MEMORY", "
 VOLC_DEFAULT_PRIORITY = os.environ.get("INFINITY_VOLC_PRIORITY", "6")
 VOLC_DEFAULT_RETRY_TIMES = os.environ.get("INFINITY_VOLC_RETRY_TIMES", "5")
 VOLC_DEFAULT_RETRY_INTERVAL_SECONDS = os.environ.get("INFINITY_VOLC_RETRY_INTERVAL_SECONDS", "120")
+NORMAL_LR_FIELDS = (
+    "lr",
+    "min_lr",
+    "word_head_lr",
+    "word_head_min_lr",
+    "image_word_lr",
+    "image_word_min_lr",
+    "normal_task_lr",
+    "normal_task_min_lr",
+)
+NORMAL_LR_ABLATIONS = {
+    "all_high_1e-4": {
+        "lr": "1e-4",
+        "min_lr": "1e-5",
+        "word_head_lr": "1e-4",
+        "word_head_min_lr": "1e-5",
+        "image_word_lr": "1e-4",
+        "image_word_min_lr": "1e-5",
+        "normal_task_lr": "1e-4",
+        "normal_task_min_lr": "1e-5",
+    },
+}
 
 @dataclass
 class Field:
@@ -129,6 +151,10 @@ def pretty_command(cmd: list[str]) -> str:
 def tmux_safe_name(title: str, index: int) -> str:
     slug = re.sub(r"[^A-Za-z0-9_]+", "_", title).strip("_").lower()
     return f"infinity_{index + 1:02d}_{slug or 'task'}"
+
+
+def tmux_run_name(title: str, index: int, started_at: datetime) -> str:
+    return f"{tmux_safe_name(title, index)}_{started_at.strftime('%Y%m%d_%H%M%S')}"
 
 
 def tmux_managed_sessions() -> list[str]:
@@ -218,6 +244,15 @@ def read_job_records() -> list[dict[str, object]]:
         else:
             data["display_status"] = str(data.get("status") or "未知")
     return sorted(records.values(), key=lambda item: str(item.get("started_at") or ""), reverse=True)
+
+
+def latest_live_session_for_task(task: Task) -> str | None:
+    for record in read_job_records():
+        if str(record.get("task") or "") == task.title and bool(record.get("alive")):
+            session_name = str(record.get("session") or "")
+            if session_name:
+                return session_name
+    return None
 
 
 def slugify(value: str) -> str:
@@ -894,6 +929,8 @@ def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
 
 
 def build_train_normal(values: dict[str, str]) -> list[str]:
+    lr_values = dict(values)
+    lr_values.update(NORMAL_LR_ABLATIONS.get(values.get("lr_ablation", "custom"), {}))
     cmd = [
         *TORCHRUN_CMD,
         "--standalone",
@@ -935,21 +972,21 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         "--prefetch-factor",
         values["prefetch_factor"],
         "--lr",
-        values["lr"],
+        lr_values["lr"],
         "--min-lr",
-        values["min_lr"],
+        lr_values["min_lr"],
         "--word-head-lr",
-        values["word_head_lr"],
+        lr_values["word_head_lr"],
         "--word-head-min-lr",
-        values["word_head_min_lr"],
+        lr_values["word_head_min_lr"],
         "--image-word-lr",
-        values["image_word_lr"],
+        lr_values["image_word_lr"],
         "--image-word-min-lr",
-        values["image_word_min_lr"],
+        lr_values["image_word_min_lr"],
         "--normal-task-lr",
-        values["normal_task_lr"],
+        lr_values["normal_task_lr"],
         "--normal-task-min-lr",
-        values["normal_task_min_lr"],
+        lr_values["normal_task_min_lr"],
         "--warmup-ratio",
         values["warmup_ratio"],
         "--betas",
@@ -1115,6 +1152,8 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
         values["log_every"],
         "--image-log-every",
         values["image_log_every"],
+        "--save-every-steps",
+        values["save_every_steps"],
         "--save-every-epoch",
         values["save_every_epoch"],
         "--recon-l1-weight",
@@ -1238,6 +1277,13 @@ TASKS: list[Task] = [
             Field("val_batch_size", "Val batch/GPU", "4"),
             Field("num_workers", "Workers", "4"),
             Field("prefetch_factor", "Prefetch factor", "4"),
+            Field(
+                "lr_ablation",
+                "LR ablation",
+                "custom",
+                help="custom 使用下面手填 LR；all_high_1e-4 将所有参数组覆盖为 1e-4/min 1e-5。",
+                choices=("custom", "all_high_1e-4"),
+            ),
             Field("lr", "Backbone LR", "1e-5"),
             Field("min_lr", "Backbone min LR", "5e-7"),
             Field("word_head_lr", "Word/head LR", "2e-5"),
@@ -1250,7 +1296,7 @@ TASKS: list[Task] = [
             Field("beta1", "Adam beta1", "0.9"),
             Field("beta2", "Adam beta2", "0.95"),
             Field("weight_decay", "Weight decay", "1e-4"),
-            Field("train_normal_metrics_every", "Train normal metrics every", "100"),
+            Field("train_normal_metrics_every", "Train normal metrics every", "10"),
             Field("token_cache_dir", "Token cache dir", "outputs/normal_token_cache"),
             Field("token_cache_metadata_only", "Metadata-only cache", "1", choices=("0", "1")),
             Field("token_cache_require_hit", "Require cache hit", "0", choices=("0", "1")),
@@ -1265,7 +1311,7 @@ TASKS: list[Task] = [
             Field("normal_use_segmented_flash_attn", "Segmented flash attn", "1", choices=("0", "1")),
             Field("normal_bf16_activations", "BF16 activations", "1", choices=("0", "1")),
             Field("normal_save_activations_on_cpu", "CPU activation offload", "0", choices=("0", "1")),
-            Field("epochs", "Epochs", "10"),
+            Field("epochs", "Epochs", "20"),
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
@@ -1342,6 +1388,7 @@ TASKS: list[Task] = [
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
+            Field("save_every_steps", "Save every steps", "100"),
             Field("save_every_epoch", "Save every epoch", "1"),
             Field("recon_l1_weight", "Recon L1 weight", "1.0"),
             Field("recon_cosine_weight", "Recon cosine weight", "1.0"),
@@ -1367,12 +1414,12 @@ TASKS: list[Task] = [
     ),
     Task(
         "Normal Eval 实验",
-        "统一运行 toy/NYUv2/Hypersim normal eval，可选择 Ours、normal tokenizer 和官方 baseline。",
+        "统一运行 toy/NYUv2/Hypersim/ScanNet/iBims/Sintel normal eval，可选择 Ours、normal tokenizer 和官方 baseline。",
         [
             Field("output_dir", "输出目录", managed_output("normal_eval")),
-            Field("dataset", "Dataset", "toy", choices=("toy", "nyuv2", "hypersim")),
-            Field("data_root", "数据目录", "auto", help="auto=toy/NYUv2/Hypersim 默认路径"),
-            Field("partition", "Split", "val", choices=("val", "test", "train")),
+            Field("dataset", "Dataset", "toy", choices=("toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel")),
+            Field("data_root", "数据目录", "auto", help="auto=toy/NYUv2/Hypersim/dsine_eval 默认路径"),
+            Field("partition", "Split", "val", choices=("val", "test", "train", "ibims", "sintel")),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("max_samples", "最多样本数", "0", help="0=全量；toy 忽略"),
             Field("eval_set_workers", "导出 workers", "auto", help="auto=使用全部 CPU 核心"),
@@ -1419,7 +1466,7 @@ TASKS: list[Task] = [
         ],
         build_normal_baseline_compare,
         env=lambda v: {"CUDA_VISIBLE_DEVICES": v["cuda"]},
-        confirm="toy 只落预测图；NYUv2/Hypersim 会先导出 RGB/GT/mask，再运行所选方法并统一计算 angle 指标；baseline 首次 bootstrap 会下载第三方仓库和权重。",
+        confirm="toy 只落预测图；NYUv2/Hypersim/ScanNet/iBims/Sintel 会先导出 RGB/GT/mask，再运行所选方法并统一计算 angle 指标；baseline 首次 bootstrap 会下载第三方仓库和权重。",
         category="Eval",
         output_slug="normal_eval",
     ),
@@ -2070,8 +2117,8 @@ class InfinityTUI(App):
             self.task_badge.update(f"{task.category}  |  {len(task.fields)} 个参数")
         if self.task_desc is not None:
             self.task_desc.update(task.desc)
-        session_name = self.current_session_name()
-        self.set_status_icon("●" if session_name in self.live_sessions else "○")
+        session_name = latest_live_session_for_task(task)
+        self.set_status_icon("●" if session_name else "○")
         table = self.field_table
         if table is None:
             return
@@ -2082,7 +2129,7 @@ class InfinityTUI(App):
         if keep_cursor is not None and task.fields:
             table.move_cursor(row=min(keep_cursor, len(task.fields) - 1), column=0)
         self.update_command_preview()
-        if session_name in self.live_sessions:
+        if session_name:
             self.session_name = session_name
 
     def edit_field(self, row_index: int | None) -> None:
@@ -2106,11 +2153,17 @@ class InfinityTUI(App):
         if row_index < 0 or row_index >= len(task.fields):
             return
         field = task.fields[row_index]
-        self.values[self.selected_index][field.key] = value
+        values = self.values[self.selected_index]
+        values[field.key] = value
+        if task.title == "训练 RGB 到 Normal":
+            if field.key == "lr_ablation":
+                values.update(NORMAL_LR_ABLATIONS.get(value, {}))
+            elif field.key in NORMAL_LR_FIELDS:
+                values["lr_ablation"] = "custom"
         self.preview_cache.pop(self.selected_index, None)
-        if self.field_table is not None:
+        if self.field_table is not None and field.key not in {"lr_ablation", *NORMAL_LR_FIELDS}:
             self.field_table.update_cell_at((row_index, 1), value, update_width=True)
-        self.update_command_preview()
+        self.refresh_task(keep_cursor=row_index)
         self.set_status_icon("○")
 
     def update_command_preview(self) -> None:
@@ -2158,12 +2211,12 @@ class InfinityTUI(App):
         return alive
 
     def resolve_session_name(self) -> str | None:
-        current = self.current_session_name()
+        if self.tmux_session_alive(self.session_name):
+            return self.session_name
+        current = latest_live_session_for_task(self.current_task()) or self.current_session_name()
         if self.tmux_session_alive(current):
             self.session_name = current
             return current
-        if self.tmux_session_alive(self.session_name):
-            return self.session_name
         self.session_name = None
         return None
 
@@ -2191,12 +2244,7 @@ class InfinityTUI(App):
             self.notify("没有正在运行的 tmux session", severity="warning")
 
     def action_run_task(self) -> None:
-        running_session = self.resolve_session_name()
-        if running_session:
-            self.set_status_icon("●")
-            return
         task = self.current_task()
-        session_name = self.current_session_name()
         values = dict(self.current_values())
         if values.get("gpus") and values.get("cuda"):
             try:
@@ -2214,6 +2262,7 @@ class InfinityTUI(App):
                 self.set_status_icon("!")
                 return
         started_at = datetime.now(timezone.utc)
+        session_name = tmux_run_name(task.title, self.selected_index, started_at)
         run_dir = create_run_dir(task, started_at)
         apply_run_outputs(values, run_dir)
         command = task.build(values)

@@ -53,11 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.0)
     parser.add_argument("--tau", type=float, default=1.0)
     parser.add_argument("--save-npy", action="store_true", default=False)
+    parser.add_argument("--save-uncertainty", action="store_true", default=False)
     parser.add_argument("--save-visualization", action="store_true", default=True)
     parser.add_argument("--disable-save-visualization", dest="save_visualization", action="store_false")
     parser.add_argument("--timing-warmup", type=int, default=3)
     parser.add_argument("--timing-repeats", type=int, default=5)
-    parser.add_argument("--normal-kv-cache-fast", action="store_true", help="Use experimental KV-cache AR path for normal inference.")
+    parser.add_argument("--normal-kv-cache-fast", action="store_true", help="Deprecated; KV-cache AR is enabled by default.")
+    parser.add_argument("--normal-disable-kv-cache-fast", action="store_true", help="Disable default KV-cache AR path for debugging.")
     return parser.parse_args()
 
 
@@ -96,6 +98,14 @@ def _save_visualization(image_chw: torch.Tensor, normal_vis_chw: torch.Tensor, p
     _save_png(cat, path)
 
 
+def _save_grayscale(tensor_chw: torch.Tensor, path: Path) -> None:
+    tensor = tensor_chw.detach().cpu().float()
+    if tensor.dim() == 3:
+        tensor = tensor[0]
+    array = tensor.clamp(0.0, 1.0).mul(255).byte().numpy()
+    Image.fromarray(array, mode="L").save(path)
+
+
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -130,12 +140,42 @@ def _predict_normal(
     )
 
 
+def _predict_normal_with_uncertainty(
+    *,
+    image_tensor: torch.Tensor,
+    rgb_vae: torch.nn.Module,
+    normal_vae: torch.nn.Module,
+    model: torch.nn.Module,
+    scale_schedule: list[tuple[int, int, int]],
+    normal_vae_type: int,
+    rgb_apply_spatial_patchify: bool,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    rgb_prefix_blc = build_prefix_tokens_from_image(
+        image_01=image_tensor,
+        rgb_vae=rgb_vae,
+        scale_schedule=scale_schedule,
+        apply_spatial_patchify=rgb_apply_spatial_patchify,
+    )
+    return model.autoregressive_infer_prefix_with_uncertainty(
+        vae=normal_vae,
+        rgb_prefix_blc=rgb_prefix_blc,
+        scale_schedule=scale_schedule,
+        tau=args.tau,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        vae_type=normal_vae_type,
+    )
+
+
 def main() -> int:
     args = parse_args()
-    if args.normal_kv_cache_fast:
-        os.environ["INFINITY_NORMAL_ENABLE_KV_FAST"] = "1"
+    os.environ.pop("INFINITY_NORMAL_ENABLE_KV_FAST", None)
+    if args.normal_disable_kv_cache_fast:
+        os.environ["INFINITY_NORMAL_DISABLE_KV_FAST"] = "1"
     else:
-        os.environ.pop("INFINITY_NORMAL_ENABLE_KV_FAST", None)
+        os.environ.pop("INFINITY_NORMAL_DISABLE_KV_FAST", None)
     model_path = Path(args.model_path)
     checkpoint_args = _load_checkpoint_args(model_path) if model_path.is_file() else {}
 
@@ -217,38 +257,75 @@ def main() -> int:
 
         repeat_seconds: list[float] = []
         raw_normal = None
+        raw_uncertainties = None
         with torch.no_grad():
             for _ in range(max(0, args.timing_warmup)):
-                _ = _predict_normal(
-                    image_tensor=image_tensor,
-                    rgb_vae=rgb_vae,
-                    normal_vae=normal_vae,
-                    model=model,
-                    scale_schedule=scale_schedule,
-                    normal_vae_type=normal_vae_type,
-                    rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
-                    device=device,
-                    args=args,
-                )
+                if args.save_uncertainty:
+                    _ = _predict_normal_with_uncertainty(
+                        image_tensor=image_tensor,
+                        rgb_vae=rgb_vae,
+                        normal_vae=normal_vae,
+                        model=model,
+                        scale_schedule=scale_schedule,
+                        normal_vae_type=normal_vae_type,
+                        rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
+                        device=device,
+                        args=args,
+                    )
+                else:
+                    _ = _predict_normal(
+                        image_tensor=image_tensor,
+                        rgb_vae=rgb_vae,
+                        normal_vae=normal_vae,
+                        model=model,
+                        scale_schedule=scale_schedule,
+                        normal_vae_type=normal_vae_type,
+                        rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
+                        device=device,
+                        args=args,
+                    )
             for _ in range(max(1, args.timing_repeats)):
                 _sync_device(device)
                 inference_start = time.perf_counter()
-                raw_normal = _predict_normal(
-                    image_tensor=image_tensor,
-                    rgb_vae=rgb_vae,
-                    normal_vae=normal_vae,
-                    model=model,
-                    scale_schedule=scale_schedule,
-                    normal_vae_type=normal_vae_type,
-                    rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
-                    device=device,
-                    args=args,
-                )
+                if args.save_uncertainty:
+                    raw_normal, raw_uncertainties = _predict_normal_with_uncertainty(
+                        image_tensor=image_tensor,
+                        rgb_vae=rgb_vae,
+                        normal_vae=normal_vae,
+                        model=model,
+                        scale_schedule=scale_schedule,
+                        normal_vae_type=normal_vae_type,
+                        rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
+                        device=device,
+                        args=args,
+                    )
+                else:
+                    raw_normal = _predict_normal(
+                        image_tensor=image_tensor,
+                        rgb_vae=rgb_vae,
+                        normal_vae=normal_vae,
+                        model=model,
+                        scale_schedule=scale_schedule,
+                        normal_vae_type=normal_vae_type,
+                        rgb_apply_spatial_patchify=rgb_apply_spatial_patchify,
+                        device=device,
+                        args=args,
+                    )
                 _sync_device(device)
                 repeat_seconds.append(time.perf_counter() - inference_start)
             assert raw_normal is not None
             raw_normal = F.interpolate(raw_normal, size=(original_height, original_width), mode="bilinear", align_corners=False)
             raw_normal = normalize_normals(raw_normal)
+            if raw_uncertainties is not None:
+                raw_uncertainties = {
+                    name: F.interpolate(
+                        uncertainty,
+                        size=(original_height, original_width),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).clamp(0.0, 1.0)
+                    for name, uncertainty in raw_uncertainties.items()
+                }
             normal_vis = normals_to_vis(raw_normal)[0]
             image_vis = F.interpolate(image_tensor, size=(original_height, original_width), mode="bilinear", align_corners=False)[0].cpu()
 
@@ -267,10 +344,18 @@ def main() -> int:
             }
         )
         _save_png(normal_vis, output_dir / f"{stem}_normal.png")
+        if raw_uncertainties is not None:
+            for uncertainty_name, uncertainty in raw_uncertainties.items():
+                suffix = "uncertainty" if uncertainty_name == "mean" else f"uncertainty_{uncertainty_name}"
+                _save_grayscale(uncertainty[0], output_dir / f"{stem}_{suffix}.png")
         if args.save_visualization:
             _save_visualization(image_vis, normal_vis, output_dir / f"{stem}_visualization.png")
         if args.save_npy:
             np.save(output_dir / f"{stem}_normal.npy", raw_normal[0].permute(1, 2, 0).cpu().numpy())
+            if raw_uncertainties is not None:
+                for uncertainty_name, uncertainty in raw_uncertainties.items():
+                    suffix = "uncertainty" if uncertainty_name == "mean" else f"uncertainty_{uncertainty_name}"
+                    np.save(output_dir / f"{stem}_{suffix}.npy", uncertainty[0, 0].cpu().numpy())
 
     (output_dir / "inference_times.json").write_text(
         json.dumps({"images": timing_rows}, ensure_ascii=False, indent=2),

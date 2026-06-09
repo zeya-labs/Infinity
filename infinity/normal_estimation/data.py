@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,11 @@ from .file_io import read_depth_normal_hypersim, read_hdf5
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
+DSINE_EVAL_DATASETS = {
+    "scannet": {"official_split": "test", "png_normal": True},
+    "ibims": {"official_split": "ibims", "png_normal": False},
+    "sintel": {"official_split": "sintel", "png_normal": False},
+}
 
 
 def _nearest_h_div_w_template(height: int, width: int) -> float:
@@ -145,6 +151,50 @@ def _truthy(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _read_dsine_eval_exr(path: Path) -> np.ndarray:
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    try:
+        import cv2
+
+        normal_bgr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if normal_bgr is None:
+            raise ValueError(f"OpenCV could not read EXR normal: {path}")
+        return cv2.cvtColor(normal_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    except Exception as cv2_exc:
+        try:
+            import imageio.v3 as iio
+
+            normal = np.asarray(iio.imread(path), dtype=np.float32)
+        except Exception as imageio_exc:
+            raise RuntimeError(
+                f"Failed to read EXR normal {path}. Install OpenCV with EXR support "
+                "or an imageio EXR backend."
+            ) from imageio_exc
+        if normal.ndim != 3 or normal.shape[2] < 3:
+            raise ValueError(f"EXR normal must have shape HxWx3, got {normal.shape} from {path}") from cv2_exc
+        return normal[:, :, :3]
+
+
+def _read_dsine_eval_normal(path: Path, *, png_normal: bool) -> tuple[np.ndarray, np.ndarray]:
+    if png_normal:
+        normal_rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        valid = normal_rgb.sum(axis=2) > 0
+        normal = (normal_rgb / 255.0) * 2.0 - 1.0
+    else:
+        normal = _read_dsine_eval_exr(path)
+        valid = np.linalg.norm(normal, axis=2) > 0.5
+    normal = np.nan_to_num(normal.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    valid = valid & np.isfinite(normal).all(axis=2) & (np.linalg.norm(normal, axis=2) > 1e-6)
+    return normal, valid.astype(np.float32)
+
+
+def _replace_img_suffix(path: str, replacement: str) -> str:
+    stem, ext = os.path.splitext(path)
+    if stem.endswith("_img"):
+        return stem[:-4] + replacement
+    return stem + replacement
+
+
 def load_vkitti2_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[str, Any]:
     base_dir = Path(metadata["manifest_dir"]) if metadata.get("manifest_dir") else None
     image_path = _resolve_path(metadata["image_path"], base_dir)
@@ -194,12 +244,53 @@ def load_vkitti2_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) 
     }
 
 
+def load_dsine_eval_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[str, Any]:
+    dataset_name = str(metadata["dataset"]).lower()
+    dataset_config = DSINE_EVAL_DATASETS[dataset_name]
+    base_dir = Path(metadata["dataset_root"])
+    image_path = _resolve_path(metadata["image_path"], base_dir)
+    normal_path = _resolve_path(metadata["normal_path"], base_dir)
+
+    with Image.open(image_path) as image_handle:
+        image = image_handle.convert("RGB")
+        original_width, original_height = image.size
+        target_height, target_width, template = _resolve_target_size(original_height, original_width, pn)
+        target_hw = (target_height, target_width)
+        image_tensor = _resize_image(image, target_hw)
+
+    normal_np, valid_np = _read_dsine_eval_normal(normal_path, png_normal=bool(dataset_config["png_normal"]))
+    if normal_np.ndim != 3 or normal_np.shape[2] != 3:
+        raise ValueError(f"{dataset_name} normal must have shape HxWx3, got {normal_np.shape} from {normal_path}")
+    normal_tensor = torch.from_numpy(normal_np).float().permute(2, 0, 1)
+    valid_normal_tensor = torch.from_numpy(valid_np.astype(np.float32)).unsqueeze(0)
+    normal_tensor = _resize_tensor(normal_tensor, target_hw, mode="bilinear", normalize_normals=True)
+    valid_normal_tensor = _resize_tensor(valid_normal_tensor, target_hw, mode="nearest") > 0.5
+
+    sample_metadata = dict(metadata)
+    sample_metadata.update(
+        {
+            "target_size": [int(target_hw[0]), int(target_hw[1])],
+            "original_size": (original_height, original_width),
+            "h_div_w": float(original_height) / float(original_width),
+            "h_div_w_template": template,
+        }
+    )
+    return {
+        "image": image_tensor.clamp(0.0, 1.0),
+        "target": normal_tensor.clamp(-1.0, 1.0),
+        "mask": valid_normal_tensor.bool(),
+        "metadata": sample_metadata,
+    }
+
+
 def load_normal_sample_from_metadata(metadata: dict[str, Any], pn: str) -> dict[str, Any]:
     dataset_name = str(metadata.get("dataset", "hypersim")).lower()
     if dataset_name == "hypersim":
         return load_hypersim_normal_sample_from_metadata(metadata, pn)
     if dataset_name == "vkitti2":
         return load_vkitti2_normal_sample_from_metadata(metadata, pn)
+    if dataset_name in DSINE_EVAL_DATASETS:
+        return load_dsine_eval_normal_sample_from_metadata(metadata, pn)
     raise ValueError(f"Unsupported normal dataset in metadata: {dataset_name}")
 
 
@@ -384,6 +475,7 @@ class VKITTI2NormalDataset(Dataset):
     def _resolve_manifest_path(root: Path) -> Path:
         candidates = [
             root / "manifest.jsonl",
+            root / "processed" / "normals_lotus_svd" / "manifest.jsonl",
             root / "processed" / "normals_d2nt_v3" / "manifest.jsonl",
             root / "processed" / "normals_from_depth" / "manifest.jsonl",
         ]
@@ -433,6 +525,122 @@ class VKITTI2NormalDataset(Dataset):
                 "metadata": metadata,
             }
         return load_vkitti2_normal_sample_from_metadata(metadata, self.pn)
+
+    def get_metadata(self, index: int) -> dict[str, Any]:
+        return self._metadata_for_record(index, self.records[index])
+
+
+class DSINEEvalNormalDataset(Dataset):
+    """Read DSINE evaluation-package RGB + GT normal samples."""
+
+    def __init__(
+        self,
+        root: str,
+        dataset: str,
+        partition: str = "test",
+        pn: str = "0.06M",
+        max_samples: int = 0,
+        metadata_only: bool = False,
+    ) -> None:
+        super().__init__()
+        dataset = dataset.lower()
+        if dataset not in DSINE_EVAL_DATASETS:
+            raise ValueError(f"dataset must be one of {sorted(DSINE_EVAL_DATASETS)}, got {dataset}")
+        if pn not in {"0.06M", "0.25M", "1M"}:
+            raise ValueError(f"Unsupported pn: {pn}")
+
+        self.root = Path(root)
+        self.dataset = dataset
+        self.partition = partition
+        self.pn = pn
+        self.metadata_only = metadata_only
+        self.dataset_root = self._resolve_dataset_root(self.root, dataset)
+        self.records = self._load_records(partition)
+        if max_samples > 0:
+            self.records = self.records[:max_samples]
+        if not self.records:
+            raise FileNotFoundError(
+                f"No DSINE eval samples found for {dataset} under {self.dataset_root}. "
+                "Run scripts/download-data/dsine-eval-tos-bundle/run_download_from_tos.ps1 first."
+            )
+
+    @staticmethod
+    def _resolve_dataset_root(root: Path, dataset: str) -> Path:
+        candidates = [
+            root if root.name.lower() == dataset else root / dataset,
+            root / "dsine_eval" / dataset,
+            root,
+        ]
+        for candidate in candidates:
+            if candidate.is_dir() and any(candidate.rglob("*_img.*")):
+                return candidate
+        for candidate in candidates:
+            if candidate.is_dir():
+                return candidate
+        return candidates[0]
+
+    def _split_candidates(self, partition: str) -> list[Path]:
+        official_split = str(DSINE_EVAL_DATASETS[self.dataset]["official_split"])
+        names = []
+        for name in (partition, official_split):
+            if name and name not in names:
+                names.append(name)
+        candidates: list[Path] = []
+        for name in names:
+            candidates.extend(
+                [
+                    self.dataset_root / "split" / f"{name}.txt",
+                    self.dataset_root / f"{name}.txt",
+                    ROOT_DIR
+                    / "external"
+                    / "normal_baselines"
+                    / "repos"
+                    / "DSINE"
+                    / "data"
+                    / "datasets"
+                    / self.dataset
+                    / "split"
+                    / f"{name}.txt",
+                ]
+            )
+        return candidates
+
+    def _load_records(self, partition: str) -> list[str]:
+        for split_path in self._split_candidates(partition):
+            if not split_path.is_file():
+                continue
+            records = [line.strip() for line in split_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if records and (self.dataset_root / records[0]).is_file():
+                return records
+        return sorted(path.relative_to(self.dataset_root).as_posix() for path in self.dataset_root.rglob("*_img.*"))
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _metadata_for_record(self, index: int, record: str) -> dict[str, Any]:
+        normal_ext = ".png" if bool(DSINE_EVAL_DATASETS[self.dataset]["png_normal"]) else ".exr"
+        normal_path = self.dataset_root / _replace_img_suffix(record, f"_normal{normal_ext}")
+        relative_stem = _replace_img_suffix(record, "")
+        return {
+            "dataset": self.dataset,
+            "dataset_root": str(self.dataset_root),
+            "image_path": record,
+            "normal_path": normal_path.relative_to(self.dataset_root).as_posix(),
+            "partition": self.partition,
+            "index": index,
+            "stem": relative_stem.replace("/", "_"),
+        }
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        metadata = self.get_metadata(index)
+        if self.metadata_only:
+            return {
+                "image": torch.empty(0),
+                "target": torch.empty(0),
+                "mask": torch.empty(0, dtype=torch.bool),
+                "metadata": metadata,
+            }
+        return load_dsine_eval_normal_sample_from_metadata(metadata, self.pn)
 
     def get_metadata(self, index: int) -> dict[str, Any]:
         return self._metadata_for_record(index, self.records[index])

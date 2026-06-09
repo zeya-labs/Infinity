@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -583,6 +584,27 @@ class InfinityNormalPrefixModel(Infinity):
             )
         return x
 
+    def _prefix_attention_for_sequence(
+        self,
+        *,
+        x: torch.Tensor,
+        attn_bias: torch.Tensor,
+        segments: tuple[tuple[int, int, int], ...],
+        prefix_len: int,
+        stage_ids: torch.Tensor,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, Any | None]:
+        attn_fn = self._normal_prefix_segmented_flash_attn(segments=segments)
+        if attn_fn is None:
+            attn_fn = self._normal_prefix_flex_attn(
+                prefix_len=prefix_len,
+                stage_ids=stage_ids,
+                batch_size=batch_size,
+            )
+        if attn_fn is not None:
+            return attn_bias, attn_fn
+        return attn_bias.type_as(x).to(x.device), None
+
     def forward(
         self,
         rgb_prefix_blc: torch.Tensor,
@@ -604,17 +626,14 @@ class InfinityNormalPrefixModel(Infinity):
                 prefix_schedule=scale_schedule,
                 normal_schedule=scale_schedule,
             )
-            attn_fn = self._normal_prefix_segmented_flash_attn(
+            attn_bias, attn_fn = self._prefix_attention_for_sequence(
+                x=x,
+                attn_bias=attn_bias,
                 segments=segments,
+                prefix_len=prefix_len,
+                stage_ids=stage_ids,
+                batch_size=batch_size,
             )
-            if attn_fn is None:
-                attn_fn = self._normal_prefix_flex_attn(
-                    prefix_len=prefix_len,
-                    stage_ids=stage_ids,
-                    batch_size=batch_size,
-                )
-            if attn_fn is None:
-                attn_bias = attn_bias.type_as(x).to(x.device)
             if self.normal_bf16_activations:
                 x = x.to(torch.bfloat16)
 
@@ -801,7 +820,13 @@ class InfinityNormalPrefixModel(Infinity):
         tau: float = 1.0,
         vae_type: int = 0,
     ) -> torch.Tensor:
-        if os.environ.get("INFINITY_NORMAL_ENABLE_KV_FAST", "").strip().lower() in {"1", "true", "yes", "y"}:
+        disable_fast_ar = os.environ.get("INFINITY_NORMAL_DISABLE_KV_FAST", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+        }
+        if not disable_fast_ar:
             return self.autoregressive_infer_prefix_fast(
                 vae=vae,
                 rgb_prefix_blc=rgb_prefix_blc,
@@ -838,19 +863,28 @@ class InfinityNormalPrefixModel(Infinity):
 
             normal_input_emb = torch.cat(normal_embeds, dim=1)
             normal_schedule = scale_schedule[: scale_index + 1]
-            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, _segments = self._prepare_prefix_sequence(
+            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, segments = self._prepare_prefix_sequence(
                 rgb_prefix_emb=rgb_prefix_emb,
                 normal_input_emb=normal_input_emb,
                 prefix_schedule=scale_schedule,
                 normal_schedule=normal_schedule,
             )
+            attn_bias, attn_fn = self._prefix_attention_for_sequence(
+                x=x,
+                attn_bias=attn_bias,
+                segments=segments,
+                prefix_len=prefix_len,
+                stage_ids=stage_ids,
+                batch_size=batch_size,
+            )
             x = self._run_prefix_blocks(
                 x=x,
                 cond_BD_or_gss=cond_BD_or_gss,
                 ca_kv=ca_kv,
-                attn_bias=attn_bias.type_as(x).to(x.device),
+                attn_bias=attn_bias,
                 rope_schedule=rope_schedule,
                 stage_ids=stage_ids,
+                attn_fn=attn_fn,
             )
             logits = self.get_logits(x[:, prefix_len + normal_len - stage_len : prefix_len + normal_len], cond_BD)
             logits = logits.mul(1.0 / max(float(tau), 1e-6))
@@ -893,6 +927,157 @@ class InfinityNormalPrefixModel(Infinity):
                 ).contiguous()
 
         return vae.decode(summed_codes.squeeze(-3)).clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def autoregressive_infer_prefix_with_uncertainty(
+        self,
+        *,
+        vae: torch.nn.Module,
+        rgb_prefix_blc: torch.Tensor,
+        scale_schedule: list[tuple[int, int, int]],
+        top_k: int = 1,
+        top_p: float = 0.0,
+        tau: float = 1.0,
+        vae_type: int = 0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        del vae_type
+        batch_size = rgb_prefix_blc.shape[0]
+        vae_scale_schedule = build_vae_scale_schedule(scale_schedule, self.apply_spatial_patchify)
+        sos, cond_BD, cond_BD_or_gss, ca_kv = self._task_condition(batch_size)
+        rgb_prefix_emb = self._embed_rgb_prefix(rgb_prefix_blc.float())
+
+        normal_embeds: list[torch.Tensor] = []
+        uncertainty_maps: list[torch.Tensor] = []
+        contribution_weights: list[torch.Tensor] = []
+        final_hw = tuple(int(value) for value in vae_scale_schedule[-1][-2:])
+        summed_codes: torch.Tensor | int = 0
+        for scale_index, scale_item in enumerate(scale_schedule):
+            stage_len = int(np.array(scale_item).prod())
+            if scale_index == 0:
+                current_emb = sos.unsqueeze(1).expand(batch_size, self.first_l, -1) + self.pos_start.expand(
+                    batch_size, self.first_l, -1
+                )
+                current_emb = current_emb + self.normal_modality_embed
+            else:
+                next_input = F.interpolate(
+                    summed_codes,
+                    size=vae_scale_schedule[scale_index],
+                    mode=vae.quantizer.z_interplote_down,
+                ).contiguous()
+                next_input = _flatten_feature_tokens(next_input, apply_spatial_patchify=self.apply_spatial_patchify)
+                current_emb = self.word_embed(self.norm0_ve(next_input.float())) + self.normal_modality_embed
+            normal_embeds.append(current_emb)
+
+            normal_input_emb = torch.cat(normal_embeds, dim=1)
+            normal_schedule = scale_schedule[: scale_index + 1]
+            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, segments = self._prepare_prefix_sequence(
+                rgb_prefix_emb=rgb_prefix_emb,
+                normal_input_emb=normal_input_emb,
+                prefix_schedule=scale_schedule,
+                normal_schedule=normal_schedule,
+            )
+            attn_bias, attn_fn = self._prefix_attention_for_sequence(
+                x=x,
+                attn_bias=attn_bias,
+                segments=segments,
+                prefix_len=prefix_len,
+                stage_ids=stage_ids,
+                batch_size=batch_size,
+            )
+            x = self._run_prefix_blocks(
+                x=x,
+                cond_BD_or_gss=cond_BD_or_gss,
+                ca_kv=ca_kv,
+                attn_bias=attn_bias,
+                rope_schedule=rope_schedule,
+                stage_ids=stage_ids,
+                attn_fn=attn_fn,
+            )
+            logits = self.get_logits(x[:, prefix_len + normal_len - stage_len : prefix_len + normal_len], cond_BD)
+            logits = logits.mul(1.0 / max(float(tau), 1e-6))
+
+            if self.use_bit_label:
+                stage_logits = logits.reshape(batch_size, stage_len, -1, 2)
+                probs = stage_logits.float().softmax(dim=-1)
+                entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1) / math.log(2.0)
+                stage_uncertainty = entropy.mean(dim=-1)
+                sampled = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                    stage_logits.reshape(batch_size, -1, 2),
+                    rng=None,
+                    top_k=top_k,
+                    top_p=top_p,
+                    num_samples=1,
+                )[:, :, 0]
+                stage_bits = sampled.reshape(batch_size, stage_len, -1).float()
+                stage_bits = stage_bits.reshape(batch_size, scale_item[0], scale_item[1], scale_item[2], -1)
+                if self.apply_spatial_patchify:
+                    assert scale_item[0] == 1
+                    stage_bits = stage_bits.squeeze(1).permute(0, 3, 1, 2)
+                    stage_bits = torch.nn.functional.pixel_shuffle(stage_bits, 2)
+                    stage_bits = stage_bits.permute(0, 2, 3, 1).unsqueeze(1)
+                codes = vae.quantizer.lfq.indices_to_codes(stage_bits, label_type="bit_label")
+            else:
+                probs = logits.float().softmax(dim=-1)
+                stage_uncertainty = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1) / math.log(float(logits.shape[-1]))
+                stage_indices = sample_with_top_k_top_p_also_inplace_modifying_logits_(
+                    logits,
+                    rng=None,
+                    top_k=top_k,
+                    top_p=top_p,
+                    num_samples=1,
+                )[:, :, 0]
+                stage_indices = stage_indices.reshape(batch_size, scale_item[0], scale_item[1], scale_item[2])
+                codes = vae.quantizer.lfq.indices_to_codes(stage_indices, label_type="int_label")
+
+            stage_uncertainty = stage_uncertainty.reshape(batch_size, scale_item[0], scale_item[1], scale_item[2])
+            stage_uncertainty = stage_uncertainty.mean(dim=1, keepdim=True).clamp(0.0, 1.0)
+            uncertainty_maps.append(
+                F.interpolate(stage_uncertainty, size=final_hw, mode="bilinear", align_corners=False)
+            )
+
+            if scale_index == len(scale_schedule) - 1:
+                stage_contribution = codes
+            else:
+                stage_contribution = F.interpolate(
+                    codes,
+                    size=vae_scale_schedule[-1],
+                    mode=vae.quantizer.z_interplote_up,
+                ).contiguous()
+            if stage_contribution.dim() == 5:
+                contribution_weight = stage_contribution.float().pow(2).mean(dim=1).mean(dim=1, keepdim=True).sqrt()
+            elif stage_contribution.dim() == 4:
+                contribution_weight = stage_contribution.float().pow(2).mean(dim=1, keepdim=True).sqrt()
+            else:
+                raise ValueError(f"Unexpected code contribution shape: {tuple(stage_contribution.shape)}")
+            contribution_weights.append(
+                F.interpolate(contribution_weight, size=final_hw, mode="bilinear", align_corners=False)
+            )
+
+            if scale_index == len(scale_schedule) - 1:
+                summed_codes = summed_codes + codes
+            else:
+                summed_codes = summed_codes + stage_contribution
+
+        normal = vae.decode(summed_codes.squeeze(-3)).clamp(-1.0, 1.0)
+        stacked_uncertainty = torch.stack(uncertainty_maps, dim=0)
+        mean_uncertainty = stacked_uncertainty.mean(dim=0).clamp(0.0, 1.0)
+        fine_count = min(3, len(uncertainty_maps))
+        fine_mean_uncertainty = torch.stack(uncertainty_maps[-fine_count:], dim=0).mean(dim=0).clamp(0.0, 1.0)
+        last_uncertainty = uncertainty_maps[-1].clamp(0.0, 1.0)
+        stacked_weights = torch.stack(contribution_weights, dim=0).clamp_min(0.0)
+        weighted_uncertainty = (stacked_uncertainty * stacked_weights).sum(dim=0)
+        weighted_uncertainty = weighted_uncertainty / stacked_weights.sum(dim=0).clamp_min(1e-8)
+        uncertainty_by_name = {
+            "mean": mean_uncertainty,
+            "fine_mean": fine_mean_uncertainty,
+            "last": last_uncertainty,
+            "latent_weighted": weighted_uncertainty.clamp(0.0, 1.0),
+        }
+        uncertainty_by_name = {
+            name: F.interpolate(value, size=normal.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
+            for name, value in uncertainty_by_name.items()
+        }
+        return normal, uncertainty_by_name
 
 
 def build_infinity_normal_model(

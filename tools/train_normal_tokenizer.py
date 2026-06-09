@@ -97,12 +97,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument(
+        "--resume-lr-step",
+        type=int,
+        default=-1,
+        help="When checkpoint has no scheduler state, fast-forward the LR scheduler to this step; -1 uses checkpoint step.",
+    )
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--precision", type=str, choices=("fp32", "bf16", "fp16"), default="bf16")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--image-log-every", type=int, default=200)
+    parser.add_argument("--save-every-steps", type=int, default=0, help="Overwrite checkpoints/last_step.pth every N optimizer steps; 0 disables step checkpointing.")
     parser.add_argument("--save-every-epoch", type=int, default=1)
     parser.add_argument("--recon-l1-weight", type=float, default=1.0)
     parser.add_argument("--recon-cosine-weight", type=float, default=1.0)
@@ -544,7 +551,8 @@ def auto_resume_path(output_dir: Path, resume_arg: str) -> Path | None:
     return resolve_checkpoint_resume_path(
         output_dir=output_dir,
         resume_arg=resume_arg,
-        auto_checkpoint_names=("last.pth",),
+        auto_checkpoint_names=("last_step.pth", "last.pth"),
+        prefer_step_checkpoint_for_last=True,
     )
 
 
@@ -588,6 +596,7 @@ def load_resume(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler | None,
     device: torch.device,
+    args: argparse.Namespace,
     weights_only: bool = False,
 ) -> tuple[int, int, float]:
     if resume_path is None:
@@ -606,9 +615,18 @@ def load_resume(
             scheduler.load_state_dict(checkpoint["sch_vae"])
         except ValueError as exc:
             LOGGER.warning("skip scheduler state restore due to parameter mismatch: %s", exc)
-    start_epoch = int(checkpoint.get("epoch", -1)) + 1
+    checkpoint_epoch = int(checkpoint.get("epoch", -1))
+    start_epoch = checkpoint_epoch if resume_path.name == "last_step.pth" else checkpoint_epoch + 1
     global_step = int(checkpoint.get("step", 0))
     best_val_angle = float(checkpoint.get("best_val_angle", float("inf")))
+    if scheduler is not None and checkpoint.get("sch_vae") is None and global_step > 0:
+        lr_step = args.resume_lr_step if args.resume_lr_step >= 0 else global_step
+        for _ in range(lr_step):
+            scheduler.step()
+        LOGGER.info(
+            "fast-forwarded LR scheduler to step=%d because checkpoint has no scheduler state",
+            lr_step,
+        )
     return start_epoch, global_step, best_val_angle
 
 
@@ -795,6 +813,7 @@ def main() -> None:
             optimizer,
             scheduler,
             device,
+            args,
             weights_only=args.resume_weights_only,
         )
         if resume_path is not None:
@@ -807,6 +826,18 @@ def main() -> None:
                 best_val_angle,
                 resume_mode,
             )
+        if global_step > 0:
+            step_epoch = min(global_step // steps_per_epoch, args.epochs)
+            if step_epoch > start_epoch:
+                if rank == 0:
+                    LOGGER.info(
+                        "adjusted start_epoch from %d to %d based on global_step=%d and steps_per_epoch=%d",
+                        start_epoch,
+                        step_epoch,
+                        global_step,
+                        steps_per_epoch,
+                    )
+                start_epoch = step_epoch
 
         use_fp16_scaler = device.type == "cuda" and args.precision == "fp16"
         scaler = build_grad_scaler(enabled=use_fp16_scaler)
@@ -827,7 +858,16 @@ def main() -> None:
                 train_sampler.set_epoch(epoch)
             apply_scope_train_modes(raw_model, args.trainable_scope)
 
+            resume_batch_offset = global_step % steps_per_epoch if epoch == start_epoch else 0
+            if resume_batch_offset and rank == 0:
+                LOGGER.info(
+                    "skipping %d already-completed batches in resumed epoch %d",
+                    resume_batch_offset,
+                    epoch,
+                )
             for batch_idx, batch in enumerate(train_loader):
+                if batch_idx < resume_batch_offset:
+                    continue
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     stop_training = True
                     break
@@ -889,6 +929,19 @@ def main() -> None:
 
                 if global_step == 1 or global_step % args.image_log_every == 0:
                     save_visuals(output_dir, swanlab_run, "train", global_step, target, recon, is_main=(rank == 0))
+
+                if rank == 0 and args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    save_checkpoint(
+                        output_dir,
+                        raw_model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        global_step,
+                        best_val_angle,
+                        args,
+                        "last_step",
+                    )
 
             val_metrics, val_visuals = run_validation(model, val_loader, device, distributed, args)
             if rank == 0 and val_metrics:

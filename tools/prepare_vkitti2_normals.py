@@ -14,6 +14,8 @@ from typing import Any
 import cv2
 import numpy as np
 from PIL import Image
+import torch
+import torch.nn.functional as F
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -25,9 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=ROOT_DIR / "data/VKITTI2/raw")
     parser.add_argument("--out-dir", type=Path, default=ROOT_DIR / "data/VKITTI2/processed/normals_from_depth")
     parser.add_argument("--depth-scale", type=float, default=100.0, help="Depth PNG scale. VKITTI2 depth is commonly stored in centimeters.")
-    parser.add_argument("--method", choices=("d2nt_basic", "d2nt_v2", "d2nt_v3"), default="d2nt_v3")
-    parser.add_argument("--no-flip", action="store_true", help="Do not flip D2NT normals to VKITTI2 camera-forward convention.")
+    parser.add_argument("--method", choices=("d2nt_basic", "d2nt_v2", "d2nt_v3", "lotus_svd"), default="d2nt_v3")
+    parser.add_argument("--no-flip", action="store_true", help="Do not flip normals to VKITTI2 camera-forward convention.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for lotus_svd generation.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for lotus_svd generation.")
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--save-vis", action="store_true", default=False)
     return parser.parse_args()
@@ -251,6 +257,164 @@ def normal_vis(normal: np.ndarray) -> Image.Image:
     return Image.fromarray(vis, mode="RGB")
 
 
+class LotusSVDDepth2Normal(torch.nn.Module):
+    """Lotus plane-SVD depth-to-normal implementation.
+
+    Mirrors EnVision-Research/Lotus utils/d2n/plane_svd.py with the VKITTI
+    parameters used by utils/depth2normal.py: k=5, d=1, gamma=0.05,
+    min_nghbr=4, d_min=1e-3, d_max=80.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_min: float = 1e-3,
+        d_max: float = 80.0,
+        k: int = 5,
+        d: int = 1,
+        min_nghbr: int = 4,
+        gamma: float = 0.05,
+    ) -> None:
+        super().__init__()
+        self.d_min = d_min
+        self.d_max = d_max
+        self.k = k
+        self.d = d
+        self.min_nghbr = min_nghbr
+        self.gamma = gamma
+        self.pad = (k + (k - 1) * (d - 1)) // 2
+        self.center_idx = (k * k - 1) // 2
+        self.unfold = torch.nn.Unfold(kernel_size=(k, k), padding=self.pad, dilation=d)
+        self.eigh_chunk_size = 8192
+
+    def forward(self, points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch, _, height, width = points.shape
+        patches = self.unfold(points)
+        matrix_a = patches.view(batch, 3, self.k * self.k, height, width)
+        matrix_a = matrix_a.permute(0, 3, 4, 2, 1)
+
+        valid_condition = (points[:, 2:3] > self.d_min) & (points[:, 2:3] < self.d_max)
+        valid_condition = self.unfold(valid_condition.float())
+        valid_condition = valid_condition.view(batch, 1, self.k * self.k, height, width)
+        valid_condition = valid_condition.permute(0, 3, 4, 2, 1)
+
+        center_depth = matrix_a[:, :, :, self.center_idx : self.center_idx + 1, 2:]
+        valid_depth_diff = torch.abs(matrix_a[:, :, :, :, 2:] - center_depth) / center_depth.clamp_min(1e-12)
+        valid_condition = valid_condition * (valid_depth_diff < self.gamma).float()
+
+        ones = torch.ones_like(matrix_a[:, :, :, :, 0:1])
+        matrix = torch.cat([matrix_a, ones], dim=-1)
+        matrix = torch.where(valid_condition.repeat(1, 1, 1, 1, 4) > 0.5, matrix, torch.zeros_like(matrix))
+        matrix_t = torch.transpose(matrix, 3, 4)
+
+        matrix = matrix.reshape(-1, self.k * self.k, 4)
+        matrix_t = matrix_t.reshape(-1, 4, self.k * self.k)
+        ata = torch.bmm(matrix_t, matrix)
+        eye = torch.eye(4, dtype=ata.dtype, device=ata.device).unsqueeze(0)
+        ata = ata + eye * 1e-6
+        normals = []
+        for chunk in ata.split(self.eigh_chunk_size, dim=0):
+            _eig_val, eig_vec = torch.linalg.eigh(chunk)
+            normals.append(eig_vec[:, :3, 0])
+        normal = torch.cat(normals, dim=0)
+        normal = normal.view(batch, height, width, 3).permute(0, 3, 1, 2).contiguous()
+        normal = F.normalize(normal, p=2.0, dim=1, eps=1e-12)
+
+        flip = torch.sign(torch.sum(normal * points, dim=1, keepdim=True))
+        normal = normal * flip
+
+        valid_center = valid_condition[:, :, :, self.center_idx, 0].unsqueeze(1)
+        valid_neighbors = torch.sum(valid_condition[..., 0], dim=3).unsqueeze(1) >= self.min_nghbr
+        valid_normal = torch.norm(normal, p=2, dim=1, keepdim=True) > 0.5
+        valid_mask = valid_center.bool() & valid_neighbors.bool() & valid_normal.bool()
+        return normal, valid_mask
+
+
+def lotus_points_from_depth_batch(
+    depths: torch.Tensor,
+    intrinsics: list[tuple[float, float, float, float]],
+) -> torch.Tensor:
+    batch, _, height, width = depths.shape
+    device = depths.device
+    dtype = depths.dtype
+    u = torch.arange(width, dtype=dtype, device=device).view(1, 1, width).expand(batch, height, width)
+    v = torch.arange(height, dtype=dtype, device=device).view(1, height, 1).expand(batch, height, width)
+    fx = torch.tensor([item[0] for item in intrinsics], dtype=dtype, device=device).view(batch, 1, 1)
+    fy = torch.tensor([item[1] for item in intrinsics], dtype=dtype, device=device).view(batch, 1, 1)
+    cx = torch.tensor([item[2] for item in intrinsics], dtype=dtype, device=device).view(batch, 1, 1)
+    cy = torch.tensor([item[3] for item in intrinsics], dtype=dtype, device=device).view(batch, 1, 1)
+    z = depths[:, 0]
+    x = (u - cx) / fx * z
+    y = (v - cy) / fy * z
+    return torch.stack((x, y, z), dim=1)
+
+
+def process_lotus_svd_tasks(tasks: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    if not tasks:
+        return []
+    device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
+    model = LotusSVDDepth2Normal().to(device).eval()
+    rows: list[dict[str, Any]] = []
+    batch_size = max(1, int(args.batch_size))
+
+    for start in range(0, len(tasks), batch_size):
+        batch_tasks = tasks[start : start + batch_size]
+        need_compute = [
+            task
+            for task in batch_tasks
+            if not Path(task["normal_path"]).is_file()
+            or not Path(task["mask_path"]).is_file()
+            or (task["normal_vis_path"] and not Path(task["normal_vis_path"]).is_file())
+        ]
+        if need_compute:
+            depths_np = [load_depth(Path(task["depth_path"]), task["depth_scale"]) for task in need_compute]
+            depths = torch.from_numpy(np.stack(depths_np, axis=0)).float().unsqueeze(1).to(device)
+            points = lotus_points_from_depth_batch(depths, [task["intrinsics"] for task in need_compute])
+            with torch.no_grad():
+                normals, valid_masks = model(points)
+            if not need_compute[0]["flipped"]:
+                normals = -normals
+            normals_np = normals.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.float32)
+            valid_np = valid_masks[:, 0].detach().cpu().numpy().astype(bool)
+            for task, normal, valid in zip(need_compute, normals_np, valid_np):
+                normal[~valid] = 0
+                normal_path = Path(task["normal_path"])
+                mask_path = Path(task["mask_path"])
+                normal_path.parent.mkdir(parents=True, exist_ok=True)
+                mask_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(normal_path, normal)
+                Image.fromarray((valid.astype(np.uint8) * 255), mode="L").save(mask_path)
+                if task["normal_vis_path"]:
+                    vis_path = Path(task["normal_vis_path"])
+                    vis_path.parent.mkdir(parents=True, exist_ok=True)
+                    normal_vis(normal).save(vis_path)
+
+        for task in batch_tasks:
+            vis_path = Path(task["normal_vis_path"]) if task["normal_vis_path"] else None
+            rows.append(
+                {
+                    "scene": task["scene"],
+                    "variant": task["variant"],
+                    "camera": task["camera"],
+                    "frame": task["frame"],
+                    "rgb_path": task["rgb_path"],
+                    "depth_path": task["depth_path"],
+                    "normal_path": task["normal_path"],
+                    "mask_path": task["mask_path"],
+                    "normal_vis_path": str(vis_path) if vis_path else "",
+                    "fx": task["intrinsics"][0],
+                    "fy": task["intrinsics"][1],
+                    "cx": task["intrinsics"][2],
+                    "cy": task["intrinsics"][3],
+                    "method": task["method"],
+                    "flipped": task["flipped"],
+                }
+            )
+        if (start + len(batch_tasks)) % 100 == 0 or start + len(batch_tasks) == len(tasks):
+            print(f"processed {start + len(batch_tasks)}/{len(tasks)}", flush=True)
+    return rows
+
+
 def corresponding_rgb(depth_path: Path, rgb_root: Path) -> Path | None:
     scene, variant = scene_variant(depth_path)
     camera = camera_name(depth_path)
@@ -303,6 +467,10 @@ def process_sample(task: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards)")
     depth_root = resolve_vkitti2_root(args.root, "depth")
     rgb_root = resolve_vkitti2_root(args.root, "rgb")
     textgt_root = resolve_vkitti2_root(args.root, "textgt")
@@ -311,6 +479,8 @@ def main() -> int:
     depth_files = sorted(depth_root.glob("Scene*/**/frames/depth/Camera_*/*.png"))
     if args.max_samples > 0:
         depth_files = depth_files[: args.max_samples]
+    if args.num_shards > 1:
+        depth_files = depth_files[args.shard_index :: args.num_shards]
     if not depth_files:
         raise FileNotFoundError(f"No VKITTI2 depth PNG files found under {depth_root}")
 
@@ -356,7 +526,9 @@ def main() -> int:
         )
 
     rows: list[dict[str, Any]] = []
-    if args.workers <= 1:
+    if args.method == "lotus_svd":
+        rows = process_lotus_svd_tasks(tasks, args)
+    elif args.workers <= 1:
         for idx, task in enumerate(tasks):
             rows.append(process_sample(task))
             if (idx + 1) % 100 == 0:
@@ -368,7 +540,11 @@ def main() -> int:
                 if (idx + 1) % 100 == 0:
                     print(f"processed {idx + 1}/{len(tasks)}", flush=True)
 
-    manifest = args.out_dir / "manifest.jsonl"
+    manifest = args.out_dir / (
+        f"manifest.shard{args.shard_index:05d}-of-{args.num_shards:05d}.jsonl"
+        if args.num_shards > 1
+        else "manifest.jsonl"
+    )
     rows.sort(key=lambda row: (row["scene"], row["variant"], row["camera"], row["frame"]))
     with manifest.open("w", encoding="utf-8") as handle:
         for row in rows:

@@ -2,6 +2,7 @@ external/
 .venv/
 .tui/
 scripts/download-data/
+scripts/download-data/*
 
 *.swp
 *.py[cod]
@@ -38,6 +39,8 @@ wandb
 *.jpg
 *.png
 *.json
+!scripts/download-data/dsine-eval-tos-bundle/config/sources.json
+!scripts/download-data/dsine-eval-tos-bundle/config/tos.json
 *.csv
 *.tar.gz
 *.bin

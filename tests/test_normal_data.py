@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 
 import infinity.normal_estimation.data as normal_data
-from infinity.normal_estimation.data import HypersimNormalDataset, VKITTI2NormalDataset
+from PIL import Image
+
+from infinity.normal_estimation.data import DSINEEvalNormalDataset, HypersimNormalDataset, VKITTI2NormalDataset
 
 
 class NormalDataTest(unittest.TestCase):
@@ -61,6 +63,21 @@ class NormalDataTest(unittest.TestCase):
 
             self.assertEqual(len(dataset), 1)
             self.assertIn("depth1.hdf5", dataset.get_metadata(0)["depth_path"])
+
+    def test_dsine_eval_dataset_discovers_scannet_style_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scene = Path(tmpdir) / "scannet" / "scene0000_00"
+            scene.mkdir(parents=True)
+            Image.new("RGB", (4, 3), (32, 64, 96)).save(scene / "000000_img.png")
+            Image.new("RGB", (4, 3), (255, 127, 127)).save(scene / "000000_normal.png")
+
+            dataset = DSINEEvalNormalDataset(root=tmpdir, dataset="scannet", metadata_only=True)
+
+            self.assertEqual(len(dataset), 1)
+            metadata = dataset.get_metadata(0)
+            self.assertEqual(metadata["dataset"], "scannet")
+            self.assertEqual(metadata["image_path"], "scene0000_00/000000_img.png")
+            self.assertEqual(metadata["normal_path"], "scene0000_00/000000_normal.png")
 
 
 if __name__ == "__main__":

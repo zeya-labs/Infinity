@@ -5,6 +5,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,13 @@ IDENTITY_CONVENTION = NormalConvention(
     to_eval_signs=(1, 1, 1),
     description="Canonical metric convention used by this script after dataset export.",
 )
+DSINE_RIGHT_DOWN_FRONT_CONVENTION = NormalConvention(
+    name="dsine_right_down_front_outward",
+    to_eval_perm=(0, 2, 1),
+    to_eval_signs=(-1, -1, 1),
+    description="DSINE eval package normals. Eval mapping: (x, y, z) -> (-x, -z, y).",
+)
+GT_EXPORT_DATASETS = ("nyuv2", "hypersim", "scannet", "ibims", "sintel")
 
 # Dataset readers/exporters normalize each dataset into the canonical evaluation
 # convention before writing _eval_set/gt/*.npy. Keep this table explicit so adding
@@ -52,6 +60,9 @@ IDENTITY_CONVENTION = NormalConvention(
 DATASET_TARGET_CONVENTIONS: dict[str, NormalConvention] = {
     "nyuv2": IDENTITY_CONVENTION,
     "hypersim": IDENTITY_CONVENTION,
+    "scannet": DSINE_RIGHT_DOWN_FRONT_CONVENTION,
+    "ibims": DSINE_RIGHT_DOWN_FRONT_CONVENTION,
+    "sintel": DSINE_RIGHT_DOWN_FRONT_CONVENTION,
 }
 
 # Model-output conventions observed from each official adapter's raw *.npy output.
@@ -60,9 +71,9 @@ DATASET_TARGET_CONVENTIONS: dict[str, NormalConvention] = {
 MODEL_OUTPUT_CONVENTIONS: dict[str, NormalConvention] = {
     "ours": NormalConvention(
         name="ours_model_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="Infinity normal output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="Infinity normal output already matches the exported eval convention.",
     ),
     "marigold": NormalConvention(
         name="marigold_normals_xyz",
@@ -108,9 +119,9 @@ MODEL_OUTPUT_CONVENTIONS: dict[str, NormalConvention] = {
     ),
     "omnidata_v2": NormalConvention(
         name="omnidata_v2_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(1, 1, -1),
-        description="Omnidata V2 output. Eval mapping: (x, y, z) -> (x, z, -y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="Omnidata V2 wrapper saves normals in the exported eval convention.",
     ),
     "marigold_e2eft": NormalConvention(
         name="marigold_e2eft_xyz",
@@ -120,9 +131,9 @@ MODEL_OUTPUT_CONVENTIONS: dict[str, NormalConvention] = {
     ),
 }
 
-# Same normal-map visualization convention as the generated model PNGs.
-DISPLAY_FROM_EVAL_PERM = (0, 2, 1)
-DISPLAY_FROM_EVAL_SIGNS = (1, 1, -1)
+# Same normal-map visualization convention as infinity.normal_estimation.normals_to_vis.
+DISPLAY_FROM_EVAL_PERM = (0, 1, 2)
+DISPLAY_FROM_EVAL_SIGNS = (-1, 1, 1)
 
 
 def parse_methods(raw: list[str]) -> list[str]:
@@ -176,6 +187,8 @@ def dataset_default_root(dataset: str) -> Path:
         return ROOT / "data" / "NYUv2" / "hf-parquet" / "tanganke" / "nyuv2" / "data"
     if dataset == "hypersim":
         return ROOT / "data" / "hypersim" / "processed" / "hypersim"
+    if dataset in {"scannet", "ibims", "sintel"}:
+        return ROOT / "data" / "dsine_eval"
     raise ValueError(f"Unsupported dataset: {dataset}")
 
 
@@ -252,15 +265,38 @@ def parse_worker_count(value: str, sample_count: int) -> int:
     return max(1, min(sample_count, parsed))
 
 
+def sanitize_sample_id(value: str) -> str:
+    sample_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return sample_id or "sample"
+
+
+def sample_id_from_metadata(index: int, metadata: dict[str, Any]) -> str:
+    dataset = str(metadata.get("dataset", "")).lower()
+    if dataset == "hypersim" and metadata.get("image_path"):
+        image_path = Path(str(metadata["image_path"]))
+        scene = image_path.parents[2].name if len(image_path.parents) >= 3 else ""
+        camera = image_path.parent.name
+        return sanitize_sample_id("_".join(part for part in (scene, camera, image_path.stem) if part))
+    return sanitize_sample_id(str(metadata.get("stem") or f"{index:08d}"))
+
+
 def init_export_worker(dataset: str, data_root: str, partition: str, pn: str, max_samples: int, work_dir: str) -> None:
     global _EXPORT_DATASET, _EXPORT_WORK_DIR
     torch.set_num_threads(1)
-    from infinity.normal_estimation import HypersimNormalDataset, NYUv2ParquetNormalDataset
+    from infinity.normal_estimation import DSINEEvalNormalDataset, HypersimNormalDataset, NYUv2ParquetNormalDataset
 
     if dataset == "hypersim":
         _EXPORT_DATASET = HypersimNormalDataset(root=data_root, partition=partition, pn=pn, max_samples=max_samples)
     elif dataset == "nyuv2":
         _EXPORT_DATASET = NYUv2ParquetNormalDataset(root=data_root, partition=partition, pn=pn, max_samples=max_samples)
+    elif dataset in {"scannet", "ibims", "sintel"}:
+        _EXPORT_DATASET = DSINEEvalNormalDataset(
+            root=data_root,
+            dataset=dataset,
+            partition=partition,
+            pn=pn,
+            max_samples=max_samples,
+        )
     else:
         raise ValueError(f"Cannot export GT dataset for {dataset}")
     _EXPORT_WORK_DIR = Path(work_dir)
@@ -271,7 +307,7 @@ def export_one_sample(index: int) -> dict[str, object]:
         raise RuntimeError("Export worker is not initialized.")
     sample = _EXPORT_DATASET[index]
     metadata = dict(sample["metadata"])
-    sample_id = str(metadata.get("stem") or f"{index:08d}")
+    sample_id = sample_id_from_metadata(index, metadata)
     image_path = _EXPORT_WORK_DIR / "images" / f"{sample_id}.png"
     target_path = _EXPORT_WORK_DIR / "gt" / f"{sample_id}_normal.npy"
     mask_path = _EXPORT_WORK_DIR / "mask" / f"{sample_id}_mask.png"
@@ -577,7 +613,7 @@ def convention_payload(dataset: str, method: str) -> dict[str, object]:
         "display_from_eval": {
             "perm": DISPLAY_FROM_EVAL_PERM,
             "signs": DISPLAY_FROM_EVAL_SIGNS,
-            "description": "Normal-map display colors matching generated model PNGs: eval (x, y, z) -> RGB (x, z, -y).",
+            "description": "Normal-map display colors matching infinity.normal_estimation.normals_to_vis: eval (x, y, z) -> RGB (-x, y, z).",
         },
     }
 
@@ -979,10 +1015,12 @@ def evaluate_predictions(method_dir: Path, manifest: list[dict[str, object]], me
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Unified normal evaluation experiment for toy, NYUv2, and Hypersim.")
-    parser.add_argument("--dataset", choices=("toy", "nyuv2", "hypersim"), default="toy")
+    parser = argparse.ArgumentParser(
+        description="Unified normal evaluation experiment for toy, NYUv2, Hypersim, and DSINE eval datasets."
+    )
+    parser.add_argument("--dataset", choices=("toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel"), default="toy")
     parser.add_argument("--data-root", default="auto")
-    parser.add_argument("--partition", choices=("train", "val", "test"), default="val")
+    parser.add_argument("--partition", choices=("train", "val", "test", "ibims", "sintel"), default="val")
     parser.add_argument("--pn", choices=("0.06M", "0.25M", "1M"), default="1M")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--eval-set-workers", default="auto")
@@ -1069,7 +1107,7 @@ def main() -> int:
             "display_from_eval": {
                 "perm": DISPLAY_FROM_EVAL_PERM,
                 "signs": DISPLAY_FROM_EVAL_SIGNS,
-                "description": "Normal-map display colors matching generated model PNGs: eval (x, y, z) -> RGB (x, z, -y).",
+                "description": "Normal-map display colors matching infinity.normal_estimation.normals_to_vis: eval (x, y, z) -> RGB (-x, y, z).",
             },
         },
     }
