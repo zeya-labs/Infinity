@@ -16,5 +16,5 @@ DEFAULT_NORMAL_TOKENIZER_CKPT = os.environ.get(
 )
 DEFAULT_NORMAL_ESTIMATION_CKPT = os.environ.get(
     "INFINITY_NORMAL_ESTIMATION_CKPT",
-    str(REPO_ROOT / "outputs" / "normal_estimation" / "2026-06-07" / "06-24-56" / "checkpoints" / "best_angle_13.7721.pth"),
+    str(REPO_ROOT / "outputs" / "normal_estimation" / "2026-06-07" / "06-24-56" / "checkpoints" / "best_angle_13.2903.pth"),
 )

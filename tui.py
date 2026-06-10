@@ -1296,7 +1296,7 @@ TASKS: list[Task] = [
             Field("beta1", "Adam beta1", "0.9"),
             Field("beta2", "Adam beta2", "0.95"),
             Field("weight_decay", "Weight decay", "1e-4"),
-            Field("train_normal_metrics_every", "Train normal metrics every", "10"),
+            Field("train_normal_metrics_every", "Train normal metrics every", "100"),
             Field("token_cache_dir", "Token cache dir", "outputs/normal_token_cache"),
             Field("token_cache_metadata_only", "Metadata-only cache", "1", choices=("0", "1")),
             Field("token_cache_require_hit", "Require cache hit", "0", choices=("0", "1")),

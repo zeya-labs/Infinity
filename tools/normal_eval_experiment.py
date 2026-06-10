@@ -21,10 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from infinity.normal_estimation.defaults import DEFAULT_NORMAL_ESTIMATION_CKPT, DEFAULT_NORMAL_TOKENIZER_CKPT  # noqa: E402
+
 PYTHON = ROOT / ".venv" / "bin" / "python"
 BASELINE_RUNNER = ROOT / "external" / "normal_baselines" / "scripts" / "run_normal_baseline_compare.py"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _EXPORT_DATASET = None
+_EXPORT_DATASET_NAME: str | None = None
 _EXPORT_WORK_DIR: Path | None = None
 _EVAL_METHOD_DIR: Path | None = None
 _EVAL_METHOD: str | None = None
@@ -39,30 +42,30 @@ class NormalConvention:
     description: str
 
 
-EVAL_CONVENTION = "eval_camera_xyz"
+EVAL_CONVENTION = "camera_left_up_backward"
 IDENTITY_CONVENTION = NormalConvention(
     name=EVAL_CONVENTION,
     to_eval_perm=(0, 1, 2),
     to_eval_signs=(1, 1, 1),
-    description="Canonical metric convention used by this script after dataset export.",
+    description="Canonical metric convention: +x left, +y up, +z backward.",
 )
-DSINE_RIGHT_DOWN_FRONT_CONVENTION = NormalConvention(
-    name="dsine_right_down_front_outward",
+NYUV2_RIGHT_FORWARD_UP_CONVENTION = NormalConvention(
+    name="nyuv2_raw_right_forward_up",
     to_eval_perm=(0, 2, 1),
-    to_eval_signs=(-1, -1, 1),
-    description="DSINE eval package normals. Eval mapping: (x, y, z) -> (-x, -z, y).",
+    to_eval_signs=(-1, 1, -1),
+    description="NYUv2 parquet normals. Canonical mapping: (x, y, z) -> (-x, z, -y).",
 )
 GT_EXPORT_DATASETS = ("nyuv2", "hypersim", "scannet", "ibims", "sintel")
 
-# Dataset readers/exporters normalize each dataset into the canonical evaluation
-# convention before writing _eval_set/gt/*.npy. Keep this table explicit so adding
-# a dataset means declaring its target convention in one place.
+# Dataset readers return raw target tensors. Export normalizes each dataset into
+# EVAL_CONVENTION before writing _eval_set/gt/*.npy. Keep this table explicit so
+# adding a dataset means declaring its raw target convention in one place.
 DATASET_TARGET_CONVENTIONS: dict[str, NormalConvention] = {
-    "nyuv2": IDENTITY_CONVENTION,
+    "nyuv2": NYUV2_RIGHT_FORWARD_UP_CONVENTION,
     "hypersim": IDENTITY_CONVENTION,
-    "scannet": DSINE_RIGHT_DOWN_FRONT_CONVENTION,
-    "ibims": DSINE_RIGHT_DOWN_FRONT_CONVENTION,
-    "sintel": DSINE_RIGHT_DOWN_FRONT_CONVENTION,
+    "scannet": IDENTITY_CONVENTION,
+    "ibims": IDENTITY_CONVENTION,
+    "sintel": IDENTITY_CONVENTION,
 }
 
 # Model-output conventions observed from each official adapter's raw *.npy output.
@@ -77,63 +80,63 @@ MODEL_OUTPUT_CONVENTIONS: dict[str, NormalConvention] = {
     ),
     "marigold": NormalConvention(
         name="marigold_normals_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(1, -1, 1),
-        description="Marigold normals_npy output. Eval mapping: (x, y, z) -> (x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(-1, 1, 1),
+        description="Marigold normals_npy output. Canonical mapping: (x, y, z) -> (-x, y, z).",
     ),
     "geowizard": NormalConvention(
         name="geowizard_normal_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="GeoWizard normal_npy output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="GeoWizard normal_npy output already matches the canonical convention.",
     ),
     "stablenormal": NormalConvention(
         name="stablenormal_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="StableNormal output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="StableNormal output already matches the canonical convention.",
     ),
     "lotusg": NormalConvention(
         name="lotus_g_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="Lotus-G output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="Lotus-G output already matches the canonical convention.",
     ),
     "lotusd": NormalConvention(
         name="lotus_d_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="Lotus-D output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="Lotus-D output already matches the canonical convention.",
     ),
     "dsine": NormalConvention(
         name="dsine_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="DSINE output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="DSINE output already matches the canonical convention.",
     ),
     "metric3dv2": NormalConvention(
         name="metric3d_v2_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(1, 1, -1),
-        description="Metric3D v2 output. Eval mapping: (x, y, z) -> (x, z, -y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(-1, -1, -1),
+        description="Metric3D v2 output. Canonical mapping: (x, y, z) -> (-x, -y, -z).",
     ),
     "omnidata_v2": NormalConvention(
         name="omnidata_v2_xyz",
         to_eval_perm=(0, 1, 2),
         to_eval_signs=(1, 1, 1),
-        description="Omnidata V2 wrapper saves normals in the exported eval convention.",
+        description="Omnidata V2 adapter output already matches the canonical convention.",
     ),
     "marigold_e2eft": NormalConvention(
         name="marigold_e2eft_xyz",
-        to_eval_perm=(0, 2, 1),
-        to_eval_signs=(-1, -1, 1),
-        description="Marigold E2E-FT output. Eval mapping: (x, y, z) -> (-x, -z, y).",
+        to_eval_perm=(0, 1, 2),
+        to_eval_signs=(1, 1, 1),
+        description="Marigold E2E-FT output already matches the canonical convention.",
     ),
 }
 
-# Same normal-map visualization convention as infinity.normal_estimation.normals_to_vis.
+# Direct normal-map visualization in the canonical convention.
 DISPLAY_FROM_EVAL_PERM = (0, 1, 2)
-DISPLAY_FROM_EVAL_SIGNS = (-1, 1, 1)
+DISPLAY_FROM_EVAL_SIGNS = (1, 1, 1)
 
 
 def parse_methods(raw: list[str]) -> list[str]:
@@ -281,10 +284,11 @@ def sample_id_from_metadata(index: int, metadata: dict[str, Any]) -> str:
 
 
 def init_export_worker(dataset: str, data_root: str, partition: str, pn: str, max_samples: int, work_dir: str) -> None:
-    global _EXPORT_DATASET, _EXPORT_WORK_DIR
+    global _EXPORT_DATASET, _EXPORT_DATASET_NAME, _EXPORT_WORK_DIR
     torch.set_num_threads(1)
     from infinity.normal_estimation import DSINEEvalNormalDataset, HypersimNormalDataset, NYUv2ParquetNormalDataset
 
+    _EXPORT_DATASET_NAME = dataset
     if dataset == "hypersim":
         _EXPORT_DATASET = HypersimNormalDataset(root=data_root, partition=partition, pn=pn, max_samples=max_samples)
     elif dataset == "nyuv2":
@@ -303,21 +307,27 @@ def init_export_worker(dataset: str, data_root: str, partition: str, pn: str, ma
 
 
 def export_one_sample(index: int) -> dict[str, object]:
-    if _EXPORT_DATASET is None or _EXPORT_WORK_DIR is None:
+    if _EXPORT_DATASET is None or _EXPORT_DATASET_NAME is None or _EXPORT_WORK_DIR is None:
         raise RuntimeError("Export worker is not initialized.")
     sample = _EXPORT_DATASET[index]
     metadata = dict(sample["metadata"])
     sample_id = sample_id_from_metadata(index, metadata)
     image_path = _EXPORT_WORK_DIR / "images" / f"{sample_id}.png"
     target_path = _EXPORT_WORK_DIR / "gt" / f"{sample_id}_normal.npy"
+    target_vis_path = target_path.with_suffix(".png")
     mask_path = _EXPORT_WORK_DIR / "mask" / f"{sample_id}_mask.png"
     save_image_tensor(sample["image"], image_path)
-    np.save(target_path, sample["target"].permute(1, 2, 0).cpu().numpy().astype(np.float32))
-    Image.fromarray(sample["mask"].squeeze(0).cpu().numpy().astype(np.uint8) * 255).save(mask_path)
+    target_eval = convert_target_to_eval(sample["target"].unsqueeze(0), _EXPORT_DATASET_NAME)[0]
+    target_hwc = target_eval.permute(1, 2, 0).cpu().numpy().astype(np.float32)
+    mask_np = sample["mask"].squeeze(0).cpu().numpy().astype(bool)
+    np.save(target_path, target_hwc)
+    Image.fromarray(eval_normal_to_display_rgb(target_hwc, mask_np)).save(target_vis_path)
+    Image.fromarray(mask_np.astype(np.uint8) * 255).save(mask_path)
     return {
         "id": sample_id,
         "image": str(image_path),
         "target": str(target_path),
+        "target_visualization": str(target_vis_path),
         "mask": str(mask_path),
         "source_image": metadata.get("image_path", metadata.get("parquet_path", "")),
         "target_size": metadata.get("target_size", []),
@@ -613,7 +623,7 @@ def convention_payload(dataset: str, method: str) -> dict[str, object]:
         "display_from_eval": {
             "perm": DISPLAY_FROM_EVAL_PERM,
             "signs": DISPLAY_FROM_EVAL_SIGNS,
-            "description": "Normal-map display colors matching infinity.normal_estimation.normals_to_vis: eval (x, y, z) -> RGB (-x, y, z).",
+            "description": "Direct normal-map display: RGB = (canonical normal + 1) / 2.",
         },
     }
 
@@ -639,9 +649,79 @@ def find_prediction_path(method_dir: Path, sample_id: str) -> Path | None:
         path
         for suffix in ("npy", "png")
         for path in method_dir.rglob(f"{sample_id}_normal*.{suffix}")
-        if not any(part.startswith("_") for part in path.relative_to(method_dir).parts)
+        if not any(part.startswith("_") or part == "canonical_predictions" for part in path.relative_to(method_dir).parts)
     )
     return matches[0] if matches else None
+
+
+def sample_ids_for_outputs(input_dir: Path, manifest: list[dict[str, object]]) -> list[str]:
+    if manifest:
+        return [str(item["id"]) for item in manifest]
+    return [path.stem for path in resolve_image_paths(input_dir)]
+
+
+def _resize_mask(mask: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
+    if mask.shape == size_hw:
+        return mask
+    image = Image.fromarray(mask.astype(np.uint8) * 255)
+    resized = image.resize((size_hw[1], size_hw[0]), Image.Resampling.NEAREST)
+    return np.asarray(resized) > 127
+
+
+def _canonical_metrics_payload(canonical_dir: Path, count: int) -> dict[str, object]:
+    return {
+        "dir": str(canonical_dir),
+        "num_png": count,
+        "num_npy": count,
+        "convention": EVAL_CONVENTION,
+        "display": {
+            "perm": DISPLAY_FROM_EVAL_PERM,
+            "signs": DISPLAY_FROM_EVAL_SIGNS,
+            "description": "Direct normal-map display: RGB = (canonical normal + 1) / 2.",
+        },
+    }
+
+
+def attach_canonical_metrics(method_dir: Path, canonical_dir: Path, count: int) -> None:
+    path = method_dir / "metrics.json"
+    payload: dict[str, object]
+    if path.exists():
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        payload = loaded if isinstance(loaded, dict) else {}
+    else:
+        payload = {}
+    payload["canonical_predictions"] = _canonical_metrics_payload(canonical_dir, count)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_canonical_predictions(
+    method_dir: Path,
+    sample_ids: list[str],
+    method: str,
+    manifest: list[dict[str, object]] | None = None,
+) -> int:
+    canonical_dir = method_dir / "canonical_predictions"
+    if canonical_dir.exists():
+        shutil.rmtree(canonical_dir)
+    canonical_dir.mkdir(parents=True, exist_ok=True)
+    manifest_by_id = {str(item["id"]): item for item in manifest or []}
+    count = 0
+    for sample_id in sample_ids:
+        pred_path = find_prediction_path(method_dir, sample_id)
+        if pred_path is None:
+            continue
+        prediction = convert_prediction_to_eval(load_prediction(pred_path), method)
+        prediction_hwc = prediction[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+        mask_np = None
+        item = manifest_by_id.get(sample_id)
+        if item is not None and item.get("mask"):
+            mask_np = np.asarray(Image.open(str(item["mask"])).convert("L")) > 127
+            mask_np = _resize_mask(mask_np, prediction_hwc.shape[:2])
+        np.save(canonical_dir / f"{sample_id}_normal.npy", prediction_hwc)
+        Image.fromarray(eval_normal_to_display_rgb(prediction_hwc, mask_np)).save(canonical_dir / f"{sample_id}_normal.png")
+        count += 1
+    attach_canonical_metrics(method_dir, canonical_dir, count)
+    return count
 
 
 def init_eval_metric_worker(method_dir: str, method: str, dataset: str) -> None:
@@ -663,7 +743,7 @@ def evaluate_one_sample(item: dict[str, object]) -> dict[str, object]:
         return {"id": sample_id, "missing": True}
     prediction = convert_prediction_to_eval(load_prediction(pred_path), _EVAL_METHOD)
     target = torch.from_numpy(np.load(str(item["target"])).astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
-    target = convert_target_to_eval(target, _EVAL_DATASET)
+    target = normalize_prediction(target)
     mask_np = np.asarray(Image.open(str(item["mask"])).convert("L")) > 127
     mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).bool()
     if prediction.shape[-2:] != target.shape[-2:]:
@@ -778,7 +858,7 @@ def write_representative_visualization(
             continue
         prediction = convert_prediction_to_eval(load_prediction(pred_path), method)
         target = torch.from_numpy(np.load(str(item["target"])).astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
-        target = convert_target_to_eval(target, dataset)
+        target = normalize_prediction(target)
         mask_np = np.asarray(Image.open(str(item["mask"])).convert("L")) > 127
         mask = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).bool()
         if prediction.shape[-2:] != target.shape[-2:]:
@@ -887,7 +967,7 @@ def write_method_comparison_visualization(
         sample_id = str(sample["id"])
         item = manifest_by_id[sample_id]
         target = torch.from_numpy(np.load(str(item["target"])).astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
-        target = convert_target_to_eval(target, dataset)
+        target = normalize_prediction(target)
         target_hwc = target[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
         mask_np = np.asarray(Image.open(str(item["mask"])).convert("L")) > 127
         rgb = np.asarray(Image.open(str(item["image"])).convert("RGB"))
@@ -1026,8 +1106,8 @@ def main() -> int:
     parser.add_argument("--eval-set-workers", default="auto")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--methods", nargs="+", default=["ours"])
-    parser.add_argument("--ours-checkpoint", type=Path, default=ROOT / "outputs/normal_estimation/2026-06-01/09-27-05/checkpoints/best_angle_18.5532.pth")
-    parser.add_argument("--normal-tokenizer-ckpt", type=Path, default=ROOT / "outputs/normal_tokenizer/2026-06-03/00-39-35/checkpoints/best_angle_3.5732.pth")
+    parser.add_argument("--ours-checkpoint", type=Path, default=Path(DEFAULT_NORMAL_ESTIMATION_CKPT))
+    parser.add_argument("--normal-tokenizer-ckpt", type=Path, default=Path(DEFAULT_NORMAL_TOKENIZER_CKPT))
     parser.add_argument("--normal-vae-type", type=int, default=32)
     parser.add_argument("--ours-seed", default="0")
     parser.add_argument("--ours-top-k", default="1")
@@ -1107,7 +1187,7 @@ def main() -> int:
             "display_from_eval": {
                 "perm": DISPLAY_FROM_EVAL_PERM,
                 "signs": DISPLAY_FROM_EVAL_SIGNS,
-                "description": "Normal-map display colors matching infinity.normal_estimation.normals_to_vis: eval (x, y, z) -> RGB (-x, y, z).",
+                "description": "Direct normal-map display: RGB = (canonical normal + 1) / 2.",
             },
         },
     }
@@ -1127,8 +1207,11 @@ def main() -> int:
         elif manifest and not args.dry_run:
             evaluate_predictions(ours_out, manifest, "ours", args.dataset)
             update_metrics_timing(ours_out, "ours", timing_by_method["ours"])
+            write_canonical_predictions(ours_out, sample_ids_for_outputs(input_dir, manifest), "ours", manifest)
         elif not manifest:
             write_image_only_metrics(ours_out, "ours", timing_by_method["ours"])
+            if not args.dry_run:
+                write_canonical_predictions(ours_out, sample_ids_for_outputs(input_dir, manifest), "ours", manifest)
 
     baseline_methods = [method for method in methods if method != "ours"]
     if baseline_methods:
@@ -1167,12 +1250,22 @@ def main() -> int:
                 if method in timing_by_method:
                     update_metrics_timing(output_dir / method, method, timing_by_method[method])
             if not manifest or args.dry_run:
+                if not args.dry_run:
+                    sample_ids = sample_ids_for_outputs(input_dir, manifest)
+                    for method in baseline_group:
+                        write_canonical_predictions(output_dir / method, sample_ids, method, manifest)
                 continue
             for method in baseline_group:
                 try:
                     evaluate_predictions(output_dir / method, manifest, method, args.dataset)
                     if method in timing_by_method:
                         update_metrics_timing(output_dir / method, method, timing_by_method[method])
+                    write_canonical_predictions(
+                        output_dir / method,
+                        sample_ids_for_outputs(input_dir, manifest),
+                        method,
+                        manifest,
+                    )
                 except Exception as exc:
                     failures.append(f"{method}: eval failed: {exc}")
 

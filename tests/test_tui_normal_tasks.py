@@ -5,6 +5,8 @@ from pathlib import Path
 
 import tui
 from infinity.normal_estimation.defaults import (
+    DEFAULT_NORMAL_ESTIMATION_CKPT,
+    DEFAULT_NORMAL_TOKENIZER_CKPT,
     DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
     DEFAULT_VKITTI2_ROOT,
@@ -44,6 +46,27 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-dataset-weights", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS)
         self.assert_flag_value(cmd, "--vkitti2-root", DEFAULT_VKITTI2_ROOT)
         self.assertIn("--hypersim-filter-depth-nan", cmd)
+
+    def test_normal_eval_uses_shared_defaults_and_all_baselines(self) -> None:
+        values = task_defaults("Normal Eval 实验")
+        cmd = tui.build_normal_baseline_compare(values)
+
+        self.assertIn("tools/normal_eval_experiment.py", cmd)
+        self.assert_flag_value(cmd, "--ours-checkpoint", DEFAULT_NORMAL_ESTIMATION_CKPT)
+        self.assert_flag_value(cmd, "--normal-tokenizer-ckpt", DEFAULT_NORMAL_TOKENIZER_CKPT)
+        for method in (
+            "ours",
+            "marigold",
+            "geowizard",
+            "stablenormal",
+            "lotusg",
+            "dsine",
+            "metric3dv2",
+            "omnidata_v2",
+            "marigold_e2eft",
+            "lotusd",
+        ):
+            self.assertIn(method, cmd)
 
     def test_tui_does_not_embed_local_vepfs_literal(self) -> None:
         text = Path(tui.__file__).read_text(encoding="utf-8")

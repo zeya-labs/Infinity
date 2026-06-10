@@ -37,7 +37,7 @@ def normalize_normals(normals: torch.Tensor) -> torch.Tensor:
     return normals.float() / torch.linalg.norm(normals.float(), dim=1, keepdim=True).clamp_min(1e-6)
 
 
-def normals_to_vis(normals: torch.Tensor, invert_x_for_vis: bool = True) -> torch.Tensor:
+def normals_to_vis(normals: torch.Tensor, invert_x_for_vis: bool = False) -> torch.Tensor:
     normals = normalize_normals(normals).detach().cpu().float().clamp(-1.0, 1.0)
     vis = normals.clone()
     if invert_x_for_vis:
