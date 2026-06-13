@@ -72,17 +72,19 @@ NORMAL_LR_FIELDS = (
     "normal_task_min_lr",
 )
 NORMAL_LR_ABLATIONS = {
-    "all_high_1e-4": {
-        "lr": "1e-4",
-        "min_lr": "1e-5",
-        "word_head_lr": "1e-4",
-        "word_head_min_lr": "1e-5",
-        "image_word_lr": "1e-4",
-        "image_word_min_lr": "1e-5",
-        "normal_task_lr": "1e-4",
-        "normal_task_min_lr": "1e-5",
+    "all_6e-5": {
+        "lr": "6e-5",
+        "min_lr": "6e-6",
+        "word_head_lr": "6e-5",
+        "word_head_min_lr": "6e-6",
+        "image_word_lr": "6e-5",
+        "image_word_min_lr": "6e-6",
+        "normal_task_lr": "6e-5",
+        "normal_task_min_lr": "6e-6",
     },
 }
+DEFAULT_NORMAL_RUNS_DIR = ROOT / "outputs" / "normal_estimation"
+DEFAULT_NORMAL_CKPT_DIR = DEFAULT_NORMAL_RUNS_DIR / "latest" / "checkpoints"
 
 @dataclass
 class Field:
@@ -92,6 +94,7 @@ class Field:
     help: str = ""
     choices: tuple[str, ...] = ()
     multi_choices: tuple[str, ...] = ()
+    choice_labels: dict[str, str] | None = None
 
 
 @dataclass
@@ -128,6 +131,52 @@ class VolcConfig:
 
 def shell_join(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def normal_checkpoint_choices() -> tuple[str, ...]:
+    if not DEFAULT_NORMAL_CKPT_DIR.is_dir():
+        return (DEFAULT_NORMAL_ESTIMATION_CKPT,)
+    choices = tuple(str(path) for path in sorted(DEFAULT_NORMAL_CKPT_DIR.glob("*.pth")))
+    return choices or (DEFAULT_NORMAL_ESTIMATION_CKPT,)
+
+
+def normal_checkpoint_choice_labels() -> dict[str, str]:
+    return normal_checkpoint_labels(normal_checkpoint_choices())
+
+
+def normal_run_dir_choices() -> tuple[str, ...]:
+    if not DEFAULT_NORMAL_RUNS_DIR.is_dir():
+        return ()
+    run_dirs: list[Path] = []
+    for date_dir in DEFAULT_NORMAL_RUNS_DIR.iterdir():
+        if not date_dir.is_dir() or date_dir.name == "latest":
+            continue
+        for run_dir in date_dir.iterdir():
+            ckpt_dir = run_dir / "checkpoints"
+            if run_dir.is_dir() and ckpt_dir.is_dir() and any(ckpt_dir.glob("*.pth")):
+                run_dirs.append(run_dir)
+    return tuple(display_path(path) for path in sorted(run_dirs, reverse=True))
+
+
+def normal_checkpoints_for_run(run_dir: str) -> tuple[str, ...]:
+    path = Path(run_dir).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    ckpt_dir = path / "checkpoints"
+    if not ckpt_dir.is_dir():
+        return ()
+    return tuple(str(path) for path in sorted(ckpt_dir.glob("*.pth")))
+
+
+def normal_checkpoint_labels(choices: tuple[str, ...]) -> dict[str, str]:
+    return {choice: Path(choice).name for choice in choices}
 
 
 def shell_join_volc_command(cmd: list[str]) -> str:
@@ -873,13 +922,20 @@ def build_infer_8b(values: dict[str, str]) -> list[str]:
     ]
 
 
-def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
+def split_multi_value(value: str) -> list[str]:
+    return [item.strip() for item in value.replace(",", " ").split() if item.strip()]
+
+
+def build_single_normal_eval(values: dict[str, str], dataset: str, output_dir: str) -> list[str]:
     methods = [item.strip() for item in values["methods"].replace(",", " ").split() if item.strip()]
+    ours_checkpoints = split_multi_value(values["ours_checkpoint"])
+    if not ours_checkpoints:
+        raise ValueError("Ours checkpoint 至少选择一个")
     cmd = [
         PYTHON,
         "tools/normal_eval_experiment.py",
         "--dataset",
-        values["dataset"],
+        dataset,
         "--data-root",
         values["data_root"],
         "--partition",
@@ -891,11 +947,11 @@ def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
         "--eval-set-workers",
         values["eval_set_workers"],
         "--output-dir",
-        values["output_dir"],
+        output_dir,
         "--methods",
         *methods,
         "--ours-checkpoint",
-        values["ours_checkpoint"],
+        *ours_checkpoints,
         "--normal-tokenizer-ckpt",
         values["normal_tokenizer_ckpt"],
         "--normal-vae-type",
@@ -917,6 +973,8 @@ def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
     ]
     if values["ours_kv_cache_fast"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--ours-kv-cache-fast")
+    if values.get("eval_image", "").strip():
+        cmd += ["--eval-image", values["eval_image"].strip()]
     if values["compare_inference_time"].lower() in {"0", "no", "false", "n"}:
         cmd.append("--no-compare-inference-time")
     else:
@@ -926,6 +984,37 @@ def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
     if values["dry_run"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--dry-run")
     return cmd
+
+
+def build_normal_baseline_compare(values: dict[str, str]) -> list[str]:
+    datasets = split_multi_value(values["dataset"])
+    if not datasets:
+        raise ValueError("Dataset 至少选择一个")
+    valid_datasets = {"toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel"}
+    invalid = [dataset for dataset in datasets if dataset not in valid_datasets]
+    if invalid:
+        raise ValueError(f"Dataset 不支持: {', '.join(invalid)}")
+    if values.get("eval_image", "").strip() and len(datasets) > 1:
+        raise ValueError("只评估单图时 Dataset 只能选择一个")
+    if len(datasets) == 1:
+        return build_single_normal_eval(values, datasets[0], values["output_dir"])
+    commands = []
+    for dataset in datasets:
+        dataset_output = str(Path(values["output_dir"]) / dataset)
+        commands.append(shell_join(build_single_normal_eval(values, dataset, dataset_output)))
+    commands.append(
+        shell_join(
+            [
+                PYTHON,
+                "tools/summarize_normal_eval_datasets.py",
+                "--root",
+                values["output_dir"],
+                "--datasets",
+                *datasets,
+            ]
+        )
+    )
+    return ["zsh", "-lc", " && ".join(commands)]
 
 
 def build_train_normal(values: dict[str, str]) -> list[str]:
@@ -1022,6 +1111,10 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["ar_eval_every"],
         "--ar-eval-samples",
         values["ar_eval_samples"],
+        "--ar-eval-nyuv2-root",
+        values["ar_eval_nyuv2_root"],
+        "--ar-eval-nyuv2-samples",
+        values["ar_eval_nyuv2_samples"],
         "--ar-eval-top-k",
         values["ar_eval_top_k"],
         "--ar-eval-top-p",
@@ -1256,7 +1349,7 @@ TASKS: list[Task] = [
             Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
-            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "1", choices=("0", "1")),
+            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "0", choices=("0", "1")),
             Field(
                 "normal_vae",
                 "Normal VAE",
@@ -1273,7 +1366,7 @@ TASKS: list[Task] = [
             Field("init_model", "初始化模型", "weights/infinity_2b_reg.pth"),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("batch_size", "Batch/GPU", "4"),
-            Field("grad_accum_steps", "Grad accum", "2"),
+            Field("grad_accum_steps", "Grad accum", "1"),
             Field("val_batch_size", "Val batch/GPU", "4"),
             Field("num_workers", "Workers", "4"),
             Field("prefetch_factor", "Prefetch factor", "4"),
@@ -1281,8 +1374,8 @@ TASKS: list[Task] = [
                 "lr_ablation",
                 "LR ablation",
                 "custom",
-                help="custom 使用下面手填 LR；all_high_1e-4 将所有参数组覆盖为 1e-4/min 1e-5。",
-                choices=("custom", "all_high_1e-4"),
+                help="custom 使用下面手填 LR；all_6e-5 将所有参数组覆盖为 6e-5/min 6e-6。",
+                choices=("custom", "all_6e-5"),
             ),
             Field("lr", "Backbone LR", "1e-5"),
             Field("min_lr", "Backbone min LR", "5e-7"),
@@ -1296,7 +1389,7 @@ TASKS: list[Task] = [
             Field("beta1", "Adam beta1", "0.9"),
             Field("beta2", "Adam beta2", "0.95"),
             Field("weight_decay", "Weight decay", "1e-4"),
-            Field("train_normal_metrics_every", "Train normal metrics every", "100"),
+            Field("train_normal_metrics_every", "Train normal metrics every", "10"),
             Field("token_cache_dir", "Token cache dir", "outputs/normal_token_cache"),
             Field("token_cache_metadata_only", "Metadata-only cache", "1", choices=("0", "1")),
             Field("token_cache_require_hit", "Require cache hit", "0", choices=("0", "1")),
@@ -1311,22 +1404,24 @@ TASKS: list[Task] = [
             Field("normal_use_segmented_flash_attn", "Segmented flash attn", "1", choices=("0", "1")),
             Field("normal_bf16_activations", "BF16 activations", "1", choices=("0", "1")),
             Field("normal_save_activations_on_cpu", "CPU activation offload", "0", choices=("0", "1")),
-            Field("epochs", "Epochs", "20"),
+            Field("epochs", "Epochs", "5"),
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
             Field("ar_eval_every", "AR eval every", "9999999"),
             Field("ar_eval_samples", "AR eval samples", "32"),
+            Field("ar_eval_nyuv2_root", "AR eval NYUv2 root", "data/NYUv2/hf-parquet/tanganke/nyuv2/data"),
+            Field("ar_eval_nyuv2_samples", "AR eval NYUv2 samples", "32"),
             Field("ar_eval_top_k", "AR top-k", "1"),
             Field("ar_eval_top_p", "AR top-p", "0.0"),
             Field("ar_eval_tau", "AR tau", "1.0"),
-            Field("save_every_steps", "Save every steps", "100"),
-            Field("save_every_epoch", "Save every epoch", "1"),
+            Field("save_every_steps", "Val/save every steps", "100"),
+            Field("save_every_epoch", "Save every epoch (always)", "1"),
             Field("save_optimizer_state", "保存优化器", "1", choices=("0", "1")),
             Field("train_partition", "Train split", "train"),
             Field("val_partition", "Val split", "val"),
             Field("max_train_samples", "Max train samples", "0"),
-            Field("max_val_samples", "Max val samples", "0"),
+            Field("max_val_samples", "Max val samples", "512"),
             Field("ce_weight", "CE weight", "1.0"),
             Field("normal_l1_weight", "Normal L1 weight", "0.25"),
             Field("normal_angular_weight", "Angular weight", "0.5"),
@@ -1363,7 +1458,7 @@ TASKS: list[Task] = [
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
             Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
-            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "1", choices=("0", "1")),
+            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "0", choices=("0", "1")),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("train_partition", "Train split", "train"),
             Field("val_partition", "Val split", "val"),
@@ -1376,15 +1471,15 @@ TASKS: list[Task] = [
             Field("prefetch_factor", "Prefetch factor", "4"),
             Field("repeat_train", "Repeat train", "1"),
             Field("repeat_val", "Repeat val", "1"),
-            Field("lr", "Learning rate", "1e-4"),
-            Field("min_lr", "Min LR", "1e-5"),
+            Field("lr", "Learning rate", "6e-5"),
+            Field("min_lr", "Min LR", "6e-6"),
             Field("warmup_ratio", "Warmup ratio", "0.03"),
             Field("beta1", "Adam beta1", "0.9"),
             Field("beta2", "Adam beta2", "0.95"),
             Field("weight_decay", "Weight decay", "1e-4"),
             Field("grad_clip", "Grad clip", "1.0"),
             Field("precision", "Precision", "bf16", choices=("bf16", "fp16", "fp32")),
-            Field("epochs", "Epochs", "20"),
+            Field("epochs", "Epochs", "5"),
             Field("max_steps", "Max steps", "0"),
             Field("log_every", "Log every", "10"),
             Field("image_log_every", "Image log every", "200"),
@@ -1416,12 +1511,20 @@ TASKS: list[Task] = [
         "Normal Eval 实验",
         "统一运行 toy/NYUv2/Hypersim/ScanNet/iBims/Sintel normal eval，可选择 Ours、normal tokenizer 和官方 baseline。",
         [
+            Field("gpus", "GPU 数", "8"),
+            Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8"), help="Eval 当前只支持单机多卡分片"),
             Field("output_dir", "输出目录", managed_output("normal_eval")),
-            Field("dataset", "Dataset", "toy", choices=("toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel")),
-            Field("data_root", "数据目录", "auto", help="auto=toy/NYUv2/Hypersim/dsine_eval 默认路径"),
+            Field("dataset", "Dataset", "toy", multi_choices=("toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel")),
+            Field("data_root", "数据目录", "auto", help="auto=toy/NYUv2/Hypersim/ScanNet/iBims/Sintel 默认路径"),
             Field("partition", "Split", "val", choices=("val", "test", "train", "ibims", "sintel")),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("max_samples", "最多样本数", "0", help="0=全量；toy 忽略"),
+            Field(
+                "eval_image",
+                "只评估单图",
+                "",
+                help="可填已有 _eval_set/images/xxx.png；留空则评估整个 dataset",
+            ),
             Field("eval_set_workers", "导出 workers", "auto", help="auto=使用全部 CPU 核心"),
             Field(
                 "methods",
@@ -1443,7 +1546,9 @@ TASKS: list[Task] = [
             Field(
                 "ours_checkpoint",
                 "Ours checkpoint",
-                DEFAULT_NORMAL_ESTIMATION_CKPT,
+                " ".join(normal_checkpoint_choices()),
+                multi_choices=normal_checkpoint_choices(),
+                choice_labels=normal_checkpoint_choice_labels(),
             ),
             Field(
                 "normal_tokenizer_ckpt",
@@ -1954,15 +2059,22 @@ class MultiChoiceFieldScreen(ModalScreen[str | None]):
         ("ctrl+s", "save", "保存"),
     ]
 
-    def __init__(self, label: str, value: str, choices: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        label: str,
+        value: str,
+        choices: tuple[str, ...],
+        choice_labels: dict[str, str] | None = None,
+    ) -> None:
         super().__init__()
         self.label = label
         self.value = value
         self.choices = choices
+        self.choice_labels = choice_labels or {}
 
     def compose(self) -> ComposeResult:
         selected = {item.strip() for item in self.value.replace(",", " ").split() if item.strip()}
-        selections = [(choice, choice, choice in selected) for choice in self.choices]
+        selections = [(self.choice_labels.get(choice, choice), choice, choice in selected) for choice in self.choices]
         with Vertical(id="multi_choice_modal"):
             yield Static(self.label, id="multi_choice_title")
             yield Static("↑↓ 选择    Space 勾选/取消    s 保存    Esc 取消", id="multi_choice_hint")
@@ -2139,12 +2251,41 @@ class InfinityTUI(App):
         field = task.fields[row_index]
         value = self.current_values()[field.key]
         callback = lambda new_value: self.apply_field_edit(row_index, new_value)
+        if task.title == "Normal Eval 实验" and field.key == "ours_checkpoint":
+            run_dirs = normal_run_dir_choices()
+            if not run_dirs:
+                self.notify("没有找到 outputs/normal_estimation 下带 checkpoints/*.pth 的 run 目录", severity="warning")
+                return
+            self.push_screen(
+                ChoiceFieldScreen("选择 Normal Estimation run", "", run_dirs),
+                lambda run_dir: self.choose_normal_eval_checkpoints(row_index, run_dir),
+            )
+            return
         if field.multi_choices:
-            self.push_screen(MultiChoiceFieldScreen(field.label, value, field.multi_choices), callback)
+            self.push_screen(MultiChoiceFieldScreen(field.label, value, field.multi_choices, field.choice_labels), callback)
         elif field.choices:
             self.push_screen(ChoiceFieldScreen(field.label, value, field.choices), callback)
         else:
             self.push_screen(EditFieldScreen(field.label, value), callback)
+
+    def choose_normal_eval_checkpoints(self, row_index: int, run_dir: str | None) -> None:
+        if not run_dir:
+            return
+        task = self.current_task()
+        if row_index < 0 or row_index >= len(task.fields):
+            return
+        field = task.fields[row_index]
+        choices = normal_checkpoints_for_run(run_dir)
+        if not choices:
+            self.notify(f"{run_dir} 下面没有 checkpoints/*.pth", severity="warning")
+            return
+        current = self.current_values()[field.key]
+        selected_from_run = [choice for choice in choices if choice in current.replace(",", " ").split()]
+        value = " ".join(selected_from_run)
+        self.push_screen(
+            MultiChoiceFieldScreen(field.label, value, choices, normal_checkpoint_labels(choices)),
+            lambda new_value: self.apply_field_edit(row_index, new_value),
+        )
 
     def apply_field_edit(self, row_index: int, value: str | None) -> None:
         if value is None:

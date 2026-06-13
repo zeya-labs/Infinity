@@ -33,11 +33,25 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--word-head-lr", "2e-5")
         self.assert_flag_value(cmd, "--image-word-lr", "5e-5")
         self.assert_flag_value(cmd, "--normal-task-lr", "1e-4")
+        self.assert_flag_value(cmd, "--epochs", "5")
+        self.assert_flag_value(cmd, "--ar-eval-nyuv2-root", "data/NYUv2/hf-parquet/tanganke/nyuv2/data")
+        self.assert_flag_value(cmd, "--ar-eval-nyuv2-samples", "32")
+        self.assert_flag_value(cmd, "--max-val-samples", "512")
         self.assert_flag_value(cmd, "--train-normal-metrics-every", "100")
         self.assert_flag_value(cmd, "--image-log-every", "200")
-        self.assert_flag_value(cmd, "--save-every-steps", "100")
-        self.assertIn("--hypersim-filter-depth-nan", cmd)
+        self.assert_flag_value(cmd, "--save-every-steps", "500")
+        self.assertNotIn("--hypersim-filter-depth-nan", cmd)
         self.assertNotIn("--token-cache-" + "memory", cmd)
+
+    def test_normal_estimation_all_6e_5_lr_ablation(self) -> None:
+        values = task_defaults("训练 RGB 到 Normal")
+        values["lr_ablation"] = "all_6e-5"
+        cmd = tui.build_train_normal(values)
+        self.assert_flag_value(cmd, "--lr", "6e-5")
+        self.assert_flag_value(cmd, "--min-lr", "6e-6")
+        self.assert_flag_value(cmd, "--word-head-lr", "6e-5")
+        self.assert_flag_value(cmd, "--image-word-lr", "6e-5")
+        self.assert_flag_value(cmd, "--normal-task-lr", "6e-5")
 
     def test_normal_tokenizer_uses_mixed_dataset_defaults(self) -> None:
         values = task_defaults("训练法线 Tokenizer")
@@ -45,7 +59,10 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-datasets", DEFAULT_NORMAL_TRAIN_DATASETS)
         self.assert_flag_value(cmd, "--train-dataset-weights", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS)
         self.assert_flag_value(cmd, "--vkitti2-root", DEFAULT_VKITTI2_ROOT)
-        self.assertIn("--hypersim-filter-depth-nan", cmd)
+        self.assert_flag_value(cmd, "--lr", "6e-5")
+        self.assert_flag_value(cmd, "--min-lr", "6e-6")
+        self.assert_flag_value(cmd, "--epochs", "5")
+        self.assertNotIn("--hypersim-filter-depth-nan", cmd)
 
     def test_normal_eval_uses_shared_defaults_and_all_baselines(self) -> None:
         values = task_defaults("Normal Eval 实验")

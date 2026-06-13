@@ -28,7 +28,7 @@ except ImportError:
     StateDictType = None
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from torchvision.utils import make_grid, save_image
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -37,6 +37,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from infinity.normal_estimation import (  # noqa: E402
     HypersimNormalDataset,
+    NYUv2ParquetNormalDataset,
     build_normal_dataloader,
     build_normal_train_dataset,
     build_bsq_vae,
@@ -72,6 +73,7 @@ from infinity.utils.swanlab_utils import (  # noqa: E402
 
 
 LOGGER = logging.getLogger("train_normal_estimation")
+DEFAULT_NYUV2_ROOT = str(ROOT_DIR / "data" / "NYUv2" / "hf-parquet" / "tanganke" / "nyuv2" / "data")
 FULLSTATE_SAVE_POLICY = (
     FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     if FullStateDictConfig is not None
@@ -209,17 +211,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ar-eval-every", type=int, default=9999999)
     parser.add_argument("--ar-eval-samples", type=int, default=32)
+    parser.add_argument("--ar-eval-nyuv2-root", type=str, default=DEFAULT_NYUV2_ROOT)
+    parser.add_argument("--ar-eval-nyuv2-samples", type=int, default=32)
     parser.add_argument("--ar-eval-top-k", type=int, default=1)
     parser.add_argument("--ar-eval-top-p", type=float, default=0.0)
     parser.add_argument("--ar-eval-tau", type=float, default=1.0)
-    parser.add_argument("--save-every-steps", type=int, default=0, help="Overwrite checkpoints/last_step.pth every N optimizer steps; 0 disables step checkpointing.")
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=500,
+        help="Run validation and save checkpoints every N optimizer steps; 0 disables step validation checkpointing.",
+    )
     parser.add_argument("--save-every-epoch", type=int, default=1)
     parser.add_argument("--save-optimizer-state", action="store_true", default=False)
     parser.add_argument("--pn", type=str, choices=("0.06M", "0.25M", "1M"), default="0.06M")
     parser.add_argument("--train-partition", type=str, default="train")
     parser.add_argument("--val-partition", type=str, default="val")
     parser.add_argument("--max-train-samples", type=int, default=0)
-    parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument("--max-val-samples", type=int, default=512)
     parser.add_argument(
         "--token-cache-dir",
         type=str,
@@ -963,6 +972,7 @@ def save_checkpoint(
     step: int,
     best_val_angle: float,
     is_main: bool,
+    metrics: dict[str, float] | None = None,
 ) -> None:
     payload = {
         "args": vars(args),
@@ -971,6 +981,8 @@ def save_checkpoint(
         "best_val_angle": best_val_angle,
         "zero": args.zero,
     }
+    if metrics:
+        payload["metrics"] = metrics
     if is_fsdp_model(model):
         require_fsdp_state_dict_api()
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FULLSTATE_SAVE_POLICY, FULLOPTSTATE_SAVE_POLICY):
@@ -994,6 +1006,16 @@ def save_checkpoint(
     if is_main:
         atomic_torch_save(payload, checkpoint_path)
     dist_barrier_if_initialized()
+
+
+def format_checkpoint_metric(value: float) -> str:
+    if not math.isfinite(value):
+        return "nan"
+    return f"{value:.4f}"
+
+
+def prefixed_checkpoint_name(prefix: str, val_ar_nyu_deg: float) -> str:
+    return f"{prefix}_val_ar_nyu_deg_{format_checkpoint_metric(val_ar_nyu_deg)}.pth"
 
 
 def resolve_resume_path(args: argparse.Namespace) -> Path | None:
@@ -1336,12 +1358,14 @@ def evaluate_ar(
     args: argparse.Namespace,
     device: torch.device,
     distributed: bool,
-) -> tuple[dict[str, float], dict[str, torch.Tensor] | None]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]], dict[str, torch.Tensor] | None]:
     training = model.training
     model.eval()
     raw_model = model.module if isinstance(model, DDP) else model
     sums: dict[str, torch.Tensor] = {}
     count = 0
+    dataset_sums: dict[str, dict[str, torch.Tensor]] = {}
+    dataset_counts: dict[str, int] = {}
     visual_payload = None
 
     for batch in dataloader:
@@ -1388,6 +1412,12 @@ def evaluate_ar(
         count += batch_size
         for key, value in metrics.items():
             sums[key] = sums.get(key, value.new_tensor(0.0)) + value * batch_size
+        dataset_name = batch_dataset_name(batch)
+        if dataset_name is not None:
+            dataset_counts[dataset_name] = dataset_counts.get(dataset_name, 0) + batch_size
+            dataset_sum = dataset_sums.setdefault(dataset_name, {})
+            for key, value in metrics.items():
+                dataset_sum[key] = dataset_sum.get(key, value.new_tensor(0.0)) + value * batch_size
 
     count_tensor = torch.tensor(float(count), device=device)
     if distributed:
@@ -1397,9 +1427,27 @@ def evaluate_ar(
     total_count = max(1.0, float(count_tensor.item()))
     result = {key: float(value.item() / total_count) for key, value in sums.items()}
     result["samples"] = total_count
+    dataset_results: dict[str, dict[str, float]] = {}
+    for dataset_name, dataset_sum in dataset_sums.items():
+        dataset_count_tensor = torch.tensor(float(dataset_counts[dataset_name]), device=device)
+        if distributed:
+            dist.all_reduce(dataset_count_tensor, op=dist.ReduceOp.SUM)
+        if dataset_count_tensor.item() <= 0:
+            continue
+        for key in sums:
+            if key not in dataset_sum:
+                dataset_sum[key] = next(iter(sums.values())).new_tensor(0.0)
+            if distributed:
+                dist.all_reduce(dataset_sum[key], op=dist.ReduceOp.SUM)
+        dataset_total_count = max(1.0, float(dataset_count_tensor.item()))
+        dataset_results[dataset_name] = {
+            key: float(value.item() / dataset_total_count)
+            for key, value in dataset_sum.items()
+        }
+        dataset_results[dataset_name]["samples"] = dataset_total_count
     if training:
         model.train()
-    return result, visual_payload
+    return result, dataset_results, visual_payload
 
 
 def main() -> int:
@@ -1471,13 +1519,38 @@ def main() -> int:
                 max_samples=args.max_val_samples,
                 filter_depth_nan=args.hypersim_filter_depth_nan,
             )
-            ar_val_dataset = HypersimNormalDataset(
-                root=args.data_root,
-                partition=args.val_partition,
-                pn=args.pn,
-                max_samples=args.ar_eval_samples,
-                filter_depth_nan=args.hypersim_filter_depth_nan,
-            ) if args.ar_eval_samples > 0 else None
+            ar_val_datasets: list[Dataset] = []
+            if args.ar_eval_samples > 0:
+                ar_val_datasets.append(
+                    HypersimNormalDataset(
+                        root=args.data_root,
+                        partition=args.val_partition,
+                        pn=args.pn,
+                        max_samples=args.ar_eval_samples,
+                        filter_depth_nan=args.hypersim_filter_depth_nan,
+                    )
+                )
+            if args.ar_eval_nyuv2_samples > 0:
+                nyuv2_root = Path(args.ar_eval_nyuv2_root)
+                if nyuv2_root.exists():
+                    ar_val_datasets.append(
+                        NYUv2ParquetNormalDataset(
+                            root=str(nyuv2_root),
+                            partition="val",
+                            pn=args.pn,
+                            max_samples=args.ar_eval_nyuv2_samples,
+                        )
+                    )
+                elif rank == 0:
+                    LOGGER.warning("Skipping NYUv2 AR eval because root does not exist: %s", nyuv2_root)
+            ar_val_dataset = ConcatDataset(ar_val_datasets) if len(ar_val_datasets) > 1 else (ar_val_datasets[0] if ar_val_datasets else None)
+            if rank == 0 and ar_val_dataset is not None:
+                LOGGER.info(
+                    "ar_eval_samples hypersim=%d nyuv2=%d total=%d",
+                    max(0, int(args.ar_eval_samples)),
+                    max(0, int(args.ar_eval_nyuv2_samples)) if Path(args.ar_eval_nyuv2_root).exists() else 0,
+                    len(ar_val_dataset),
+                )
             train_shuffle = not args.token_cache_filter_missing
             if rank == 0 and not train_shuffle:
                 LOGGER.info("Disabled train shuffle because --token-cache-filter-missing is enabled.")
@@ -1826,7 +1899,7 @@ def main() -> int:
                     and args.ar_eval_every > 0
                     and global_step % args.ar_eval_every == 0
                 ):
-                    ar_metrics, ar_visuals = evaluate_ar(
+                    ar_metrics, ar_dataset_metrics, ar_visuals = evaluate_ar(
                         model=model,
                         normal_vae=normal_vae,
                         rgb_vae=rgb_vae,
@@ -1845,8 +1918,22 @@ def main() -> int:
                             ar_metrics["acc_22_5"],
                             ar_metrics["acc_30"],
                         )
+                        for dataset_name, dataset_metrics in ar_dataset_metrics.items():
+                            LOGGER.info(
+                                "val_ar/%s step=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                                dataset_name,
+                                global_step,
+                                dataset_metrics["samples"],
+                                dataset_metrics["angle_deg"],
+                                dataset_metrics["acc_11_25"],
+                                dataset_metrics["acc_22_5"],
+                                dataset_metrics["acc_30"],
+                            )
                         if swanlab_run is not None:
                             payload = {f"val_ar/{key}": value for key, value in ar_metrics.items()}
+                            for dataset_name, dataset_metrics in ar_dataset_metrics.items():
+                                for key, value in dataset_metrics.items():
+                                    payload[f"val_ar/{dataset_name}/{key}"] = value
                             swanlab_run.log(payload, step=global_step)
                         if ar_visuals is not None:
                             save_visuals(
@@ -1862,6 +1949,105 @@ def main() -> int:
                     dist_barrier_if_initialized()
 
                 if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    val_metrics, val_dataset_metrics, val_visuals = evaluate(
+                        model=model,
+                        normal_vae=normal_vae,
+                        rgb_vae=rgb_vae,
+                        dataloader=val_loader,
+                        args=args,
+                        device=device,
+                        distributed=distributed,
+                    )
+                    is_best = val_metrics["angle_deg"] < best_val_angle
+                    if is_best:
+                        best_val_angle = val_metrics["angle_deg"]
+                    if rank == 0:
+                        LOGGER.info(
+                            "val step=%d loss=%.4f ce=%.4f aux=%.4f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                            global_step,
+                            val_metrics["loss_total"],
+                            val_metrics["loss_ce"],
+                            val_metrics["loss_total_aux"],
+                            val_metrics["angle_deg"],
+                            val_metrics["acc_11_25"],
+                            val_metrics["acc_22_5"],
+                            val_metrics["acc_30"],
+                        )
+                        if swanlab_run is not None:
+                            payload = {f"val/{key}": value for key, value in val_metrics.items()}
+                            for dataset_name, dataset_metrics in val_dataset_metrics.items():
+                                for key, value in dataset_metrics.items():
+                                    payload[f"val/{dataset_name}/{key}"] = value
+                            swanlab_run.log(payload, step=global_step)
+                        if val_visuals is not None:
+                            save_visuals(
+                                output_dir,
+                                swanlab_run,
+                                "val",
+                                global_step,
+                                val_visuals["image"],
+                                val_visuals["target"],
+                                val_visuals["prediction"],
+                                is_main=True,
+                            )
+                    step_ar_metrics: dict[str, float] | None = None
+                    step_ar_dataset_metrics: dict[str, dict[str, float]] = {}
+                    if ar_val_loader is not None:
+                        step_ar_metrics, step_ar_dataset_metrics, ar_visuals = evaluate_ar(
+                            model=model,
+                            normal_vae=normal_vae,
+                            rgb_vae=rgb_vae,
+                            dataloader=ar_val_loader,
+                            args=args,
+                            device=device,
+                            distributed=distributed,
+                        )
+                        if rank == 0:
+                            LOGGER.info(
+                                "val_ar step=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                                global_step,
+                                step_ar_metrics["samples"],
+                                step_ar_metrics["angle_deg"],
+                                step_ar_metrics["acc_11_25"],
+                                step_ar_metrics["acc_22_5"],
+                                step_ar_metrics["acc_30"],
+                            )
+                            for dataset_name, dataset_metrics in step_ar_dataset_metrics.items():
+                                LOGGER.info(
+                                    "val_ar/%s step=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                                    dataset_name,
+                                    global_step,
+                                    dataset_metrics["samples"],
+                                    dataset_metrics["angle_deg"],
+                                    dataset_metrics["acc_11_25"],
+                                    dataset_metrics["acc_22_5"],
+                                    dataset_metrics["acc_30"],
+                                )
+                            if swanlab_run is not None:
+                                payload = {f"val_ar/{key}": value for key, value in step_ar_metrics.items()}
+                                for dataset_name, dataset_metrics in step_ar_dataset_metrics.items():
+                                    for key, value in dataset_metrics.items():
+                                        payload[f"val_ar/{dataset_name}/{key}"] = value
+                                swanlab_run.log(payload, step=global_step)
+                            if ar_visuals is not None:
+                                save_visuals(
+                                    output_dir,
+                                    swanlab_run,
+                                    "val_ar",
+                                    global_step,
+                                    ar_visuals["image"],
+                                    ar_visuals["target"],
+                                    ar_visuals["prediction"],
+                                    is_main=True,
+                                )
+                        dist_barrier_if_initialized()
+                    val_ar_nyu_deg = step_ar_dataset_metrics.get("nyuv2", {}).get("angle_deg", float("nan"))
+                    checkpoint_metrics = {
+                        "val_angle_deg": float(val_metrics["angle_deg"]),
+                        "val_ar_nyu_deg": float(val_ar_nyu_deg),
+                    }
+                    if step_ar_metrics is not None:
+                        checkpoint_metrics["val_ar_angle_deg"] = float(step_ar_metrics["angle_deg"])
                     save_checkpoint(
                         output_dir / "checkpoints" / "last_step.pth",
                         args=args,
@@ -1873,6 +2059,22 @@ def main() -> int:
                         step=global_step,
                         best_val_angle=best_val_angle,
                         is_main=(rank == 0),
+                        metrics=checkpoint_metrics,
+                    )
+                    save_checkpoint(
+                        output_dir
+                        / "checkpoints"
+                        / prefixed_checkpoint_name(f"step_{global_step:07d}", val_ar_nyu_deg),
+                        args=args,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler if args.precision == "fp16" else None,
+                        epoch=epoch,
+                        step=global_step,
+                        best_val_angle=best_val_angle,
+                        is_main=(rank == 0),
+                        metrics=checkpoint_metrics,
                     )
 
                 if args.max_steps > 0 and global_step >= args.max_steps:
@@ -1890,7 +2092,6 @@ def main() -> int:
                 device=device,
                 distributed=distributed,
             )
-            should_save_last = args.save_every_epoch > 0 and (epoch + 1) % args.save_every_epoch == 0
             is_best = val_metrics["angle_deg"] < best_val_angle
             if is_best:
                 best_val_angle = val_metrics["angle_deg"]
@@ -1924,10 +2125,12 @@ def main() -> int:
                         val_visuals["prediction"],
                         is_main=True,
                     )
+            epoch_ar_metrics: dict[str, float] | None = None
+            epoch_ar_dataset_metrics: dict[str, dict[str, float]] = {}
             if ar_val_loader is not None and args.ar_eval_every > 0:
                 if rank == 0:
                     LOGGER.info("val_ar epoch=%d start", epoch + 1)
-                ar_metrics, ar_visuals = evaluate_ar(
+                epoch_ar_metrics, epoch_ar_dataset_metrics, ar_visuals = evaluate_ar(
                     model=model,
                     normal_vae=normal_vae,
                     rgb_vae=rgb_vae,
@@ -1940,14 +2143,28 @@ def main() -> int:
                     LOGGER.info(
                         "val_ar epoch=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
                         epoch + 1,
-                        ar_metrics["samples"],
-                        ar_metrics["angle_deg"],
-                        ar_metrics["acc_11_25"],
-                        ar_metrics["acc_22_5"],
-                        ar_metrics["acc_30"],
+                        epoch_ar_metrics["samples"],
+                        epoch_ar_metrics["angle_deg"],
+                        epoch_ar_metrics["acc_11_25"],
+                        epoch_ar_metrics["acc_22_5"],
+                        epoch_ar_metrics["acc_30"],
                     )
+                    for dataset_name, dataset_metrics in epoch_ar_dataset_metrics.items():
+                        LOGGER.info(
+                            "val_ar/%s epoch=%d samples=%.0f angle=%.2f acc11=%.3f acc22=%.3f acc30=%.3f",
+                            dataset_name,
+                            epoch + 1,
+                            dataset_metrics["samples"],
+                            dataset_metrics["angle_deg"],
+                            dataset_metrics["acc_11_25"],
+                            dataset_metrics["acc_22_5"],
+                            dataset_metrics["acc_30"],
+                        )
                     if swanlab_run is not None:
-                        payload = {f"val_ar/{key}": value for key, value in ar_metrics.items()}
+                        payload = {f"val_ar/{key}": value for key, value in epoch_ar_metrics.items()}
+                        for dataset_name, dataset_metrics in epoch_ar_dataset_metrics.items():
+                            for key, value in dataset_metrics.items():
+                                payload[f"val_ar/{dataset_name}/{key}"] = value
                         payload["val_ar/epoch"] = epoch + 1
                         swanlab_run.log(payload, step=global_step)
                     if ar_visuals is not None:
@@ -1964,33 +2181,41 @@ def main() -> int:
                 dist_barrier_if_initialized()
                 if rank == 0:
                     LOGGER.info("val_ar epoch=%d done", epoch + 1)
-            if should_save_last:
-                save_checkpoint(
-                    output_dir / "checkpoints" / "last.pth",
-                    args=args,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler if args.precision == "fp16" else None,
-                    epoch=epoch + 1,
-                    step=global_step,
-                    best_val_angle=best_val_angle,
-                    is_main=(rank == 0),
-                )
-            if is_best:
-                save_checkpoint(
-                    output_dir / "checkpoints" / f"best_angle_{best_val_angle:.4f}.pth",
-                    args=args,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler if args.precision == "fp16" else None,
-                    epoch=epoch + 1,
-                    step=global_step,
-                    best_val_angle=best_val_angle,
-                    is_main=(rank == 0),
-                )
-
+            val_ar_nyu_deg = epoch_ar_dataset_metrics.get("nyuv2", {}).get("angle_deg", float("nan"))
+            checkpoint_metrics = {
+                "val_angle_deg": float(val_metrics["angle_deg"]),
+                "val_ar_nyu_deg": float(val_ar_nyu_deg),
+            }
+            if epoch_ar_metrics is not None:
+                checkpoint_metrics["val_ar_angle_deg"] = float(epoch_ar_metrics["angle_deg"])
+            save_checkpoint(
+                output_dir / "checkpoints" / "last.pth",
+                args=args,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler if args.precision == "fp16" else None,
+                epoch=epoch + 1,
+                step=global_step,
+                best_val_angle=best_val_angle,
+                is_main=(rank == 0),
+                metrics=checkpoint_metrics,
+            )
+            save_checkpoint(
+                output_dir
+                / "checkpoints"
+                / prefixed_checkpoint_name(f"epoch_{epoch + 1:04d}", val_ar_nyu_deg),
+                args=args,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler if args.precision == "fp16" else None,
+                epoch=epoch + 1,
+                step=global_step,
+                best_val_angle=best_val_angle,
+                is_main=(rank == 0),
+                metrics=checkpoint_metrics,
+            )
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
 

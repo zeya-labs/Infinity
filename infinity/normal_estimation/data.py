@@ -183,8 +183,8 @@ def _read_dsine_eval_normal(path: Path, *, png_normal: bool) -> tuple[np.ndarray
     else:
         normal = _read_dsine_eval_exr(path)
         valid = np.linalg.norm(normal, axis=2) > 0.5
-    normal = np.nan_to_num(normal.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     valid = valid & np.isfinite(normal).all(axis=2) & (np.linalg.norm(normal, axis=2) > 1e-6)
+    normal = np.nan_to_num(normal.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     return normal, valid.astype(np.float32)
 
 
@@ -723,6 +723,7 @@ class NYUv2ParquetNormalDataset(Dataset):
         mask = (depth_tensor > 0) & valid_normal.bool()
 
         metadata = {
+            "dataset": "nyuv2",
             "parquet_path": str(self.files[file_index]),
             "partition": self.partition,
             "index": index,

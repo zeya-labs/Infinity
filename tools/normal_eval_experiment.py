@@ -191,7 +191,7 @@ def dataset_default_root(dataset: str) -> Path:
     if dataset == "hypersim":
         return ROOT / "data" / "hypersim" / "processed" / "hypersim"
     if dataset in {"scannet", "ibims", "sintel"}:
-        return ROOT / "data" / "dsine_eval"
+        return ROOT / "data"
     raise ValueError(f"Unsupported dataset: {dataset}")
 
 
@@ -382,6 +382,92 @@ def export_eval_set(
     return images_dir, manifest
 
 
+def infer_eval_set_dir_from_image(image_path: Path) -> Path:
+    if image_path.parent.name == "images":
+        return image_path.parent.parent
+    raise ValueError(f"--eval-image must point to an image under an _eval_set/images directory: {image_path}")
+
+
+def copy_or_link_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        target.unlink()
+    try:
+        target.symlink_to(source.resolve())
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def materialize_single_eval_image(eval_image: Path, output_eval_set_dir: Path) -> tuple[Path, list[dict[str, object]], Path]:
+    image_path = resolve_path(eval_image).resolve()
+    if not image_path.is_file():
+        raise FileNotFoundError(f"--eval-image not found: {image_path}")
+    source_eval_set_dir = infer_eval_set_dir_from_image(image_path)
+    source_manifest_path = source_eval_set_dir / "manifest.jsonl"
+    if output_eval_set_dir.exists():
+        shutil.rmtree(output_eval_set_dir)
+    for name in ("images", "gt", "mask"):
+        (output_eval_set_dir / name).mkdir(parents=True, exist_ok=True)
+
+    stem = image_path.stem
+    manifest_item: dict[str, object] | None = None
+    if source_manifest_path.is_file():
+        for item in load_eval_manifest(source_eval_set_dir):
+            if Path(str(item.get("image", ""))).resolve() == image_path or str(item.get("id", "")) == stem:
+                manifest_item = dict(item)
+                break
+    if manifest_item is None:
+        manifest_item = {
+            "id": stem,
+            "image": str(image_path),
+            "target": str(source_eval_set_dir / "gt" / f"{stem}_normal.npy"),
+            "target_visualization": str(source_eval_set_dir / "gt" / f"{stem}_normal.png"),
+            "mask": str(source_eval_set_dir / "mask" / f"{stem}_mask.png"),
+            "source_image": "",
+            "target_size": [],
+        }
+
+    required = {
+        "image": Path(str(manifest_item["image"])),
+        "target": Path(str(manifest_item["target"])),
+        "mask": Path(str(manifest_item["mask"])),
+    }
+    missing = [f"{key}={path}" for key, path in required.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Single-image eval set is incomplete: " + ", ".join(missing))
+
+    target_vis = Path(str(manifest_item.get("target_visualization", "")))
+    copied_item = dict(manifest_item)
+    copied_item["image"] = str(output_eval_set_dir / "images" / image_path.name)
+    copied_item["target"] = str(output_eval_set_dir / "gt" / required["target"].name)
+    copied_item["mask"] = str(output_eval_set_dir / "mask" / required["mask"].name)
+    if target_vis.is_file():
+        copied_item["target_visualization"] = str(output_eval_set_dir / "gt" / target_vis.name)
+
+    copy_or_link_file(image_path, Path(str(copied_item["image"])))
+    copy_or_link_file(required["target"], Path(str(copied_item["target"])))
+    copy_or_link_file(required["mask"], Path(str(copied_item["mask"])))
+    if target_vis.is_file():
+        copy_or_link_file(target_vis, Path(str(copied_item["target_visualization"])))
+    (output_eval_set_dir / "manifest.jsonl").write_text(
+        json.dumps(copied_item, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return output_eval_set_dir / "images", [copied_item], source_eval_set_dir
+
+
+def infer_dataset_from_eval_set(eval_set_dir: Path) -> str | None:
+    meta_path = eval_set_dir.parent / "eval_experiment.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    dataset = payload.get("dataset")
+    return str(dataset) if isinstance(dataset, str) and dataset else None
+
+
 def run_command(cmd: list[str], *, cwd: Path, dry_run: bool, env: dict[str, str], cuda_device: str | None = None) -> int:
     prefix = f"CUDA_VISIBLE_DEVICES={cuda_device} " if cuda_device is not None else ""
     print("$ " + prefix + " ".join(str(part) for part in cmd), flush=True)
@@ -390,12 +476,12 @@ def run_command(cmd: list[str], *, cwd: Path, dry_run: bool, env: dict[str, str]
     return int(subprocess.run([str(part) for part in cmd], cwd=str(cwd), env=env, check=False).returncode)
 
 
-def ours_command(args: argparse.Namespace, input_dir: Path, output_dir: Path) -> list[str]:
+def ours_command(args: argparse.Namespace, input_dir: Path, output_dir: Path, checkpoint: Path) -> list[str]:
     cmd = [
         str(PYTHON),
         "tools/run_normal_estimation.py",
         "--model-path",
-        str(args.ours_checkpoint),
+        str(checkpoint),
         "--input-path",
         str(input_dir),
         "--output-dir",
@@ -423,11 +509,17 @@ def ours_command(args: argparse.Namespace, input_dir: Path, output_dir: Path) ->
     return cmd
 
 
-def run_ours_sharded(args: argparse.Namespace, input_dir: Path, output_dir: Path, devices: list[str]) -> tuple[int, list[list[str]]]:
+def run_ours_sharded(
+    args: argparse.Namespace,
+    input_dir: Path,
+    output_dir: Path,
+    devices: list[str],
+    checkpoint: Path,
+) -> tuple[int, list[list[str]]]:
     shard_count = max(1, len(devices))
     input_shards = prepare_input_shards(input_dir, output_dir / "_input_shards", shard_count)
     if len(input_shards) == 1:
-        cmd = ours_command(args, input_shards[0], output_dir)
+        cmd = ours_command(args, input_shards[0], output_dir, checkpoint)
         device = devices[0] if devices else None
         code = run_command(cmd, cwd=ROOT, dry_run=args.dry_run, env=clean_env(device), cuda_device=device)
         return code, [cmd]
@@ -441,7 +533,7 @@ def run_ours_sharded(args: argparse.Namespace, input_dir: Path, output_dir: Path
     for index, shard_input in enumerate(input_shards):
         shard_output = shard_output_root / f"shard_{index:02d}"
         shard_output.mkdir(parents=True, exist_ok=True)
-        cmd = ours_command(args, shard_input, shard_output)
+        cmd = ours_command(args, shard_input, shard_output, checkpoint)
         commands.append(cmd)
         device = devices[index % len(devices)] if devices else None
         print(f"$ CUDA_VISIBLE_DEVICES={device} " + " ".join(cmd), flush=True)
@@ -453,6 +545,107 @@ def run_ours_sharded(args: argparse.Namespace, input_dir: Path, output_dir: Path
     if not args.dry_run:
         merge_shard_outputs([shard_output_root / f"shard_{index:02d}" for index in range(len(input_shards))], output_dir)
     return 0, commands
+
+
+def run_ours_method(
+    args: argparse.Namespace,
+    input_dir: Path,
+    output_dir: Path,
+    devices: list[str],
+    checkpoint: Path,
+) -> tuple[int, list[list[str]]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return run_ours_sharded(args, input_dir, output_dir, devices, checkpoint)
+
+
+def finalize_ours_method(
+    *,
+    args: argparse.Namespace,
+    input_dir: Path,
+    output_dir: Path,
+    method: str,
+    manifest: list[dict[str, object]],
+    dataset: str,
+) -> dict[str, object]:
+    timing = load_inference_timing(output_dir, method, args.compare_inference_time and not args.dry_run)
+    if manifest and not args.dry_run:
+        evaluate_predictions(output_dir, manifest, method, dataset)
+        update_metrics_timing(output_dir, method, timing)
+        write_canonical_predictions(output_dir, sample_ids_for_outputs(input_dir, manifest), method, manifest)
+    elif not manifest:
+        write_image_only_metrics(output_dir, method, timing)
+        if not args.dry_run:
+            write_canonical_predictions(output_dir, sample_ids_for_outputs(input_dir, manifest), method, manifest)
+    return timing
+
+
+def run_ours_methods(
+    *,
+    args: argparse.Namespace,
+    input_dir: Path,
+    output_dir: Path,
+    methods: list[str],
+    checkpoints: dict[str, Path],
+    devices: list[str],
+    manifest: list[dict[str, object]],
+    dataset: str,
+) -> tuple[dict[str, object], dict[str, dict[str, object]], list[str]]:
+    commands: dict[str, object] = {}
+    timing_by_method: dict[str, dict[str, object]] = {}
+    failures: list[str] = []
+    if len(methods) <= 1 or len(devices) <= 1:
+        for method in methods:
+            method_out = output_dir / method
+            code, method_commands = run_ours_method(args, input_dir, method_out, devices, checkpoints[method])
+            commands[method] = method_commands[0] if len(method_commands) == 1 else method_commands
+            if code != 0:
+                failures.append(f"{method}: exited with {code}")
+                continue
+            timing_by_method[method] = finalize_ours_method(
+                args=args,
+                input_dir=input_dir,
+                output_dir=method_out,
+                method=method,
+                manifest=manifest,
+                dataset=dataset,
+            )
+        return commands, timing_by_method, failures
+
+    running: list[tuple[str, Path, str, list[str], subprocess.Popen[bytes]]] = []
+    pending = list(methods)
+    active_limit = min(len(devices), len(pending))
+    available_devices = list(devices)
+    while pending or running:
+        while pending and len(running) < active_limit and available_devices:
+            method = pending.pop(0)
+            method_out = output_dir / method
+            method_out.mkdir(parents=True, exist_ok=True)
+            device = available_devices.pop(0)
+            cmd = ours_command(args, input_dir, method_out, checkpoints[method])
+            commands[method] = cmd
+            print(f"$ CUDA_VISIBLE_DEVICES={device} " + " ".join(cmd), flush=True)
+            if args.dry_run:
+                timing_by_method[method] = load_inference_timing(method_out, method, False)
+                available_devices.append(device)
+                continue
+            running.append((method, method_out, device, cmd, subprocess.Popen(cmd, cwd=str(ROOT), env=clean_env(device))))
+        if args.dry_run:
+            continue
+        method, method_out, device, _cmd, process = running.pop(0)
+        code = process.wait()
+        available_devices.append(device)
+        if code != 0:
+            failures.append(f"{method}: exited with {code}")
+            continue
+        timing_by_method[method] = finalize_ours_method(
+            args=args,
+            input_dir=input_dir,
+            output_dir=method_out,
+            method=method,
+            manifest=manifest,
+            dataset=dataset,
+        )
+    return commands, timing_by_method, failures
 
 
 def timing_protocol() -> str:
@@ -590,10 +783,15 @@ def dataset_target_convention(dataset: str) -> NormalConvention:
     return DATASET_TARGET_CONVENTIONS[dataset]
 
 
+def method_convention_key(method: str) -> str:
+    return "ours" if method.startswith("ours__") else method
+
+
 def model_output_convention(method: str) -> NormalConvention:
-    if method not in MODEL_OUTPUT_CONVENTIONS:
+    key = method_convention_key(method)
+    if key not in MODEL_OUTPUT_CONVENTIONS:
         raise ValueError(f"No output normal convention registered for method={method!r}")
-    return MODEL_OUTPUT_CONVENTIONS[method]
+    return MODEL_OUTPUT_CONVENTIONS[key]
 
 
 def convert_target_to_eval(target: torch.Tensor, dataset: str) -> torch.Tensor:
@@ -1104,9 +1302,10 @@ def main() -> int:
     parser.add_argument("--pn", choices=("0.06M", "0.25M", "1M"), default="1M")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--eval-set-workers", default="auto")
+    parser.add_argument("--eval-image", type=Path, default=None, help="Evaluate one image from an existing _eval_set/images dir.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--methods", nargs="+", default=["ours"])
-    parser.add_argument("--ours-checkpoint", type=Path, default=Path(DEFAULT_NORMAL_ESTIMATION_CKPT))
+    parser.add_argument("--ours-checkpoint", type=Path, nargs="+", default=[Path(DEFAULT_NORMAL_ESTIMATION_CKPT)])
     parser.add_argument("--normal-tokenizer-ckpt", type=Path, default=Path(DEFAULT_NORMAL_TOKENIZER_CKPT))
     parser.add_argument("--normal-vae-type", type=int, default=32)
     parser.add_argument("--ours-seed", default="0")
@@ -1129,12 +1328,21 @@ def main() -> int:
 
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    args.ours_checkpoint = resolve_path(args.ours_checkpoint)
+    args.ours_checkpoint = [resolve_path(path) for path in args.ours_checkpoint]
     args.normal_tokenizer_ckpt = resolve_path(args.normal_tokenizer_ckpt) if str(args.normal_tokenizer_ckpt) else None
     data_root = dataset_default_root(args.dataset) if args.data_root.lower() == "auto" else resolve_path(args.data_root)
 
     manifest: list[dict[str, object]] = []
-    if args.dataset == "toy":
+    source_eval_set_dir = None
+    if args.eval_image is not None:
+        eval_set_dir = output_dir / "_eval_set"
+        input_dir, manifest, source_eval_set_dir = materialize_single_eval_image(args.eval_image, eval_set_dir)
+        inferred_dataset = infer_dataset_from_eval_set(source_eval_set_dir)
+        if inferred_dataset:
+            args.dataset = inferred_dataset
+            if args.data_root.lower() == "auto":
+                data_root = dataset_default_root(args.dataset)
+    elif args.dataset == "toy":
         input_dir = resolve_image_dir(args.dataset, data_root)
         eval_set_dir = None
     else:
@@ -1155,6 +1363,16 @@ def main() -> int:
             )
 
     methods = parse_methods(args.methods)
+    ours_checkpoints = list(args.ours_checkpoint)
+    if "ours" in methods and len(ours_checkpoints) > 1:
+        expanded_methods: list[str] = []
+        for method in methods:
+            if method != "ours":
+                expanded_methods.append(method)
+                continue
+            for checkpoint in ours_checkpoints:
+                expanded_methods.append("ours__" + sanitize_sample_id(checkpoint.stem))
+        methods = expanded_methods
     devices = visible_cuda_devices()
     if args.parallel_shards != "auto":
         shard_count = max(1, int(args.parallel_shards))
@@ -1170,8 +1388,10 @@ def main() -> int:
         "max_samples": args.max_samples,
         "input_dir": str(input_dir),
         "eval_set_dir": str(eval_set_dir) if eval_set_dir else "",
+        "source_eval_set_dir": str(source_eval_set_dir) if source_eval_set_dir else "",
+        "eval_image": str(resolve_path(args.eval_image)) if args.eval_image else "",
         "methods": methods,
-        "ours_checkpoint": str(args.ours_checkpoint),
+        "ours_checkpoints": [str(path) for path in ours_checkpoints],
         "normal_tokenizer_ckpt": str(args.normal_tokenizer_ckpt) if args.normal_tokenizer_ckpt else "",
         "visible_cuda_devices": devices,
         "parallel_shards": args.parallel_shards,
@@ -1196,24 +1416,27 @@ def main() -> int:
 
     timing_by_method: dict[str, dict[str, object]] = {}
 
-    if "ours" in methods:
-        ours_out = output_dir / "ours"
-        ours_out.mkdir(parents=True, exist_ok=True)
-        code, ours_commands = run_ours_sharded(args, input_dir, ours_out, devices)
-        timing_by_method["ours"] = load_inference_timing(ours_out, "ours", args.compare_inference_time and not args.dry_run)
-        commands["ours"] = ours_commands[0] if len(ours_commands) == 1 else ours_commands
-        if code != 0:
-            failures.append(f"ours: exited with {code}")
-        elif manifest and not args.dry_run:
-            evaluate_predictions(ours_out, manifest, "ours", args.dataset)
-            update_metrics_timing(ours_out, "ours", timing_by_method["ours"])
-            write_canonical_predictions(ours_out, sample_ids_for_outputs(input_dir, manifest), "ours", manifest)
-        elif not manifest:
-            write_image_only_metrics(ours_out, "ours", timing_by_method["ours"])
-            if not args.dry_run:
-                write_canonical_predictions(ours_out, sample_ids_for_outputs(input_dir, manifest), "ours", manifest)
+    ours_methods = [method for method in methods if method == "ours" or method.startswith("ours__")]
+    ours_checkpoint_by_method = (
+        {"ours": ours_checkpoints[0]}
+        if ours_methods == ["ours"]
+        else {method: checkpoint for method, checkpoint in zip(ours_methods, ours_checkpoints, strict=True)}
+    )
+    ours_commands, ours_timing, ours_failures = run_ours_methods(
+        args=args,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        methods=ours_methods,
+        checkpoints=ours_checkpoint_by_method,
+        devices=devices,
+        manifest=manifest,
+        dataset=args.dataset,
+    )
+    commands.update(ours_commands)
+    timing_by_method.update(ours_timing)
+    failures.extend(ours_failures)
 
-    baseline_methods = [method for method in methods if method != "ours"]
+    baseline_methods = [method for method in methods if method not in ours_methods]
     if baseline_methods:
         baseline_groups = [[method] for method in baseline_methods] if args.compare_inference_time else [baseline_methods]
         for baseline_group in baseline_groups:
