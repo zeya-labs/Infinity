@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +37,29 @@ class NormalDataTest(unittest.TestCase):
             manifest.write_text('{"rgb_path": "rgb.png"}\n', encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "missing required fields"):
                 VKITTI2NormalDataset(root=tmpdir, metadata_only=True)
+
+    def test_vkitti2_filters_by_max_invalid_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            Image.new("RGB", (2, 2), (0, 0, 0)).save(root / "rgb.png")
+            np.save(root / "normal0.npy", np.ones((2, 2, 3), dtype=np.float32))
+            np.save(root / "normal1.npy", np.ones((2, 2, 3), dtype=np.float32))
+            Image.fromarray(np.array([[255, 255], [255, 0]], dtype=np.uint8)).save(root / "mask0.png")
+            Image.fromarray(np.array([[255, 0], [0, 0]], dtype=np.uint8)).save(root / "mask1.png")
+            records = [
+                {"rgb_path": "rgb.png", "normal_path": "normal0.npy", "mask_path": "mask0.png"},
+                {"rgb_path": "rgb.png", "normal_path": "normal1.npy", "mask_path": "mask1.png"},
+            ]
+            (root / "manifest.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            dataset = VKITTI2NormalDataset(root=tmpdir, metadata_only=True, max_invalid_ratio=0.25)
+
+            self.assertEqual(len(dataset), 1)
+            self.assertEqual(dataset.get_metadata(0)["normal_path"], "normal0.npy")
+            self.assertAlmostEqual(dataset.get_metadata(0)["mask_invalid_ratio"], 0.25)
 
     def test_hypersim_filter_depth_nan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

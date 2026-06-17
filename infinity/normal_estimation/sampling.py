@@ -303,6 +303,7 @@ def build_normal_train_dataset(
     max_samples: int,
     metadata_only: bool = False,
     hypersim_filter_depth_nan: bool = False,
+    vkitti2_max_invalid_ratio: float | None = None,
 ) -> Dataset:
     datasets: list[Dataset] = []
     for name in parse_train_dataset_names(train_datasets):
@@ -325,6 +326,7 @@ def build_normal_train_dataset(
                     pn=pn,
                     max_samples=max_samples,
                     metadata_only=metadata_only,
+                    max_invalid_ratio=vkitti2_max_invalid_ratio,
                 )
             )
     return datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)

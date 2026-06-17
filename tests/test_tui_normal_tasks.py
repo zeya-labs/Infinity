@@ -9,6 +9,7 @@ from infinity.normal_estimation.defaults import (
     DEFAULT_NORMAL_TOKENIZER_CKPT,
     DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_VKITTI2_MAX_INVALID_RATIO,
     DEFAULT_VKITTI2_ROOT,
 )
 
@@ -29,10 +30,12 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-datasets", DEFAULT_NORMAL_TRAIN_DATASETS)
         self.assert_flag_value(cmd, "--train-dataset-weights", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS)
         self.assert_flag_value(cmd, "--vkitti2-root", DEFAULT_VKITTI2_ROOT)
+        self.assert_flag_value(cmd, "--vkitti2-max-invalid-ratio", f"{DEFAULT_VKITTI2_MAX_INVALID_RATIO:g}")
         self.assert_flag_value(cmd, "--lr", "1e-5")
         self.assert_flag_value(cmd, "--word-head-lr", "2e-5")
         self.assert_flag_value(cmd, "--image-word-lr", "5e-5")
         self.assert_flag_value(cmd, "--normal-task-lr", "1e-4")
+        self.assert_flag_value(cmd, "--normal-token-layout", "prefix")
         self.assert_flag_value(cmd, "--epochs", "5")
         self.assert_flag_value(cmd, "--ar-eval-nyuv2-root", "data/NYUv2/hf-parquet/tanganke/nyuv2/data")
         self.assert_flag_value(cmd, "--ar-eval-nyuv2-samples", "32")
@@ -40,8 +43,29 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-normal-metrics-every", "100")
         self.assert_flag_value(cmd, "--image-log-every", "200")
         self.assert_flag_value(cmd, "--save-every-steps", "500")
-        self.assertNotIn("--hypersim-filter-depth-nan", cmd)
+        self.assertIn("--hypersim-filter-depth-nan", cmd)
         self.assertNotIn("--token-cache-" + "memory", cmd)
+
+    def test_normal_estimation_can_select_interleaved_token_layout(self) -> None:
+        values = task_defaults("训练 RGB 到 Normal")
+        values["normal_token_layout"] = "interleaved"
+        cmd = tui.build_train_normal(values)
+        self.assert_flag_value(cmd, "--normal-token-layout", "interleaved")
+
+    def test_normal_estimation_strict_interleaved_source_uses_flex_attention(self) -> None:
+        values = task_defaults("训练 RGB 到 Normal")
+        values["normal_token_layout"] = "interleaved_source"
+        values["normal_use_segmented_flash_attn"] = "1"
+        cmd = tui.build_train_normal(values)
+        self.assert_flag_value(cmd, "--normal-token-layout", "interleaved_source")
+        self.assertIn("--normal-use-flex-attn", cmd)
+        self.assertNotIn("--normal-use-segmented-flash-attn", cmd)
+
+    def test_normal_estimation_can_disable_hypersim_nan_filter_flag(self) -> None:
+        values = task_defaults("训练 RGB 到 Normal")
+        values["hypersim_filter_depth_nan"] = "0"
+        cmd = tui.build_train_normal(values)
+        self.assertNotIn("--hypersim-filter-depth-nan", cmd)
 
     def test_normal_estimation_all_6e_5_lr_ablation(self) -> None:
         values = task_defaults("训练 RGB 到 Normal")
@@ -59,10 +83,11 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--train-datasets", DEFAULT_NORMAL_TRAIN_DATASETS)
         self.assert_flag_value(cmd, "--train-dataset-weights", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS)
         self.assert_flag_value(cmd, "--vkitti2-root", DEFAULT_VKITTI2_ROOT)
+        self.assert_flag_value(cmd, "--vkitti2-max-invalid-ratio", f"{DEFAULT_VKITTI2_MAX_INVALID_RATIO:g}")
         self.assert_flag_value(cmd, "--lr", "6e-5")
         self.assert_flag_value(cmd, "--min-lr", "6e-6")
         self.assert_flag_value(cmd, "--epochs", "5")
-        self.assertNotIn("--hypersim-filter-depth-nan", cmd)
+        self.assertIn("--hypersim-filter-depth-nan", cmd)
 
     def test_normal_eval_uses_shared_defaults_and_all_baselines(self) -> None:
         values = task_defaults("Normal Eval 实验")

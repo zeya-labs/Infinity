@@ -34,6 +34,8 @@ _EXPORT_MODULES = {
     "normals_to_vis": ".modeling",
     "resolve_scale_schedule_from_hw": ".modeling",
     "token_cache_sample_key": ".token_cache",
+    "convert_ar_batch_target_to_eval_convention": ".training",
+    "convert_ar_target_to_eval_convention": ".training",
     "require_positive_steps_per_epoch": ".training",
 }
 

@@ -40,6 +40,7 @@ from infinity.normal_estimation.defaults import (  # noqa: E402
     DEFAULT_HYPERSIM_ROOT,
     DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_VKITTI2_MAX_INVALID_RATIO,
     DEFAULT_VKITTI2_ROOT,
 )
 from infinity.utils.swanlab_utils import (  # noqa: E402
@@ -67,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated dataset sampling weights, e.g. hypersim:9,vkitti2:1. Empty uses 1 for each train dataset.",
     )
     parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
+    parser.add_argument(
+        "--vkitti2-max-invalid-ratio",
+        type=float,
+        default=DEFAULT_VKITTI2_MAX_INVALID_RATIO,
+        help="Drop VKITTI2 samples whose mask==0 pixel ratio is above this threshold. Set to 1.0 to keep all.",
+    )
     parser.add_argument(
         "--hypersim-filter-depth-nan",
         action="store_true",
@@ -502,6 +509,7 @@ def build_tokenizer_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset
         pn=args.pn,
         max_samples=args.max_train_samples,
         hypersim_filter_depth_nan=args.hypersim_filter_depth_nan,
+        vkitti2_max_invalid_ratio=args.vkitti2_max_invalid_ratio,
     )
     val_dataset: Dataset = HypersimNormalDataset(
         root=args.data_root,

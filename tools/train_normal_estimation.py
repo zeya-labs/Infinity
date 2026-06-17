@@ -46,6 +46,7 @@ from infinity.normal_estimation import (  # noqa: E402
     build_multiscale_var_inputs,
     collate_normal_estimation_batch,
     compute_normal_metrics,
+    convert_ar_batch_target_to_eval_convention,
     decode_logits_to_normal,
     dataset_metadata_at,
     load_normal_sample_from_metadata,
@@ -63,6 +64,7 @@ from infinity.normal_estimation.defaults import (  # noqa: E402
     DEFAULT_HYPERSIM_ROOT,
     DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_VKITTI2_MAX_INVALID_RATIO,
     DEFAULT_VKITTI2_ROOT,
 )
 from infinity.normal_estimation.token_cache import token_cache_sample_key  # noqa: E402
@@ -102,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated dataset sampling weights, e.g. hypersim:9,vkitti2:1. Empty uses 1 for each train dataset.",
     )
     parser.add_argument("--vkitti2-root", type=str, default=DEFAULT_VKITTI2_ROOT)
+    parser.add_argument(
+        "--vkitti2-max-invalid-ratio",
+        type=float,
+        default=DEFAULT_VKITTI2_MAX_INVALID_RATIO,
+        help="Drop VKITTI2 samples whose mask==0 pixel ratio is above this threshold. Set to 1.0 to keep all.",
+    )
     parser.add_argument(
         "--hypersim-filter-depth-nan",
         action="store_true",
@@ -265,6 +273,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--add-lvl-embeding-only-first-block", type=int, choices=(0, 1), default=1)
     parser.add_argument("--rope2d-each-sa-layer", type=int, choices=(0, 1), default=1)
     parser.add_argument("--rope2d-normalized-by-hw", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument(
+        "--normal-token-layout",
+        type=str,
+        choices=("prefix", "interleaved", "interleaved_source"),
+        default="prefix",
+        help=(
+            "RGB/normal token layout. prefix keeps [RGB_all][Normal_all]; "
+            "interleaved uses [RGB_s][Normal_s] with contiguous-prefix attention; "
+            "interleaved_source keeps RGB source tokens from attending normal tokens and requires --normal-use-flex-attn."
+        ),
+    )
     parser.add_argument("--normal-use-flex-attn", action="store_true", default=False)
     parser.add_argument("--normal-use-segmented-flash-attn", action="store_true", default=False)
     parser.add_argument("--normal-bf16-activations", action="store_true", default=False)
@@ -321,7 +340,13 @@ def parse_args() -> argparse.Namespace:
         default=40,
         help="Number of rows to write in the torch.profiler CUDA time table.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.normal_token_layout == "interleaved_source":
+        if args.normal_use_segmented_flash_attn:
+            parser.error("--normal-token-layout interleaved_source cannot use --normal-use-segmented-flash-attn; use --normal-use-flex-attn.")
+        if not args.normal_use_flex_attn:
+            parser.error("--normal-token-layout interleaved_source requires --normal-use-flex-attn for non-prefix source/target masking.")
+    return args
 
 
 def setup_logging(output_dir: Path, is_main: bool) -> None:
@@ -1393,6 +1418,7 @@ def evaluate_ar(
                 vae_type=args.normal_vae_type,
             )
         target_for_prediction, mask_for_prediction = maybe_resize_target_for_prediction(prediction, target, mask)
+        target_for_prediction = convert_ar_batch_target_to_eval_convention(target_for_prediction, batch["metadata"])
         _, metrics = compute_normal_metrics(
             prediction=prediction,
             target=target_for_prediction,
@@ -1493,6 +1519,7 @@ def main() -> int:
                 max_samples=args.max_train_samples,
                 metadata_only=args.token_cache_metadata_only and token_cache_enabled(args),
                 hypersim_filter_depth_nan=args.hypersim_filter_depth_nan,
+                vkitti2_max_invalid_ratio=args.vkitti2_max_invalid_ratio,
             )
             if rank == 0:
                 LOGGER.info(
@@ -1596,6 +1623,7 @@ def main() -> int:
                     drop_last=False,
                     collate_fn=collate_normal_estimation_batch,
                     pin_memory=torch.cuda.is_available(),
+                    group_by_target_size=True,
                 )
 
         with timed_stage(init_timings if args.profile_timings else None, "vae_load", device):
@@ -1625,6 +1653,7 @@ def main() -> int:
                     rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
                     apply_spatial_patchify=args.normal_apply_spatial_patchify,
                     checkpointing=None if args.checkpointing == "none" else args.checkpointing,
+                    normal_token_layout=args.normal_token_layout,
                     normal_use_flex_attn=args.normal_use_flex_attn,
                     normal_use_segmented_flash_attn=args.normal_use_segmented_flash_attn,
                     normal_bf16_activations=args.normal_bf16_activations,

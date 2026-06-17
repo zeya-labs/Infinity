@@ -9,6 +9,7 @@ DEFAULT_HYPERSIM_ROOT = str(REPO_ROOT / "data" / "hypersim" / "processed" / "hyp
 DEFAULT_VKITTI2_ROOT = str(REPO_ROOT / "data" / "VKITTI2" / "processed" / "normals_lotus_svd")
 DEFAULT_NORMAL_TRAIN_DATASETS = "hypersim,vkitti2"
 DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS = "hypersim:9,vkitti2:1"
+DEFAULT_VKITTI2_MAX_INVALID_RATIO = 0.25
 
 DEFAULT_NORMAL_TOKENIZER_CKPT = os.environ.get(
     "INFINITY_NORMAL_TOKENIZER_CKPT",

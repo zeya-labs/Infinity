@@ -28,6 +28,7 @@ from infinity.normal_estimation.defaults import (
     DEFAULT_NORMAL_TOKENIZER_CKPT,
     DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_VKITTI2_MAX_INVALID_RATIO,
     DEFAULT_VKITTI2_ROOT,
 )
 
@@ -1036,6 +1037,8 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["train_dataset_weights"],
         "--vkitti2-root",
         values["vkitti2_root"],
+        "--vkitti2-max-invalid-ratio",
+        values["vkitti2_max_invalid_ratio"],
         "--normal-vae-ckpt",
         values["normal_vae"],
         "--rgb-vae-ckpt",
@@ -1099,6 +1102,8 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         values["checkpointing"],
         "--full-block-checkpoint-skip-interval",
         values["full_block_checkpoint_skip_interval"],
+        "--normal-token-layout",
+        values["normal_token_layout"],
         "--epochs",
         values["epochs"],
         "--max-steps",
@@ -1166,7 +1171,9 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         cmd.append("--token-cache-filter-missing")
     if values["fast_model_init"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--fast-model-init")
-    if values["normal_use_segmented_flash_attn"].lower() in {"1", "yes", "true", "y"}:
+    if values.get("normal_use_flex_attn", "0").lower() in {"1", "yes", "true", "y"} or values["normal_token_layout"] == "interleaved_source":
+        cmd.append("--normal-use-flex-attn")
+    if values["normal_use_segmented_flash_attn"].lower() in {"1", "yes", "true", "y"} and values["normal_token_layout"] != "interleaved_source":
         cmd.append("--normal-use-segmented-flash-attn")
     if values["normal_bf16_activations"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--normal-bf16-activations")
@@ -1198,6 +1205,8 @@ def build_train_tokenizer(values: dict[str, str]) -> list[str]:
         values["train_dataset_weights"],
         "--vkitti2-root",
         values["vkitti2_root"],
+        "--vkitti2-max-invalid-ratio",
+        values["vkitti2_max_invalid_ratio"],
         "--pn",
         values["pn"],
         "--train-partition",
@@ -1349,7 +1358,12 @@ TASKS: list[Task] = [
             Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
-            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "0", choices=("0", "1")),
+            Field(
+                "vkitti2_max_invalid_ratio",
+                "VKITTI2 max invalid ratio",
+                f"{DEFAULT_VKITTI2_MAX_INVALID_RATIO:g}",
+            ),
+            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "1", choices=("0", "1")),
             Field(
                 "normal_vae",
                 "Normal VAE",
@@ -1400,7 +1414,9 @@ TASKS: list[Task] = [
             Field("zero", "ZeRO", "0", choices=("0", "2", "3")),
             Field("checkpointing", "Checkpointing", "full-block", choices=("full-block", "self-attn", "none")),
             Field("full_block_checkpoint_skip_interval", "Checkpoint skip interval", "16"),
+            Field("normal_token_layout", "Normal token layout", "prefix", choices=("prefix", "interleaved", "interleaved_source")),
             Field("fast_model_init", "Fast model init", "1", choices=("0", "1")),
+            Field("normal_use_flex_attn", "Flex attn", "0", choices=("0", "1")),
             Field("normal_use_segmented_flash_attn", "Segmented flash attn", "1", choices=("0", "1")),
             Field("normal_bf16_activations", "BF16 activations", "1", choices=("0", "1")),
             Field("normal_save_activations_on_cpu", "CPU activation offload", "0", choices=("0", "1")),
@@ -1458,7 +1474,12 @@ TASKS: list[Task] = [
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
             Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
-            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "0", choices=("0", "1")),
+            Field(
+                "vkitti2_max_invalid_ratio",
+                "VKITTI2 max invalid ratio",
+                f"{DEFAULT_VKITTI2_MAX_INVALID_RATIO:g}",
+            ),
+            Field("hypersim_filter_depth_nan", "Filter Hypersim NaN depth", "1", choices=("0", "1")),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
             Field("train_partition", "Train split", "train"),
             Field("val_partition", "Val split", "val"),

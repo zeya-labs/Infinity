@@ -455,10 +455,13 @@ class VKITTI2NormalDataset(Dataset):
         pn: str = "0.06M",
         max_samples: int = 0,
         metadata_only: bool = False,
+        max_invalid_ratio: float | None = None,
     ) -> None:
         super().__init__()
         if pn not in {"0.06M", "0.25M", "1M"}:
             raise ValueError(f"Unsupported pn: {pn}")
+        if max_invalid_ratio is not None and not 0.0 <= max_invalid_ratio <= 1.0:
+            raise ValueError(f"max_invalid_ratio must be in [0, 1], got {max_invalid_ratio}")
 
         self.root = Path(root)
         self.partition = partition
@@ -467,6 +470,8 @@ class VKITTI2NormalDataset(Dataset):
         self.manifest_path = self._resolve_manifest_path(self.root)
         self.manifest_dir = self.manifest_path.parent
         self.records = _load_jsonl_manifest(self.manifest_path, required_fields=("rgb_path", "normal_path", "mask_path"))
+        if max_invalid_ratio is not None:
+            self.records = self._records_within_invalid_ratio(max_invalid_ratio)
         if max_samples > 0:
             self.records = self.records[:max_samples]
         self.original_hw = self._infer_original_hw()
@@ -486,6 +491,42 @@ class VKITTI2NormalDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def _invalid_ratio_from_mask(self, record: dict[str, Any]) -> float:
+        mask_path = _resolve_path(record["mask_path"], self.manifest_dir)
+        with Image.open(mask_path) as mask_handle:
+            mask = np.asarray(mask_handle.convert("L"))
+        if mask.size == 0:
+            return 1.0
+        return float((mask == 0).sum() / mask.size)
+
+    def _load_invalid_ratio_index(self) -> dict[str, float]:
+        csv_path = self.manifest_dir / "analysis" / "normal_invalid_ratio_distribution.csv"
+        if not csv_path.is_file():
+            return {}
+        ratios: dict[str, float] = {}
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                normal_path = row.get("normal_path", "")
+                ratio = row.get("mask_invalid_ratio", "")
+                if not normal_path or ratio == "":
+                    continue
+                ratios[normal_path] = float(ratio)
+        return ratios
+
+    def _records_within_invalid_ratio(self, max_invalid_ratio: float) -> list[dict[str, Any]]:
+        ratios = self._load_invalid_ratio_index()
+        records: list[dict[str, Any]] = []
+        for index, record in enumerate(self.records):
+            ratio = ratios.get(record["normal_path"])
+            if ratio is None:
+                ratio = self._invalid_ratio_from_mask(record)
+            if ratio <= max_invalid_ratio:
+                kept_record = dict(record)
+                kept_record.setdefault("__original_index", index)
+                kept_record["mask_invalid_ratio"] = ratio
+                records.append(kept_record)
+        return records
 
     def _infer_original_hw(self) -> tuple[int, int]:
         if not self.records:

@@ -99,6 +99,20 @@ def _stage_ids_for_schedule(scale_schedule: list[tuple[int, int, int]], device: 
     )
 
 
+def _stage_lengths(scale_schedule: list[tuple[int, int, int]]) -> list[int]:
+    return [int(pt) * int(ph) * int(pw) for pt, ph, pw in scale_schedule]
+
+
+def _stage_offsets(scale_schedule: list[tuple[int, int, int]]) -> list[tuple[int, int]]:
+    offsets: list[tuple[int, int]] = []
+    start = 0
+    for length in _stage_lengths(scale_schedule):
+        end = start + length
+        offsets.append((start, end))
+        start = end
+    return offsets
+
+
 def _flatten_feature_tokens(feature: torch.Tensor, *, apply_spatial_patchify: bool) -> torch.Tensor:
     feature = feature.squeeze(-3)
     if apply_spatial_patchify:
@@ -202,6 +216,7 @@ class InfinityNormalPrefixModel(Infinity):
         self,
         *args: Any,
         task_condition_len: int = 16,
+        normal_token_layout: str = "prefix",
         normal_use_flex_attn: bool = False,
         normal_use_segmented_flash_attn: bool = False,
         normal_bf16_activations: bool = False,
@@ -218,10 +233,13 @@ class InfinityNormalPrefixModel(Infinity):
             raise NotImplementedError("flash-attn is required for normal segmented flash attention.")
         if normal_use_flex_attn and normal_use_segmented_flash_attn:
             raise ValueError("Use only one normal attention backend: flex or segmented flash.")
+        if normal_token_layout not in {"prefix", "interleaved", "interleaved_source"}:
+            raise ValueError(f"Unsupported normal_token_layout: {normal_token_layout}")
         if normal_use_flex_attn:
             torch._inductor.config.max_autotune_gemm_backends = "TRITON,ATEN"
 
         self.task_condition_len = task_condition_len
+        self.normal_token_layout = normal_token_layout
         self.normal_use_flex_attn = normal_use_flex_attn
         self.normal_use_segmented_flash_attn = normal_use_segmented_flash_attn
         self.normal_bf16_activations = normal_bf16_activations
@@ -288,28 +306,32 @@ class InfinityNormalPrefixModel(Infinity):
         normal_x = self.word_embed(self.norm0_ve(normal_x_blc_wo_prefix.float()))
         return torch.cat((sos, normal_x), dim=1) + self.normal_modality_embed
 
-    def _ensure_prefix_rope_cache(
+    def _ensure_sequence_rope_cache(
         self,
-        prefix_schedule: list[tuple[int, int, int]],
-        normal_schedule: list[tuple[int, int, int]],
+        sequence_schedule: list[tuple[int, int, int]],
+        sequence_source_indices: list[int],
+        source_schedule: list[tuple[int, int, int]],
         padded_len: int,
     ) -> list[tuple[int, int, int]]:
-        rope_schedule = list(prefix_schedule) + list(normal_schedule)
         if not self.rope2d_each_sa_layer:
-            return rope_schedule
-        rope_key = str(tuple(rope_schedule))
+            return sequence_schedule
+        rope_key = str(tuple(sequence_schedule))
         if rope_key in self.rope2d_freqs_grid and self.rope2d_freqs_grid[rope_key].shape[4] >= padded_len:
-            return rope_schedule
-        base_cache = self._find_rope_cache_for_schedule(prefix_schedule)
+            return sequence_schedule
+        base_cache = self._find_rope_cache_for_schedule(source_schedule)
         if base_cache is None:
-            return rope_schedule
+            return sequence_schedule
 
-        prefix_len = _scale_seq_len(prefix_schedule)
-        normal_len = _scale_seq_len(normal_schedule)
-        rope_cache = torch.cat(
-            [base_cache[..., :prefix_len, :], base_cache[..., :normal_len, :]],
-            dim=4,
-        )
+        source_offsets = _stage_offsets(source_schedule)
+        pieces = []
+        if len(sequence_source_indices) != len(sequence_schedule):
+            return sequence_schedule
+        for source_index in sequence_source_indices:
+            if source_index < 0 or source_index >= len(source_offsets):
+                return sequence_schedule
+            start, end = source_offsets[source_index]
+            pieces.append(base_cache[..., start:end, :])
+        rope_cache = torch.cat(pieces, dim=4)
         if rope_cache.shape[4] < padded_len:
             pad = torch.zeros(
                 *rope_cache.shape[:4],
@@ -320,7 +342,7 @@ class InfinityNormalPrefixModel(Infinity):
             )
             rope_cache = torch.cat([rope_cache, pad], dim=4)
         self.rope2d_freqs_grid[rope_key] = rope_cache
-        return rope_schedule
+        return sequence_schedule
 
     def _find_rope_cache_for_schedule(self, scale_schedule: list[tuple[int, int, int]]) -> torch.Tensor | None:
         exact_key = str(tuple(scale_schedule))
@@ -349,30 +371,112 @@ class InfinityNormalPrefixModel(Infinity):
         normal_schedule: list[tuple[int, int, int]],
         device: torch.device,
     ) -> dict[str, Any]:
-        key = f"{device}:{tuple(prefix_schedule)}:{tuple(normal_schedule)}"
+        key = f"{self.normal_token_layout}:{device}:{tuple(prefix_schedule)}:{tuple(normal_schedule)}"
         layout = self.normal_prefix_layout_cache.get(key)
         if layout is not None:
             return layout
 
         prefix_len = _scale_seq_len(prefix_schedule)
         normal_len = _scale_seq_len(normal_schedule)
-        prefix_stage_ids = _stage_ids_for_schedule(prefix_schedule, device)
-        normal_stage_ids = _stage_ids_for_schedule(normal_schedule, device)
-        stage_ids = torch.cat((prefix_stage_ids, normal_stage_ids), dim=0)
+        if self.normal_token_layout == "prefix":
+            prefix_stage_ids = _stage_ids_for_schedule(prefix_schedule, device)
+            normal_stage_ids = _stage_ids_for_schedule(normal_schedule, device)
+            stage_ids = torch.cat((prefix_stage_ids, normal_stage_ids), dim=0)
+            normal_token_indices = torch.arange(prefix_len, prefix_len + normal_len, dtype=torch.long, device=device)
+            sequence_schedule = list(prefix_schedule) + list(normal_schedule)
+            sequence_source_indices = list(range(len(prefix_schedule))) + list(range(len(normal_schedule)))
 
-        segments: list[tuple[int, int, int]] = [(0, prefix_len, prefix_len)]
-        start = prefix_len
-        for pt, ph, pw in normal_schedule:
-            end = start + int(pt) * int(ph) * int(pw)
-            segments.append((start, end, end))
-            start = end
+            segments: list[tuple[int, int, int]] = [(0, prefix_len, prefix_len)]
+            start = prefix_len
+            for pt, ph, pw in normal_schedule:
+                end = start + int(pt) * int(ph) * int(pw)
+                segments.append((start, end, end))
+                start = end
+            segment_key_indices = None
+        elif self.normal_token_layout == "interleaved":
+            if len(prefix_schedule) != len(normal_schedule):
+                raise ValueError(
+                    "interleaved normal token layout requires matching RGB and normal schedule lengths; "
+                    f"got RGB={len(prefix_schedule)} normal={len(normal_schedule)}."
+                )
+            stage_ids_list: list[torch.Tensor] = []
+            normal_token_indices_list: list[torch.Tensor] = []
+            sequence_schedule = []
+            sequence_source_indices = []
+            segments = []
+            start = 0
+            for stage_index, ((r_pt, r_ph, r_pw), (n_pt, n_ph, n_pw)) in enumerate(zip(prefix_schedule, normal_schedule, strict=True)):
+                if (r_pt, r_ph, r_pw) != (n_pt, n_ph, n_pw):
+                    raise ValueError("interleaved normal token layout requires aligned RGB and normal schedules.")
+                rgb_len = int(r_pt) * int(r_ph) * int(r_pw)
+                normal_stage_len = int(n_pt) * int(n_ph) * int(n_pw)
+                stage_ids_list.append(torch.full((rgb_len,), stage_index, dtype=torch.long, device=device))
+                stage_ids_list.append(torch.full((normal_stage_len,), stage_index, dtype=torch.long, device=device))
+                rgb_end = start + rgb_len
+                normal_end = rgb_end + normal_stage_len
+                normal_indices = torch.arange(rgb_end, normal_end, dtype=torch.long, device=device)
+                normal_token_indices_list.append(normal_indices)
+                sequence_schedule.extend([(r_pt, r_ph, r_pw), (n_pt, n_ph, n_pw)])
+                sequence_source_indices.extend([stage_index, stage_index])
+                segments.append((start, rgb_end, rgb_end))
+                segments.append((rgb_end, normal_end, normal_end))
+                start = normal_end
+            stage_ids = torch.cat(stage_ids_list, dim=0)
+            normal_stage_ids = _stage_ids_for_schedule(normal_schedule, device)
+            normal_token_indices = torch.cat(normal_token_indices_list, dim=0)
+            segment_key_indices = None
+        else:
+            if len(prefix_schedule) != len(normal_schedule):
+                raise ValueError(
+                    "interleaved_source normal token layout requires matching RGB and normal schedule lengths; "
+                    f"got RGB={len(prefix_schedule)} normal={len(normal_schedule)}."
+                )
+            stage_ids_list = []
+            normal_token_indices_list = []
+            sequence_schedule = []
+            sequence_source_indices = []
+            segments = []
+            segment_key_indices_list: list[torch.Tensor] = []
+            start = 0
+            rgb_seen_indices: list[torch.Tensor] = []
+            visible_seen_indices: list[torch.Tensor] = []
+            for stage_index, ((r_pt, r_ph, r_pw), (n_pt, n_ph, n_pw)) in enumerate(zip(prefix_schedule, normal_schedule, strict=True)):
+                if (r_pt, r_ph, r_pw) != (n_pt, n_ph, n_pw):
+                    raise ValueError("interleaved_source normal token layout requires aligned RGB and normal schedules.")
+                rgb_len = int(r_pt) * int(r_ph) * int(r_pw)
+                normal_stage_len = int(n_pt) * int(n_ph) * int(n_pw)
+                stage_ids_list.append(torch.full((rgb_len,), stage_index, dtype=torch.long, device=device))
+                stage_ids_list.append(torch.full((normal_stage_len,), stage_index, dtype=torch.long, device=device))
+                rgb_end = start + rgb_len
+                normal_end = rgb_end + normal_stage_len
+                rgb_indices = torch.arange(start, rgb_end, dtype=torch.long, device=device)
+                normal_indices = torch.arange(rgb_end, normal_end, dtype=torch.long, device=device)
+                rgb_seen_indices.append(rgb_indices)
+                visible_seen_indices.append(rgb_indices)
+                normal_token_indices_list.append(normal_indices)
+                sequence_schedule.extend([(r_pt, r_ph, r_pw), (n_pt, n_ph, n_pw)])
+                sequence_source_indices.extend([stage_index, stage_index])
+                segments.append((start, rgb_end, rgb_end))
+                segment_key_indices_list.append(torch.cat(rgb_seen_indices, dim=0))
+                segments.append((rgb_end, normal_end, normal_end))
+                segment_key_indices_list.append(torch.cat(visible_seen_indices + [normal_indices], dim=0))
+                visible_seen_indices.append(normal_indices)
+                start = normal_end
+            stage_ids = torch.cat(stage_ids_list, dim=0)
+            normal_stage_ids = _stage_ids_for_schedule(normal_schedule, device)
+            normal_token_indices = torch.cat(normal_token_indices_list, dim=0)
+            segment_key_indices = tuple(segment_key_indices_list)
 
         layout = {
             "prefix_len": prefix_len,
             "normal_len": normal_len,
-            "normal_stage_ids": normal_stage_ids,
             "stage_ids": stage_ids,
+            "normal_stage_ids": normal_stage_ids,
+            "normal_token_indices": normal_token_indices,
+            "sequence_schedule": sequence_schedule,
+            "sequence_source_indices": sequence_source_indices,
             "segments": tuple(segments),
+            "segment_key_indices": segment_key_indices,
         }
         self.normal_prefix_layout_cache[key] = layout
         return layout
@@ -388,28 +492,34 @@ class InfinityNormalPrefixModel(Infinity):
     def _normal_prefix_flex_attn(
         self,
         *,
-        prefix_len: int,
         stage_ids: torch.Tensor,
         batch_size: int,
+        segments: tuple[tuple[int, int, int], ...],
+        segment_key_indices: tuple[torch.Tensor, ...] | None,
     ):
         if not self.normal_use_flex_attn:
             return None
         if self.normal_flex_attention is None:
             raise RuntimeError("Normal FlexAttention was not initialized.")
 
-        stage_ids = stage_ids.to(dtype=torch.int32, device=stage_ids.device)
-        key = f"{batch_size}:{self.num_heads}:{prefix_len}:{stage_ids.device}:{tuple(int(item) for item in stage_ids.detach().cpu().tolist())}"
+        if segment_key_indices is None:
+            key_end_by_query = torch.empty(stage_ids.shape[0], dtype=torch.int32, device=stage_ids.device)
+            for query_start, query_end, key_end in segments:
+                key_end_by_query[query_start:query_end] = int(key_end)
+            key = f"{batch_size}:{self.num_heads}:{stage_ids.device}:{tuple(segments)}"
+        else:
+            visible = torch.zeros((stage_ids.shape[0], stage_ids.shape[0]), dtype=torch.bool, device=stage_ids.device)
+            for (query_start, query_end, _), key_indices in zip(segments, segment_key_indices, strict=True):
+                visible[query_start:query_end, key_indices] = True
+            key = f"{batch_size}:{self.num_heads}:{stage_ids.device}:{tuple(segments)}:{tuple(tuple(int(v) for v in item.detach().cpu().tolist()) for item in segment_key_indices)}"
         block_mask = self.normal_flex_block_masks.get(key)
         if block_mask is None:
-            prefix_len_int = int(prefix_len)
-            stage_ids_for_mask = stage_ids
-
-            def normal_prefix_mask(_b, _h, q_idx, kv_idx):
-                q_is_prefix = q_idx < prefix_len_int
-                kv_is_prefix = kv_idx < prefix_len_int
-                q_stage = stage_ids_for_mask[q_idx]
-                kv_stage = stage_ids_for_mask[kv_idx]
-                return (q_is_prefix & kv_is_prefix) | ((~q_is_prefix) & (kv_is_prefix | (q_stage >= kv_stage)))
+            if segment_key_indices is None:
+                def normal_prefix_mask(_b, _h, q_idx, kv_idx):
+                    return kv_idx < key_end_by_query[q_idx]
+            else:
+                def normal_prefix_mask(_b, _h, q_idx, kv_idx):
+                    return visible[q_idx, kv_idx]
 
             block_mask = create_block_mask(
                 normal_prefix_mask,
@@ -431,35 +541,20 @@ class InfinityNormalPrefixModel(Infinity):
         self,
         *,
         segments: tuple[tuple[int, int, int], ...],
+        segment_key_indices: tuple[torch.Tensor, ...] | None,
     ):
         if not self.normal_use_segmented_flash_attn:
             return None
         if normal_flash_attn_func is None:
             raise RuntimeError("flash-attn was not initialized.")
-        force_contiguous = os.environ.get("INFINITY_NORMAL_SEGMENTED_FLASH_CONTIG", "").strip().lower() in {"1", "true", "yes", "y"}
-
+        if segment_key_indices is not None:
+            raise NotImplementedError("Segmented flash attention only supports contiguous-prefix normal layouts.")
         def attn_fn(q, k, v, scale=None):
-            if force_contiguous:
-                pieces = []
-                for query_start, query_end, key_end in segments:
-                    q_part = q[:, query_start:query_end, :, :].contiguous()
-                    k_part = k[:, :key_end, :, :].contiguous()
-                    v_part = v[:, :key_end, :, :].contiguous()
-                    out = normal_flash_attn_func(
-                        q_part.to(v_part.dtype),
-                        k_part.to(v_part.dtype),
-                        v_part,
-                        dropout_p=0,
-                        softmax_scale=scale,
-                    )
-                    pieces.append(out)
-                return torch.cat(pieces, dim=1)
-
             pieces = []
             for query_start, query_end, key_end in segments:
-                q_part = q[:, query_start:query_end, :, :]
-                k_part = k[:, :key_end, :, :]
-                v_part = v[:, :key_end, :, :]
+                q_part = q[:, query_start:query_end, :, :].contiguous()
+                k_part = k[:, :key_end, :, :].contiguous()
+                v_part = v[:, :key_end, :, :].contiguous()
                 out = normal_flash_attn_func(
                     q_part.to(v_part.dtype),
                     k_part.to(v_part.dtype),
@@ -489,9 +584,21 @@ class InfinityNormalPrefixModel(Infinity):
         if normal_input_emb.shape[1] != normal_len:
             raise ValueError(f"Normal input length {normal_input_emb.shape[1]} does not match schedule length {normal_len}.")
 
-        x = torch.cat((rgb_prefix_emb, normal_input_emb), dim=1)
-        normal_stage_ids = layout["normal_stage_ids"]
+        if self.normal_token_layout == "prefix":
+            x = torch.cat((rgb_prefix_emb, normal_input_emb), dim=1)
+        else:
+            pieces: list[torch.Tensor] = []
+            for (rgb_start, rgb_end), (normal_start, normal_end) in zip(
+                _stage_offsets(prefix_schedule),
+                _stage_offsets(normal_schedule),
+                strict=True,
+            ):
+                pieces.append(rgb_prefix_emb[:, rgb_start:rgb_end])
+                pieces.append(normal_input_emb[:, normal_start:normal_end])
+            x = torch.cat(pieces, dim=1)
         stage_ids = layout["stage_ids"]
+        normal_token_indices = layout["normal_token_indices"]
+        segment_key_indices = layout["segment_key_indices"]
 
         l_end = x.shape[1]
         need_to_pad = (l_end + self.pad_to_multiplier - 1) // self.pad_to_multiplier * self.pad_to_multiplier - l_end
@@ -501,22 +608,25 @@ class InfinityNormalPrefixModel(Infinity):
             attn_bias = x.new_empty(0)
         else:
             attn_bias = x.new_full((1, 1, l_end, l_end), -torch.inf)
-            attn_bias[:, :, :prefix_len, :prefix_len] = 0
-            attn_bias[:, :, prefix_len:l_end, :prefix_len] = 0
-            normal_mask = torch.where(
-                normal_stage_ids.view(-1, 1) >= normal_stage_ids.view(1, -1),
-                0.0,
-                -torch.inf,
-            ).to(device=x.device, dtype=x.dtype)
-            attn_bias[:, :, prefix_len:l_end, prefix_len:l_end] = normal_mask
+            if segment_key_indices is None:
+                for query_start, query_end, key_end in layout["segments"]:
+                    attn_bias[:, :, query_start:query_end, :key_end] = 0
+            else:
+                for (query_start, query_end, _), key_indices in zip(layout["segments"], segment_key_indices, strict=True):
+                    attn_bias[:, :, query_start:query_end, key_indices] = 0
 
         if need_to_pad:
             attn_bias = F.pad(attn_bias, (0, need_to_pad, 0, need_to_pad), value=-torch.inf)
             attn_bias[0, 0, l_end:, 0] = 0
             x = F.pad(x, (0, 0, 0, need_to_pad))
 
-        rope_schedule = self._ensure_prefix_rope_cache(prefix_schedule, normal_schedule, x.shape[1])
-        return x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, layout["segments"]
+        rope_schedule = self._ensure_sequence_rope_cache(
+            layout["sequence_schedule"],
+            layout["sequence_source_indices"],
+            prefix_schedule,
+            x.shape[1],
+        )
+        return x, attn_bias, rope_schedule, stage_ids, normal_token_indices, normal_len, layout["segments"], segment_key_indices
 
     def _run_prefix_blocks(
         self,
@@ -590,16 +700,17 @@ class InfinityNormalPrefixModel(Infinity):
         x: torch.Tensor,
         attn_bias: torch.Tensor,
         segments: tuple[tuple[int, int, int], ...],
-        prefix_len: int,
+        segment_key_indices: tuple[torch.Tensor, ...] | None,
         stage_ids: torch.Tensor,
         batch_size: int,
     ) -> tuple[torch.Tensor, Any | None]:
-        attn_fn = self._normal_prefix_segmented_flash_attn(segments=segments)
+        attn_fn = self._normal_prefix_segmented_flash_attn(segments=segments, segment_key_indices=segment_key_indices)
         if attn_fn is None:
             attn_fn = self._normal_prefix_flex_attn(
-                prefix_len=prefix_len,
                 stage_ids=stage_ids,
                 batch_size=batch_size,
+                segments=segments,
+                segment_key_indices=segment_key_indices,
             )
         if attn_fn is not None:
             return attn_bias, attn_fn
@@ -620,7 +731,7 @@ class InfinityNormalPrefixModel(Infinity):
             sos, cond_BD, cond_BD_or_gss, ca_kv = self._task_condition(batch_size)
             rgb_prefix_emb = self._embed_rgb_prefix(rgb_prefix_blc)
             normal_input_emb = self._embed_normal_inputs(normal_x_blc_wo_prefix, sos)
-            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, segments = self._prepare_prefix_sequence(
+            x, attn_bias, rope_schedule, stage_ids, normal_token_indices, normal_len, segments, segment_key_indices = self._prepare_prefix_sequence(
                 rgb_prefix_emb=rgb_prefix_emb,
                 normal_input_emb=normal_input_emb,
                 prefix_schedule=scale_schedule,
@@ -630,7 +741,7 @@ class InfinityNormalPrefixModel(Infinity):
                 x=x,
                 attn_bias=attn_bias,
                 segments=segments,
-                prefix_len=prefix_len,
+                segment_key_indices=segment_key_indices,
                 stage_ids=stage_ids,
                 batch_size=batch_size,
             )
@@ -646,7 +757,7 @@ class InfinityNormalPrefixModel(Infinity):
             stage_ids=stage_ids,
             attn_fn=attn_fn,
         )
-        hidden = x[:, prefix_len : prefix_len + normal_len]
+        hidden = x.index_select(1, normal_token_indices)
         return self.get_logits(hidden, cond_BD)
 
     def _iter_inference_blocks(self):
@@ -721,7 +832,12 @@ class InfinityNormalPrefixModel(Infinity):
         rgb_prefix_emb = self._embed_rgb_prefix(rgb_prefix_blc.float())
         prefix_stage_ids = _stage_ids_for_schedule(scale_schedule, rgb_prefix_emb.device)
         prefix_len = _scale_seq_len(scale_schedule)
-        full_rope_schedule = self._ensure_prefix_rope_cache(scale_schedule, scale_schedule, 2 * prefix_len)
+        full_rope_schedule = self._ensure_sequence_rope_cache(
+            list(scale_schedule) + list(scale_schedule),
+            list(range(len(scale_schedule))) + list(range(len(scale_schedule))),
+            scale_schedule,
+            2 * prefix_len,
+        )
 
         self._set_kv_caching(True)
         try:
@@ -826,7 +942,7 @@ class InfinityNormalPrefixModel(Infinity):
             "yes",
             "y",
         }
-        if not disable_fast_ar:
+        if not disable_fast_ar and self.normal_token_layout == "prefix":
             return self.autoregressive_infer_prefix_fast(
                 vae=vae,
                 rgb_prefix_blc=rgb_prefix_blc,
@@ -863,17 +979,19 @@ class InfinityNormalPrefixModel(Infinity):
 
             normal_input_emb = torch.cat(normal_embeds, dim=1)
             normal_schedule = scale_schedule[: scale_index + 1]
-            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, segments = self._prepare_prefix_sequence(
-                rgb_prefix_emb=rgb_prefix_emb,
+            current_prefix_schedule = scale_schedule if self.normal_token_layout == "prefix" else normal_schedule
+            current_prefix_len = _scale_seq_len(current_prefix_schedule)
+            x, attn_bias, rope_schedule, stage_ids, normal_token_indices, normal_len, segments, segment_key_indices = self._prepare_prefix_sequence(
+                rgb_prefix_emb=rgb_prefix_emb[:, :current_prefix_len],
                 normal_input_emb=normal_input_emb,
-                prefix_schedule=scale_schedule,
+                prefix_schedule=current_prefix_schedule,
                 normal_schedule=normal_schedule,
             )
             attn_bias, attn_fn = self._prefix_attention_for_sequence(
                 x=x,
                 attn_bias=attn_bias,
                 segments=segments,
-                prefix_len=prefix_len,
+                segment_key_indices=segment_key_indices,
                 stage_ids=stage_ids,
                 batch_size=batch_size,
             )
@@ -886,7 +1004,7 @@ class InfinityNormalPrefixModel(Infinity):
                 stage_ids=stage_ids,
                 attn_fn=attn_fn,
             )
-            logits = self.get_logits(x[:, prefix_len + normal_len - stage_len : prefix_len + normal_len], cond_BD)
+            logits = self.get_logits(x.index_select(1, normal_token_indices[-stage_len:]), cond_BD)
             logits = logits.mul(1.0 / max(float(tau), 1e-6))
 
             if self.use_bit_label:
@@ -970,17 +1088,19 @@ class InfinityNormalPrefixModel(Infinity):
 
             normal_input_emb = torch.cat(normal_embeds, dim=1)
             normal_schedule = scale_schedule[: scale_index + 1]
-            x, attn_bias, rope_schedule, stage_ids, prefix_len, normal_len, segments = self._prepare_prefix_sequence(
-                rgb_prefix_emb=rgb_prefix_emb,
+            current_prefix_schedule = scale_schedule if self.normal_token_layout == "prefix" else normal_schedule
+            current_prefix_len = _scale_seq_len(current_prefix_schedule)
+            x, attn_bias, rope_schedule, stage_ids, normal_token_indices, normal_len, segments, segment_key_indices = self._prepare_prefix_sequence(
+                rgb_prefix_emb=rgb_prefix_emb[:, :current_prefix_len],
                 normal_input_emb=normal_input_emb,
-                prefix_schedule=scale_schedule,
+                prefix_schedule=current_prefix_schedule,
                 normal_schedule=normal_schedule,
             )
             attn_bias, attn_fn = self._prefix_attention_for_sequence(
                 x=x,
                 attn_bias=attn_bias,
                 segments=segments,
-                prefix_len=prefix_len,
+                segment_key_indices=segment_key_indices,
                 stage_ids=stage_ids,
                 batch_size=batch_size,
             )
@@ -993,7 +1113,7 @@ class InfinityNormalPrefixModel(Infinity):
                 stage_ids=stage_ids,
                 attn_fn=attn_fn,
             )
-            logits = self.get_logits(x[:, prefix_len + normal_len - stage_len : prefix_len + normal_len], cond_BD)
+            logits = self.get_logits(x.index_select(1, normal_token_indices[-stage_len:]), cond_BD)
             logits = logits.mul(1.0 / max(float(tau), 1e-6))
 
             if self.use_bit_label:
@@ -1093,6 +1213,7 @@ def build_infinity_normal_model(
     apply_spatial_patchify: bool,
     device: torch.device,
     checkpointing: str | None = "full-block",
+    normal_token_layout: str = "prefix",
     normal_use_flex_attn: bool = False,
     normal_use_segmented_flash_attn: bool = False,
     normal_bf16_activations: bool = False,
@@ -1108,6 +1229,7 @@ def build_infinity_normal_model(
         text_channels=text_channels,
         text_maxlen=text_maxlen,
         task_condition_len=task_condition_len,
+        normal_token_layout=normal_token_layout,
         normal_use_flex_attn=normal_use_flex_attn,
         normal_use_segmented_flash_attn=normal_use_segmented_flash_attn,
         normal_bf16_activations=normal_bf16_activations,
