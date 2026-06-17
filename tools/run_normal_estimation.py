@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import sys
@@ -26,6 +27,7 @@ from infinity.normal_estimation import (  # noqa: E402
     normals_to_vis,
     resolve_scale_schedule_from_hw,
 )
+from infinity.models.basic import precompute_rope2d_freqs_grid  # noqa: E402
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -48,6 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--add-lvl-embeding-only-first-block", type=int, choices=(0, 1), default=None)
     parser.add_argument("--rope2d-each-sa-layer", type=int, choices=(0, 1), default=None)
     parser.add_argument("--rope2d-normalized-by-hw", type=int, choices=(0, 1, 2), default=None)
+    parser.add_argument("--normal-use-flex-attn", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--normal-use-segmented-flash-attn", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--normal-bf16-activations", type=int, choices=(0, 1), default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument("--top-p", type=float, default=0.0)
@@ -60,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timing-repeats", type=int, default=5)
     parser.add_argument("--normal-kv-cache-fast", action="store_true", help="Deprecated; KV-cache AR is enabled by default.")
     parser.add_argument("--normal-disable-kv-cache-fast", action="store_true", help="Disable default KV-cache AR path for debugging.")
+    parser.add_argument(
+        "--force-original-resolution",
+        action="store_true",
+        help="Experimental: skip input resizing and build an oversized schedule/cache for the original image size.",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +121,67 @@ def _sync_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _model_precision_context(model: torch.nn.Module, device: torch.device):
+    if device.type == "cuda" and bool(getattr(model, "normal_bf16_activations", False)):
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def _scale_schedule_to_original_resolution(
+    *,
+    base_schedule: list[tuple[int, int, int]],
+    original_height: int,
+    original_width: int,
+) -> list[tuple[int, int, int]]:
+    if original_height % 16 != 0 or original_width % 16 != 0:
+        raise ValueError(
+            "--force-original-resolution requires image height and width divisible by 16; "
+            f"got {original_height}x{original_width}."
+        )
+    final_h = original_height // 16
+    final_w = original_width // 16
+    _, base_final_h, base_final_w = base_schedule[-1]
+    scaled: list[tuple[int, int, int]] = []
+    for index, (pt, ph, pw) in enumerate(base_schedule):
+        if index == len(base_schedule) - 1:
+            scaled.append((int(pt), final_h, final_w))
+            continue
+        scaled_h = max(1, int(round(float(ph) / float(base_final_h) * float(final_h))))
+        scaled_w = max(1, int(round(float(pw) / float(base_final_w) * float(final_w))))
+        scaled.append((int(pt), scaled_h, scaled_w))
+    return scaled
+
+
+def _scale_schedule_tokens(scale_schedule: list[tuple[int, int, int]]) -> int:
+    return int(sum(int(pt) * int(ph) * int(pw) for pt, ph, pw in scale_schedule))
+
+
+def _ensure_custom_rope_cache(model: torch.nn.Module, scale_schedule: list[tuple[int, int, int]]) -> None:
+    if not getattr(model, "rope2d_each_sa_layer", 0):
+        return
+    rope_key = str(tuple(scale_schedule))
+    if rope_key in model.rope2d_freqs_grid:
+        return
+    max_h = max(2048 // 16, *(int(item[1]) for item in scale_schedule))
+    max_w = max(2048 // 16, *(int(item[2]) for item in scale_schedule))
+    custom_resolution = {
+        "original": {
+            "1M": {
+                "scales": [(int(pt), int(ph), int(pw)) for pt, ph, pw in scale_schedule],
+            }
+        }
+    }
+    cache = precompute_rope2d_freqs_grid(
+        dim=model.C // model.num_heads,
+        dynamic_resolution_h_w=custom_resolution,
+        rope2d_normalized_by_hw=model.rope2d_normalized_by_hw,
+        pad_to_multiplier=model.pad_to_multiplier,
+        max_height=max_h,
+        max_width=max_w,
+    )
+    model.rope2d_freqs_grid.update(cache)
+
+
 def _predict_normal(
     *,
     image_tensor: torch.Tensor,
@@ -129,15 +200,16 @@ def _predict_normal(
         scale_schedule=scale_schedule,
         apply_spatial_patchify=rgb_apply_spatial_patchify,
     )
-    return model.autoregressive_infer_prefix(
-        vae=normal_vae,
-        rgb_prefix_blc=rgb_prefix_blc,
-        scale_schedule=scale_schedule,
-        tau=args.tau,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        vae_type=normal_vae_type,
-    )
+    with _model_precision_context(model, device):
+        return model.autoregressive_infer_prefix(
+            vae=normal_vae,
+            rgb_prefix_blc=rgb_prefix_blc,
+            scale_schedule=scale_schedule,
+            tau=args.tau,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            vae_type=normal_vae_type,
+        )
 
 
 def _predict_normal_with_uncertainty(
@@ -158,15 +230,16 @@ def _predict_normal_with_uncertainty(
         scale_schedule=scale_schedule,
         apply_spatial_patchify=rgb_apply_spatial_patchify,
     )
-    return model.autoregressive_infer_prefix_with_uncertainty(
-        vae=normal_vae,
-        rgb_prefix_blc=rgb_prefix_blc,
-        scale_schedule=scale_schedule,
-        tau=args.tau,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        vae_type=normal_vae_type,
-    )
+    with _model_precision_context(model, device):
+        return model.autoregressive_infer_prefix_with_uncertainty(
+            vae=normal_vae,
+            rgb_prefix_blc=rgb_prefix_blc,
+            scale_schedule=scale_schedule,
+            tau=args.tau,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            vae_type=normal_vae_type,
+        )
 
 
 def main() -> int:
@@ -204,6 +277,13 @@ def main() -> int:
     rope2d_normalized_by_hw = int(
         _resolve_option(args.rope2d_normalized_by_hw, checkpoint_args, "rope2d_normalized_by_hw", 2)
     )
+    normal_use_flex_attn = bool(int(_resolve_option(args.normal_use_flex_attn, checkpoint_args, "normal_use_flex_attn", 0)))
+    normal_use_segmented_flash_attn = bool(
+        int(_resolve_option(args.normal_use_segmented_flash_attn, checkpoint_args, "normal_use_segmented_flash_attn", 0))
+    )
+    normal_bf16_activations = bool(
+        int(_resolve_option(args.normal_bf16_activations, checkpoint_args, "normal_bf16_activations", 0))
+    )
 
     if normal_vae_ckpt is None or rgb_vae_ckpt is None:
         raise ValueError("Both --normal-vae-ckpt and --rgb-vae-ckpt must be provided, either explicitly or via the training checkpoint.")
@@ -239,6 +319,9 @@ def main() -> int:
         rope2d_each_sa_layer=rope2d_each_sa_layer,
         rope2d_normalized_by_hw=rope2d_normalized_by_hw,
         apply_spatial_patchify=normal_apply_spatial_patchify,
+        normal_use_flex_attn=normal_use_flex_attn,
+        normal_use_segmented_flash_attn=normal_use_segmented_flash_attn,
+        normal_bf16_activations=normal_bf16_activations,
         device=device,
     )
     missing, unexpected = load_infinity_state_dict(model, str(model_path))
@@ -250,8 +333,33 @@ def main() -> int:
         with Image.open(image_path) as image_handle:
             image = image_handle.convert("RGB")
             original_width, original_height = image.size
-            _, scale_schedule, target_hw = resolve_scale_schedule_from_hw(original_height, original_width, pn)
-            resized = image.resize((target_hw[1], target_hw[0]), resample=Image.LANCZOS)
+            _, base_scale_schedule, target_hw = resolve_scale_schedule_from_hw(original_height, original_width, pn)
+            if args.force_original_resolution:
+                scale_schedule = _scale_schedule_to_original_resolution(
+                    base_schedule=base_scale_schedule,
+                    original_height=original_height,
+                    original_width=original_width,
+                )
+                target_hw = (original_height, original_width)
+                _ensure_custom_rope_cache(model, scale_schedule)
+                print(
+                    json.dumps(
+                        {
+                            "image": str(image_path),
+                            "force_original_resolution": True,
+                            "target_height": target_hw[0],
+                            "target_width": target_hw[1],
+                            "scale_schedule": scale_schedule,
+                            "tokens": _scale_schedule_tokens(scale_schedule),
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                resized = image
+            else:
+                scale_schedule = base_scale_schedule
+                resized = image.resize((target_hw[1], target_hw[0]), resample=Image.LANCZOS)
             image_np = np.asarray(resized, dtype=np.float32) / 255.0
             image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to(device)
 
@@ -336,6 +444,10 @@ def main() -> int:
                 "image": str(image_path),
                 "height": int(original_height),
                 "width": int(original_width),
+                "model_input_height": int(target_hw[0]),
+                "model_input_width": int(target_hw[1]),
+                "force_original_resolution": bool(args.force_original_resolution),
+                "tokens": _scale_schedule_tokens(scale_schedule),
                 "warmup": int(max(0, args.timing_warmup)),
                 "repeats": int(max(1, args.timing_repeats)),
                 "repeat_inference_seconds": repeat_seconds,

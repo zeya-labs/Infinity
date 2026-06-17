@@ -67,6 +67,27 @@ The current normal tokenizer and RGB-to-normal training defaults validate on Hyp
 interpreting metrics after adding VKITTI2 to training: VKITTI2 improves outdoor coverage but is not reflected in the
 default validation split unless a separate VKITTI2 validation workflow is added.
 
+## Upload Checkpoints to Hugging Face
+
+Install the Hub client and authenticate without writing tokens into the repository:
+
+```bash
+python -m pip install huggingface_hub
+export HF_TOKEN=<your-token>
+```
+
+Upload a normal-estimation checkpoint:
+
+```bash
+python scripts/upload_hf_checkpoint.py \
+  --repo-id <user-or-org>/<repo-name> \
+  --checkpoint outputs/normal_estimation/<run>/checkpoints/<checkpoint>.pth \
+  --path-in-repo checkpoints/<checkpoint>.pth
+```
+
+Use `--dry-run` first to confirm the target repository path. Add `--create-repo --private` when the model repository
+should be created as a private Hub repository before uploading.
+
 ## Regression Tests
 
 Run the lightweight tests with:

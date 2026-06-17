@@ -62,6 +62,7 @@ VOLC_DEFAULT_RESOURCE_MEMORY = os.environ.get("INFINITY_VOLC_RESOURCE_MEMORY", "
 VOLC_DEFAULT_PRIORITY = os.environ.get("INFINITY_VOLC_PRIORITY", "6")
 VOLC_DEFAULT_RETRY_TIMES = os.environ.get("INFINITY_VOLC_RETRY_TIMES", "5")
 VOLC_DEFAULT_RETRY_INTERVAL_SECONDS = os.environ.get("INFINITY_VOLC_RETRY_INTERVAL_SECONDS", "120")
+DEFAULT_HF_UPLOAD_PROXY = os.environ.get("INFINITY_HF_UPLOAD_PROXY", "http://100.68.162.212:3128")
 NORMAL_LR_FIELDS = (
     "lr",
     "min_lr",
@@ -86,6 +87,7 @@ NORMAL_LR_ABLATIONS = {
 }
 DEFAULT_NORMAL_RUNS_DIR = ROOT / "outputs" / "normal_estimation"
 DEFAULT_NORMAL_CKPT_DIR = DEFAULT_NORMAL_RUNS_DIR / "latest" / "checkpoints"
+
 
 @dataclass
 class Field:
@@ -190,6 +192,13 @@ def shell_join_volc_command(cmd: list[str]) -> str:
 def shell_export(env: dict[str, str]) -> str:
     keys = ["PYTHONPATH", "PYTORCH_CUDA_ALLOC_CONF", "CUDA_VISIBLE_DEVICES"]
     return " ".join(f"{key}={shlex.quote(env[key])}" for key in keys if env.get(key))
+
+
+def hidden_shell_exports(env: dict[str, str]) -> str:
+    visible_keys = {"PYTHONPATH", "PYTORCH_CUDA_ALLOC_CONF", "CUDA_VISIBLE_DEVICES"}
+    return "; ".join(
+        f"export {key}={shlex.quote(value)}" for key, value in env.items() if key not in visible_keys and value != ""
+    )
 
 
 def pretty_command(cmd: list[str]) -> str:
@@ -353,6 +362,39 @@ def common_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def read_dotenv(path: Path = ROOT / ".env") -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        values[key] = value.strip().strip("'\"")
+    return values
+
+
+def hf_upload_env(values: dict[str, str]) -> dict[str, str]:
+    dotenv = read_dotenv()
+    token = os.environ.get("HF_TOKEN") or dotenv.get("HF_TOKEN", "")
+    proxy = os.environ.get("INFINITY_HF_UPLOAD_PROXY", DEFAULT_HF_UPLOAD_PROXY).strip()
+    env = {"HF_TOKEN": token} if token else {}
+    if proxy:
+        env.update(
+            {
+                "http_proxy": proxy,
+                "HTTP_PROXY": proxy,
+                "https_proxy": proxy,
+                "HTTPS_PROXY": proxy,
+            }
+        )
+    return env
+
+
 def volc_cli_env() -> dict[str, str]:
     env = os.environ.copy()
     volc_bin = str(Path(VOLC).parent) if Path(VOLC).exists() else str(Path.home() / ".volc" / "bin")
@@ -442,9 +484,7 @@ def write_yaml(path: Path, data: dict[str, object]) -> None:
 def remove_empty_config(value: object) -> object:
     if isinstance(value, dict):
         return {
-            key: cleaned
-            for key, item in value.items()
-            if (cleaned := remove_empty_config(item)) not in ("", [], {})
+            key: cleaned for key, item in value.items() if (cleaned := remove_empty_config(item)) not in ("", [], {})
         }
     if isinstance(value, list):
         return [cleaned for item in value if (cleaned := remove_empty_config(item)) not in ("", [], {})]
@@ -617,7 +657,12 @@ def volc_resource_spec(config: VolcConfig, gpus_per_worker: int, worker_count: i
         if flavor:
             spec["Flavor"] = flavor
             return spec
-    if config.flavor and config.flavor != "custom" and worker_count == 1 and gpus_per_worker == parse_positive_int(config.gpus, "Volc GPU 数"):
+    if (
+        config.flavor
+        and config.flavor != "custom"
+        and worker_count == 1
+        and gpus_per_worker == parse_positive_int(config.gpus, "Volc GPU 数")
+    ):
         spec["Flavor"] = config.flavor
         return spec
     base_gpus = parse_positive_int(config.gpus, "Volc GPU 数")
@@ -646,9 +691,7 @@ def volc_distributed_command(command: list[str], worker_count: int, gpus_per_wor
         launcher_name == "torchrun"
         or command[:3] == [PYTHON, "-m", "torch.distributed.run"]
         or (
-            len(command) >= 3
-            and launcher_name.startswith("python")
-            and command[1:3] == ["-m", "torch.distributed.run"]
+            len(command) >= 3 and launcher_name.startswith("python") and command[1:3] == ["-m", "torch.distributed.run"]
         )
     )
     if worker_count <= 1 or not is_torchrun:
@@ -670,16 +713,18 @@ def volc_distributed_command(command: list[str], worker_count: int, gpus_per_wor
             index += 1
             continue
         if not inserted and (part.endswith(".py") or part.endswith(".sh")):
-            transformed.extend([
-                "--nnodes",
-                "__MLP_WORKER_NUM__",
-                "--node_rank",
-                "__MLP_ROLE_INDEX__",
-                "--master_addr",
-                "__MLP_WORKER_0_HOST__",
-                "--master_port",
-                "__MLP_WORKER_0_PORT__",
-            ])
+            transformed.extend(
+                [
+                    "--nnodes",
+                    "__MLP_WORKER_NUM__",
+                    "--node_rank",
+                    "__MLP_ROLE_INDEX__",
+                    "--master_addr",
+                    "__MLP_WORKER_0_HOST__",
+                    "--master_port",
+                    "__MLP_WORKER_0_PORT__",
+                ]
+            )
             inserted = True
         transformed.append(part)
         index += 1
@@ -739,8 +784,8 @@ def build_volc_entrypoint(task: Task, values: dict[str, str], config: VolcConfig
         lines.extend(auto_resume_lines)
         lines += [
             'if [ -n "$AUTO_RESUME_ARG" ]; then',
-            f"  echo {shlex.quote('$ ' + command_line)} \"$AUTO_RESUME_ARG\" \"$AUTO_RESUME_PATH\"",
-            f"  {command_line} \"$AUTO_RESUME_ARG\" \"$AUTO_RESUME_PATH\"",
+            f'  echo {shlex.quote("$ " + command_line)} "$AUTO_RESUME_ARG" "$AUTO_RESUME_PATH"',
+            f'  {command_line} "$AUTO_RESUME_ARG" "$AUTO_RESUME_PATH"',
             "else",
             f"  echo {shlex.quote('$ ' + command_line)}",
             f"  {command_line}",
@@ -780,24 +825,26 @@ def build_volc_task_config(
     runtime_values = volc_runtime_values(task, values, gpus_per_worker)
     entrypoint, command_line = build_volc_entrypoint(task, runtime_values, config, gpus_per_worker)
     framework = "PyTorchDDP" if worker_count > 1 else config.framework
-    task_config = remove_empty_config({
-        "TaskName": volc_task_name(task, started_at),
-        "Description": f"Submitted from Infinity TUI at {started_at.isoformat(timespec='seconds')}",
-        "ImageUrl": config.image,
-        "Framework": framework,
-        "Entrypoint": entrypoint,
-        "UserCodePath": config.user_code_path,
-        "RemoteMountCodePath": config.remote_code_path,
-        "TaskRoleSpecs": [volc_resource_spec(config, gpus_per_worker, worker_count)],
-        "Envs": volc_envs(config, gpus_per_worker, task.env(runtime_values)),
-        "Storages": volc_storages(config),
-        "ActiveDeadlineSeconds": active_deadline,
-        "EnableTensorBoard": False,
-        "Preemptible": parse_bool(config.preemptible),
-        "Priority": priority,
-        "RetryOptions": volc_retry_options(),
-        "Tags": ["infinity", experiment_slug(task)],
-    })
+    task_config = remove_empty_config(
+        {
+            "TaskName": volc_task_name(task, started_at),
+            "Description": f"Submitted from Infinity TUI at {started_at.isoformat(timespec='seconds')}",
+            "ImageUrl": config.image,
+            "Framework": framework,
+            "Entrypoint": entrypoint,
+            "UserCodePath": config.user_code_path,
+            "RemoteMountCodePath": config.remote_code_path,
+            "TaskRoleSpecs": [volc_resource_spec(config, gpus_per_worker, worker_count)],
+            "Envs": volc_envs(config, gpus_per_worker, task.env(runtime_values)),
+            "Storages": volc_storages(config),
+            "ActiveDeadlineSeconds": active_deadline,
+            "EnableTensorBoard": False,
+            "Preemptible": parse_bool(config.preemptible),
+            "Priority": priority,
+            "RetryOptions": volc_retry_options(),
+            "Tags": ["infinity", experiment_slug(task)],
+        }
+    )
     if config.queue_id:
         task_config["ResourceQueueID"] = config.queue_id
     else:
@@ -929,9 +976,7 @@ def split_multi_value(value: str) -> list[str]:
 
 def build_single_normal_eval(values: dict[str, str], dataset: str, output_dir: str) -> list[str]:
     methods = [item.strip() for item in values["methods"].replace(",", " ").split() if item.strip()]
-    ours_checkpoints = split_multi_value(values["ours_checkpoint"])
-    if not ours_checkpoints:
-        raise ValueError("Ours checkpoint 至少选择一个")
+    uses_ours = any(method == "ours" or method.startswith("ours__") for method in methods)
     cmd = [
         PYTHON,
         "tools/normal_eval_experiment.py",
@@ -951,20 +996,6 @@ def build_single_normal_eval(values: dict[str, str], dataset: str, output_dir: s
         output_dir,
         "--methods",
         *methods,
-        "--ours-checkpoint",
-        *ours_checkpoints,
-        "--normal-tokenizer-ckpt",
-        values["normal_tokenizer_ckpt"],
-        "--normal-vae-type",
-        values["normal_vae_type"],
-        "--ours-seed",
-        values["ours_seed"],
-        "--ours-top-k",
-        values["ours_top_k"],
-        "--ours-top-p",
-        values["ours_top_p"],
-        "--ours-tau",
-        values["ours_tau"],
         "--parallel-shards",
         values["parallel_shards"],
         "--timing-warmup",
@@ -972,8 +1003,28 @@ def build_single_normal_eval(values: dict[str, str], dataset: str, output_dir: s
         "--timing-repeats",
         values["timing_repeats"],
     ]
-    if values["ours_kv_cache_fast"].lower() in {"1", "yes", "true", "y"}:
-        cmd.append("--ours-kv-cache-fast")
+    if uses_ours:
+        ours_checkpoints = split_multi_value(values["ours_checkpoint"])
+        if not ours_checkpoints:
+            raise ValueError("Ours checkpoint 至少选择一个")
+        cmd += [
+            "--ours-checkpoint",
+            *ours_checkpoints,
+            "--normal-tokenizer-ckpt",
+            values["normal_tokenizer_ckpt"],
+            "--normal-vae-type",
+            values["normal_vae_type"],
+            "--ours-seed",
+            values["ours_seed"],
+            "--ours-top-k",
+            values["ours_top_k"],
+            "--ours-top-p",
+            values["ours_top_p"],
+            "--ours-tau",
+            values["ours_tau"],
+        ]
+        if values["ours_kv_cache_fast"].lower() in {"1", "yes", "true", "y"}:
+            cmd.append("--ours-kv-cache-fast")
     if values.get("eval_image", "").strip():
         cmd += ["--eval-image", values["eval_image"].strip()]
     if values["compare_inference_time"].lower() in {"0", "no", "false", "n"}:
@@ -1171,9 +1222,15 @@ def build_train_normal(values: dict[str, str]) -> list[str]:
         cmd.append("--token-cache-filter-missing")
     if values["fast_model_init"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--fast-model-init")
-    if values.get("normal_use_flex_attn", "0").lower() in {"1", "yes", "true", "y"} or values["normal_token_layout"] == "interleaved_source":
+    if (
+        values.get("normal_use_flex_attn", "0").lower() in {"1", "yes", "true", "y"}
+        or values["normal_token_layout"] == "interleaved_source"
+    ):
         cmd.append("--normal-use-flex-attn")
-    if values["normal_use_segmented_flash_attn"].lower() in {"1", "yes", "true", "y"} and values["normal_token_layout"] != "interleaved_source":
+    if (
+        values["normal_use_segmented_flash_attn"].lower() in {"1", "yes", "true", "y"}
+        and values["normal_token_layout"] != "interleaved_source"
+    ):
         cmd.append("--normal-use-segmented-flash-attn")
     if values["normal_bf16_activations"].lower() in {"1", "yes", "true", "y"}:
         cmd.append("--normal-bf16-activations")
@@ -1302,6 +1359,32 @@ def build_shell(values: dict[str, str]) -> list[str]:
     return ["bash", "-lc", values["command"]]
 
 
+def build_upload_hf_checkpoint(values: dict[str, str]) -> list[str]:
+    cmd = [
+        PYTHON,
+        "scripts/upload_hf_checkpoint.py",
+        "--repo-id",
+        values["repo_id"],
+        "--checkpoint",
+        values["checkpoint"],
+        "--repo-type",
+        values["repo_type"],
+    ]
+    if values.get("path_in_repo", "").strip():
+        cmd += ["--path-in-repo", values["path_in_repo"].strip()]
+    if values.get("revision", "").strip():
+        cmd += ["--revision", values["revision"].strip()]
+    if values.get("commit_message", "").strip():
+        cmd += ["--commit-message", values["commit_message"].strip()]
+    if values.get("create_repo", "0").lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--create-repo")
+    if values.get("private", "0").lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--private")
+    if values.get("dry_run", "0").lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--dry-run")
+    return cmd
+
+
 def managed_output(prefix: str) -> str:
     return str(ROOT / "outputs" / prefix / "latest")
 
@@ -1355,7 +1438,12 @@ TASKS: list[Task] = [
             Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8", "2x4", "4x2", "8x1")),
             Field("output_dir", "输出目录", managed_output("normal_estimation")),
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
-            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
+            Field(
+                "train_dataset_weights",
+                "数据集采样权重",
+                DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+                help="逗号分隔：hypersim:9,vkitti2:1",
+            ),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
             Field(
@@ -1414,7 +1502,12 @@ TASKS: list[Task] = [
             Field("zero", "ZeRO", "0", choices=("0", "2", "3")),
             Field("checkpointing", "Checkpointing", "full-block", choices=("full-block", "self-attn", "none")),
             Field("full_block_checkpoint_skip_interval", "Checkpoint skip interval", "16"),
-            Field("normal_token_layout", "Normal token layout", "prefix", choices=("prefix", "interleaved", "interleaved_source")),
+            Field(
+                "normal_token_layout",
+                "Normal token layout",
+                "prefix",
+                choices=("prefix", "interleaved", "interleaved_source"),
+            ),
             Field("fast_model_init", "Fast model init", "1", choices=("0", "1")),
             Field("normal_use_flex_attn", "Flex attn", "0", choices=("0", "1")),
             Field("normal_use_segmented_flash_attn", "Segmented flash attn", "1", choices=("0", "1")),
@@ -1472,7 +1565,12 @@ TASKS: list[Task] = [
             Field("resume_weights_only", "只加载权重", "0", choices=("0", "1")),
             Field("data_root", "Hypersim 数据目录", DEFAULT_HYPERSIM_ROOT),
             Field("train_datasets", "训练数据集", DEFAULT_NORMAL_TRAIN_DATASETS, help="逗号分隔：hypersim,vkitti2"),
-            Field("train_dataset_weights", "数据集采样权重", DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS, help="逗号分隔：hypersim:9,vkitti2:1"),
+            Field(
+                "train_dataset_weights",
+                "数据集采样权重",
+                DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+                help="逗号分隔：hypersim:9,vkitti2:1",
+            ),
             Field("vkitti2_root", "VKITTI2 数据目录", DEFAULT_VKITTI2_ROOT),
             Field(
                 "vkitti2_max_invalid_ratio",
@@ -1535,7 +1633,9 @@ TASKS: list[Task] = [
             Field("gpus", "GPU 数", "8"),
             Field("volc_topology", "Volc topology", "1x8", choices=("1x4", "1x8"), help="Eval 当前只支持单机多卡分片"),
             Field("output_dir", "输出目录", managed_output("normal_eval")),
-            Field("dataset", "Dataset", "toy", multi_choices=("toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel")),
+            Field(
+                "dataset", "Dataset", "toy", multi_choices=("toy", "nyuv2", "hypersim", "scannet", "ibims", "sintel")
+            ),
             Field("data_root", "数据目录", "auto", help="auto=toy/NYUv2/Hypersim/ScanNet/iBims/Sintel 默认路径"),
             Field("partition", "Split", "val", choices=("val", "test", "train", "ibims", "sintel")),
             Field("pn", "分辨率 pn", "1M", choices=("0.06M", "0.25M", "1M")),
@@ -1581,11 +1681,25 @@ TASKS: list[Task] = [
             Field("ours_top_k", "Ours top-k", "1"),
             Field("ours_top_p", "Ours top-p", "0.0"),
             Field("ours_tau", "Ours tau", "1.0"),
-            Field("parallel_shards", "并行分片数", "auto", help="auto=按可见 GPU 分片并行；每个进程仍按 batch=1 逐图计时"),
-            Field("compare_inference_time", "比较推理时间", "1", choices=("1", "0"), help="1=只统计单图模型推理段，输出 inference_time_summary.json"),
+            Field(
+                "parallel_shards", "并行分片数", "auto", help="auto=按可见 GPU 分片并行；每个进程仍按 batch=1 逐图计时"
+            ),
+            Field(
+                "compare_inference_time",
+                "比较推理时间",
+                "1",
+                choices=("1", "0"),
+                help="1=只统计单图模型推理段，输出 inference_time_summary.json",
+            ),
             Field("timing_warmup", "计时 warmup", "3", help="每张图预热次数，不计入结果"),
             Field("timing_repeats", "计时 repeats", "5", help="每张图正式计时重复次数"),
-            Field("ours_kv_cache_fast", "Ours KV fast", "0", choices=("0", "1"), help="实验性 KV cache 推理；需单独验证指标"),
+            Field(
+                "ours_kv_cache_fast",
+                "Ours KV fast",
+                "0",
+                choices=("0", "1"),
+                help="实验性 KV cache 推理；需单独验证指标",
+            ),
             Field("bootstrap", "下载代码/权重", "0", choices=("0", "1")),
             Field("dry_run", "只打印命令", "0", choices=("0", "1")),
             Field("cuda", "CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
@@ -1612,7 +1726,33 @@ TASKS: list[Task] = [
         build_shell,
         category="Utility",
     ),
-    Task("自定义命令", "在项目根目录执行一条 shell 命令。", [Field("command", "命令", "echo hello")], build_shell, category="Utility"),
+    Task(
+        "上传 HF checkpoint",
+        "把本地 checkpoint 上传到 Hugging Face Hub；HF_TOKEN 从环境变量或 .env 读取。",
+        [
+            Field("repo_id", "HF repo id", "", help="例如 user/model-name 或 org/model-name"),
+            Field("checkpoint", "Checkpoint", str(DEFAULT_NORMAL_CKPT_DIR / "epoch_0001_val_ar_nyu_deg_103.8351.pth")),
+            Field("path_in_repo", "Repo 内路径", "", help="留空时脚本默认 checkpoints/<文件名>"),
+            Field("repo_type", "Repo type", "model", choices=("model", "dataset", "space")),
+            Field("revision", "Revision", ""),
+            Field("commit_message", "Commit message", ""),
+            Field("create_repo", "创建 repo", "1", choices=("1", "0")),
+            Field("private", "私有 repo", "1", choices=("0", "1")),
+            Field("dry_run", "Dry run", "0", choices=("0", "1")),
+        ],
+        build_upload_hf_checkpoint,
+        env=hf_upload_env,
+        confirm="Dry run=0 会真实上传文件到 Hugging Face Hub。",
+        category="Utility",
+        output_slug="hf_upload",
+    ),
+    Task(
+        "自定义命令",
+        "在项目根目录执行一条 shell 命令。",
+        [Field("command", "命令", "echo hello")],
+        build_shell,
+        category="Utility",
+    ),
 ]
 
 
@@ -2283,7 +2423,9 @@ class InfinityTUI(App):
             )
             return
         if field.multi_choices:
-            self.push_screen(MultiChoiceFieldScreen(field.label, value, field.multi_choices, field.choice_labels), callback)
+            self.push_screen(
+                MultiChoiceFieldScreen(field.label, value, field.multi_choices, field.choice_labels), callback
+            )
         elif field.choices:
             self.push_screen(ChoiceFieldScreen(field.label, value, field.choices), callback)
         else:
@@ -2364,7 +2506,9 @@ class InfinityTUI(App):
             return False
         if name in self.live_sessions:
             return True
-        result = subprocess.run(["tmux", "has-session", "-t", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
         alive = result.returncode == 0
         if alive:
             self.live_sessions.add(name)
@@ -2397,7 +2541,9 @@ class InfinityTUI(App):
         session_name = self.resolve_session_name()
         if session_name:
             write_job_meta(session_name, {"status": "stopped", "ended_at": now_utc()})
-            subprocess.run(["tmux", "kill-session", "-t", session_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
             self.live_sessions.discard(session_name)
             self.set_status_icon("■")
             if self.session_name == session_name:
@@ -2428,10 +2574,13 @@ class InfinityTUI(App):
         run_dir = create_run_dir(task, started_at)
         apply_run_outputs(values, run_dir)
         command = task.build(values)
-        env = common_env(task.env(values))
+        task_extra_env = task.env(values)
+        env = common_env(task_extra_env)
         prefix = shell_export(env)
+        hidden_prefix = hidden_shell_exports(task_extra_env)
         cmd = shell_join(command)
         run_line = f"{prefix} {cmd}" if prefix else cmd
+        exec_line = f"{hidden_prefix}; {run_line}" if hidden_prefix else run_line
         confirm = f"echo {shlex.quote('[提示] ' + task.confirm)}; " if task.confirm else ""
         meta_path = job_meta_path(session_name)
         meta_update_code = (
@@ -2444,19 +2593,15 @@ class InfinityTUI(App):
             "'ended_at':datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}); "
             "p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\\n')"
         )
-        meta_update = (
-            f"{shlex.quote(PYTHON)} -c "
-            f"{shlex.quote(meta_update_code)} "
-            f"{shlex.quote(str(meta_path))} \"$rc\""
-        )
+        meta_update = f'{shlex.quote(PYTHON)} -c {shlex.quote(meta_update_code)} {shlex.quote(str(meta_path))} "$rc"'
         script = (
             f"cd {shlex.quote(str(ROOT))}; "
             f"{confirm}"
             f"echo {shlex.quote('$ ' + run_line)}; "
-            f"{run_line}; "
-            "rc=$?; echo; echo \"[exit code: $rc]\"; "
+            f"{exec_line}; "
+            'rc=$?; echo; echo "[exit code: $rc]"; '
             f"{meta_update}; "
-            "echo; echo \"任务结束。按 Ctrl-b d 返回 TUI，或输入 exit 关闭 session。\"; "
+            'echo; echo "任务结束。按 Ctrl-b d 返回 TUI，或输入 exit 关闭 session。"; '
             "exec $SHELL"
         )
         write_job_meta(
@@ -2489,6 +2634,10 @@ class InfinityTUI(App):
         self.set_status_icon("●")
 
     def action_submit_volc_task(self) -> None:
+        if self.current_task().title == "上传 HF checkpoint":
+            self.notify("HF 上传任务不支持提交 Volc，请在本机运行，避免 token 写入远端配置", severity="warning")
+            self.set_status_icon("!")
+            return
         if not Path(VOLC).exists() and shutil.which(VOLC) is None:
             self.notify("未找到 volc CLI，请先安装并配置火山引擎命令行工具", severity="error")
             self.set_status_icon("!")

@@ -6,6 +6,7 @@ gputil
 colorama
 omegaconf
 pandas
+huggingface_hub
 timm==0.9.6
 decord
 transformers

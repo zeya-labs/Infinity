@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import tui
 from infinity.normal_estimation.defaults import (
-    DEFAULT_NORMAL_ESTIMATION_CKPT,
     DEFAULT_NORMAL_TOKENIZER_CKPT,
-    DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_NORMAL_TRAIN_DATASET_WEIGHTS,
+    DEFAULT_NORMAL_TRAIN_DATASETS,
     DEFAULT_VKITTI2_MAX_INVALID_RATIO,
     DEFAULT_VKITTI2_ROOT,
 )
@@ -40,9 +40,9 @@ class TuiNormalTaskTest(unittest.TestCase):
         self.assert_flag_value(cmd, "--ar-eval-nyuv2-root", "data/NYUv2/hf-parquet/tanganke/nyuv2/data")
         self.assert_flag_value(cmd, "--ar-eval-nyuv2-samples", "32")
         self.assert_flag_value(cmd, "--max-val-samples", "512")
-        self.assert_flag_value(cmd, "--train-normal-metrics-every", "100")
+        self.assert_flag_value(cmd, "--train-normal-metrics-every", "10")
         self.assert_flag_value(cmd, "--image-log-every", "200")
-        self.assert_flag_value(cmd, "--save-every-steps", "500")
+        self.assert_flag_value(cmd, "--save-every-steps", "100")
         self.assertIn("--hypersim-filter-depth-nan", cmd)
         self.assertNotIn("--token-cache-" + "memory", cmd)
 
@@ -94,7 +94,7 @@ class TuiNormalTaskTest(unittest.TestCase):
         cmd = tui.build_normal_baseline_compare(values)
 
         self.assertIn("tools/normal_eval_experiment.py", cmd)
-        self.assert_flag_value(cmd, "--ours-checkpoint", DEFAULT_NORMAL_ESTIMATION_CKPT)
+        self.assert_flag_value(cmd, "--ours-checkpoint", tui.normal_checkpoint_choices()[0])
         self.assert_flag_value(cmd, "--normal-tokenizer-ckpt", DEFAULT_NORMAL_TOKENIZER_CKPT)
         for method in (
             "ours",
@@ -110,9 +110,47 @@ class TuiNormalTaskTest(unittest.TestCase):
         ):
             self.assertIn(method, cmd)
 
+    def test_normal_eval_baseline_only_omits_ours_flags(self) -> None:
+        values = task_defaults("Normal Eval 实验")
+        values["methods"] = "stablenormal"
+        cmd = tui.build_single_normal_eval(values, "nyuv2", values["output_dir"])
+
+        self.assertIn("stablenormal", cmd)
+        self.assertNotIn("--ours-checkpoint", cmd)
+        self.assertNotIn("--normal-tokenizer-ckpt", cmd)
+        self.assertNotIn("--normal-vae-type", cmd)
+        self.assertNotIn("--ours-seed", cmd)
+        self.assertNotIn("--ours-kv-cache-fast", cmd)
+
     def test_tui_does_not_embed_local_vepfs_literal(self) -> None:
         text = Path(tui.__file__).read_text(encoding="utf-8")
         self.assertNotIn("/root/vepfs", text)
+
+    def test_hf_upload_task_builds_checkpoint_upload_command(self) -> None:
+        values = task_defaults("上传 HF checkpoint")
+        values["repo_id"] = "user/model"
+        values["checkpoint"] = "outputs/normal_estimation/latest/checkpoints/model.pth"
+        values["path_in_repo"] = "checkpoints/model.pth"
+        cmd = tui.build_upload_hf_checkpoint(values)
+
+        self.assertIn("scripts/upload_hf_checkpoint.py", cmd)
+        self.assertNotIn("--dry-run", cmd)
+        self.assertIn("--create-repo", cmd)
+        self.assertIn("--private", cmd)
+        self.assert_flag_value(cmd, "--repo-id", "user/model")
+        self.assert_flag_value(cmd, "--checkpoint", "outputs/normal_estimation/latest/checkpoints/model.pth")
+        self.assert_flag_value(cmd, "--path-in-repo", "checkpoints/model.pth")
+        self.assertNotIn("HF_TOKEN", cmd)
+
+    def test_hf_upload_env_sets_token_and_proxy(self) -> None:
+        with mock.patch.dict(tui.os.environ, {"HF_TOKEN": "test-token"}, clear=False):
+            env = tui.hf_upload_env({})
+
+        self.assertEqual(env["HF_TOKEN"], "test-token")
+        self.assertEqual(env["http_proxy"], tui.DEFAULT_HF_UPLOAD_PROXY)
+        self.assertEqual(env["HTTP_PROXY"], tui.DEFAULT_HF_UPLOAD_PROXY)
+        self.assertEqual(env["https_proxy"], tui.DEFAULT_HF_UPLOAD_PROXY)
+        self.assertEqual(env["HTTPS_PROXY"], tui.DEFAULT_HF_UPLOAD_PROXY)
 
 
 if __name__ == "__main__":

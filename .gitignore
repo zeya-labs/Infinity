@@ -1,5 +1,7 @@
 external/
 .venv/
+.env
+.secrets/
 .tui/
 scripts/download-data/
 scripts/download-data/*

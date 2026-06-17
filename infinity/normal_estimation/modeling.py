@@ -854,8 +854,8 @@ class InfinityNormalPrefixModel(Infinity):
             for scale_index, scale_item in enumerate(scale_schedule):
                 stage_len = int(np.array(scale_item).prod())
                 if scale_index == 0:
-                    current_emb = sos.unsqueeze(1).expand(batch_size, self.first_l, -1) + self.pos_start.expand(
-                        batch_size, self.first_l, -1
+                    current_emb = sos.unsqueeze(1).expand(batch_size, stage_len, -1) + self.pos_start[:, :1].expand(
+                        batch_size, stage_len, -1
                     )
                     current_emb = current_emb + self.normal_modality_embed
                 else:
@@ -963,8 +963,8 @@ class InfinityNormalPrefixModel(Infinity):
         for scale_index, scale_item in enumerate(scale_schedule):
             stage_len = int(np.array(scale_item).prod())
             if scale_index == 0:
-                current_emb = sos.unsqueeze(1).expand(batch_size, self.first_l, -1) + self.pos_start.expand(
-                    batch_size, self.first_l, -1
+                current_emb = sos.unsqueeze(1).expand(batch_size, stage_len, -1) + self.pos_start[:, :1].expand(
+                    batch_size, stage_len, -1
                 )
                 current_emb = current_emb + self.normal_modality_embed
             else:
@@ -1072,8 +1072,8 @@ class InfinityNormalPrefixModel(Infinity):
         for scale_index, scale_item in enumerate(scale_schedule):
             stage_len = int(np.array(scale_item).prod())
             if scale_index == 0:
-                current_emb = sos.unsqueeze(1).expand(batch_size, self.first_l, -1) + self.pos_start.expand(
-                    batch_size, self.first_l, -1
+                current_emb = sos.unsqueeze(1).expand(batch_size, stage_len, -1) + self.pos_start[:, :1].expand(
+                    batch_size, stage_len, -1
                 )
                 current_emb = current_emb + self.normal_modality_embed
             else:

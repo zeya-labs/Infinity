@@ -468,12 +468,35 @@ def infer_dataset_from_eval_set(eval_set_dir: Path) -> str | None:
     return str(dataset) if isinstance(dataset, str) and dataset else None
 
 
-def run_command(cmd: list[str], *, cwd: Path, dry_run: bool, env: dict[str, str], cuda_device: str | None = None) -> int:
+def run_command(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    dry_run: bool,
+    env: dict[str, str],
+    cuda_device: str | None = None,
+    log_path: Path | None = None,
+) -> int:
     prefix = f"CUDA_VISIBLE_DEVICES={cuda_device} " if cuda_device is not None else ""
     print("$ " + prefix + " ".join(str(part) for part in cmd), flush=True)
     if dry_run:
         return 0
-    return int(subprocess.run([str(part) for part in cmd], cwd=str(cwd), env=env, check=False).returncode)
+    if log_path is None:
+        return int(subprocess.run([str(part) for part in cmd], cwd=str(cwd), env=env, check=False).returncode)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        log_file.write("$ " + prefix + " ".join(str(part) for part in cmd) + "\n")
+        log_file.flush()
+        return int(
+            subprocess.run(
+                [str(part) for part in cmd],
+                cwd=str(cwd),
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+            ).returncode
+        )
 
 
 def ours_command(args: argparse.Namespace, input_dir: Path, output_dir: Path, checkpoint: Path) -> list[str]:
@@ -506,6 +529,10 @@ def ours_command(args: argparse.Namespace, input_dir: Path, output_dir: Path, ch
         cmd.extend(["--normal-vae-type", str(args.normal_vae_type)])
     if args.ours_kv_cache_fast:
         cmd.append("--normal-kv-cache-fast")
+    if os.environ.get("INFINITY_NORMAL_DISABLE_KV_FAST", "").lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--normal-disable-kv-cache-fast")
+    if os.environ.get("INFINITY_NORMAL_FORCE_ORIGINAL_RESOLUTION", "").lower() in {"1", "yes", "true", "y"}:
+        cmd.append("--force-original-resolution")
     return cmd
 
 
@@ -521,7 +548,14 @@ def run_ours_sharded(
     if len(input_shards) == 1:
         cmd = ours_command(args, input_shards[0], output_dir, checkpoint)
         device = devices[0] if devices else None
-        code = run_command(cmd, cwd=ROOT, dry_run=args.dry_run, env=clean_env(device), cuda_device=device)
+        code = run_command(
+            cmd,
+            cwd=ROOT,
+            dry_run=args.dry_run,
+            env=clean_env(device),
+            cuda_device=device,
+            log_path=output_dir / "command.log",
+        )
         return code, [cmd]
 
     shard_output_root = output_dir / "_shards"
@@ -538,7 +572,13 @@ def run_ours_sharded(
         device = devices[index % len(devices)] if devices else None
         print(f"$ CUDA_VISIBLE_DEVICES={device} " + " ".join(cmd), flush=True)
         if not args.dry_run:
-            processes.append(subprocess.Popen(cmd, cwd=str(ROOT), env=clean_env(device)))
+            log_path = shard_output / "command.log"
+            log_file = log_path.open("w", encoding="utf-8")
+            log_file.write(f"$ CUDA_VISIBLE_DEVICES={device} " + " ".join(cmd) + "\n")
+            log_file.flush()
+            processes.append(
+                subprocess.Popen(cmd, cwd=str(ROOT), env=clean_env(device), stdout=log_file, stderr=subprocess.STDOUT)
+            )
     codes = [process.wait() for process in processes] if not args.dry_run else [0 for _ in commands]
     if any(code != 0 for code in codes):
         return 2, commands
@@ -1305,7 +1345,7 @@ def main() -> int:
     parser.add_argument("--eval-image", type=Path, default=None, help="Evaluate one image from an existing _eval_set/images dir.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--methods", nargs="+", default=["ours"])
-    parser.add_argument("--ours-checkpoint", type=Path, nargs="+", default=[Path(DEFAULT_NORMAL_ESTIMATION_CKPT)])
+    parser.add_argument("--ours-checkpoint", type=Path, nargs="+", default=[])
     parser.add_argument("--normal-tokenizer-ckpt", type=Path, default=Path(DEFAULT_NORMAL_TOKENIZER_CKPT))
     parser.add_argument("--normal-vae-type", type=int, default=32)
     parser.add_argument("--ours-seed", default="0")
@@ -1364,6 +1404,9 @@ def main() -> int:
 
     methods = parse_methods(args.methods)
     ours_checkpoints = list(args.ours_checkpoint)
+    has_ours = any(method == "ours" or method.startswith("ours__") for method in methods)
+    if has_ours and not ours_checkpoints:
+        ours_checkpoints = [resolve_path(Path(DEFAULT_NORMAL_ESTIMATION_CKPT))]
     if "ours" in methods and len(ours_checkpoints) > 1:
         expanded_methods: list[str] = []
         for method in methods:
@@ -1417,11 +1460,14 @@ def main() -> int:
     timing_by_method: dict[str, dict[str, object]] = {}
 
     ours_methods = [method for method in methods if method == "ours" or method.startswith("ours__")]
-    ours_checkpoint_by_method = (
-        {"ours": ours_checkpoints[0]}
-        if ours_methods == ["ours"]
-        else {method: checkpoint for method, checkpoint in zip(ours_methods, ours_checkpoints, strict=True)}
-    )
+    if not ours_methods:
+        ours_checkpoint_by_method = {}
+    elif ours_methods == ["ours"]:
+        ours_checkpoint_by_method = {"ours": ours_checkpoints[0]}
+    else:
+        ours_checkpoint_by_method = {
+            method: checkpoint for method, checkpoint in zip(ours_methods, ours_checkpoints, strict=True)
+        }
     ours_commands, ours_timing, ours_failures = run_ours_methods(
         args=args,
         input_dir=input_dir,
